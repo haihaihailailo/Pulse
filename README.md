@@ -81,7 +81,7 @@ scripts\install.cmd -Quiet
 
 ## 卸载
 
-运行 `scripts\uninstall.cmd`。脚本会退出所有名为 Pulse 的进程，删除上述 Run 值，并删除开始菜单和桌面上目标为 `Pulse.exe` 或已失效的 `Pulse.lnk`。
+运行 `scripts\uninstall.cmd`。脚本会仅退出通过窗口类名或版本信息识别为本程序的 Pulse 进程，跳过其他同名程序，删除上述 Run 值，并删除开始菜单和桌面上目标为 `Pulse.exe` 或已失效的 `Pulse.lnk`。
 
 窗口位置、模式、置顶、显示内容、刷新间隔、界面大小、延迟较慢阈值、断网提醒和提示音设置保存在 `%LOCALAPPDATA%\Pulse\settings.ini`。网络探测和帧数诊断等日志在 `%LOCALAPPDATA%\Pulse\pulse_net.log`，与安装目录同属一个文件夹。`%APPDATA%`（漫游目录）下不写配置；卸载脚本仍会检查那里是否存在同名配置或日志。
 

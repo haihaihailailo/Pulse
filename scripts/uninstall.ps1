@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     卸载当前用户安装的 Pulse。
@@ -38,31 +38,140 @@ function Stop-Pulse {
         Write-Host 'Pulse 未在运行。'
         return
     }
-    Write-Host '正在退出正在运行的 Pulse...'
+
+    if (-not ('PulseWin32' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class PulseWin32
+{
+    private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int GetClassNameW(IntPtr hwnd, StringBuilder className, int maxCount);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostMessageW(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+
+    public static IntPtr[] GetMainWindows(uint processId)
+    {
+        var windows = new List<IntPtr>();
+        // EnumWindows also visits hidden top-level windows (minimized to the tray).
+        EnumWindowsProc callback = delegate(IntPtr hwnd, IntPtr lParam)
+        {
+            uint ownerId;
+            GetWindowThreadProcessId(hwnd, out ownerId);
+            if (ownerId == processId)
+            {
+                var className = new StringBuilder(256);
+                if (GetClassNameW(hwnd, className, className.Capacity) > 0 &&
+                    className.ToString() == "Pulse.Native.Main.v1")
+                {
+                    windows.Add(hwnd);
+                }
+            }
+            return true;
+        };
+        if (!EnumWindows(callback, IntPtr.Zero))
+        {
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+        return windows.ToArray();
+    }
+}
+'@
+    }
+
+    $targets = @()
     foreach ($proc in $procs) {
-        try { [void]$proc.CloseMainWindow() } catch { }
+        $windows = @([PulseWin32]::GetMainWindows([uint32]$proc.Id))
+        $path = $null
+        try { $path = $proc.Path } catch { }
+        $isPulse = $windows.Count -gt 0
+        if ((-not $isPulse) -and (-not [string]::IsNullOrWhiteSpace($path))) {
+            try {
+                $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+                $isPulse = ($version.ProductName -eq 'Pulse' -and
+                    $version.FileDescription -eq 'Pulse native desktop widget')
+            } catch { }
+        }
+        if ($isPulse) {
+            $targets += [pscustomobject]@{ Process = $proc; Windows = $windows }
+        } else {
+            $location = '路径不可读'
+            if (-not [string]::IsNullOrWhiteSpace($path)) { $location = '路径 ' + $path }
+            Write-Host ("检测到另一个名为 Pulse 的程序（PID {0}，{1}），不是本程序，已跳过。" -f $proc.Id, $location)
+        }
+    }
+    if ($targets.Count -eq 0) {
+        Write-Host 'Pulse 未在运行。'
+        return
+    }
+
+    # 后续只检查已识别的 PID，不再按进程名查找。
+    $targetIds = @($targets | ForEach-Object { $_.Process.Id })
+    Write-Host '正在退出正在运行的 Pulse...'
+    foreach ($target in $targets) {
+        if ($target.Windows.Count -gt 0) {
+            foreach ($window in $target.Windows) {
+                [void][PulseWin32]::PostMessageW($window, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+            }
+        } else {
+            try { [void]$target.Process.CloseMainWindow() } catch { }
+        }
     }
     $grace = (Get-Date).AddSeconds(5)
     do {
-        $left = @(Get-Process -Name 'Pulse' -ErrorAction SilentlyContinue)
+        $left = @(Get-Process -Id $targetIds -ErrorAction SilentlyContinue)
         if ($left.Count -eq 0) { break }
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $grace)
 
-    $left = @(Get-Process -Name 'Pulse' -ErrorAction SilentlyContinue)
+    $left = @(Get-Process -Id $targetIds -ErrorAction SilentlyContinue)
     foreach ($proc in $left) {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+        } catch {
+            $failure = $_
+            # 进程可能恰好自行退出，只有仍在运行时才报告权限错误。
+            if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { continue }
+            $accessDenied = $failure.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::PermissionDenied
+            $exception = $failure.Exception
+            while ($null -ne $exception) {
+                if (($exception -is [System.UnauthorizedAccessException]) -or
+                    (($exception -is [System.ComponentModel.Win32Exception]) -and $exception.NativeErrorCode -eq 5)) {
+                    $accessDenied = $true
+                    break
+                }
+                $exception = $exception.InnerException
+            }
+            if ($accessDenied) {
+                Fail 'Pulse 正以管理员身份运行，脚本无法结束它。请从托盘菜单选择“退出”后重试。'
+            }
+        }
     }
 
     $deadline = (Get-Date).AddSeconds(8)
     do {
-        $left = @(Get-Process -Name 'Pulse' -ErrorAction SilentlyContinue)
+        $left = @(Get-Process -Id $targetIds -ErrorAction SilentlyContinue)
         if ($left.Count -eq 0) {
             Start-Sleep -Milliseconds 400
             return
         }
         Start-Sleep -Milliseconds 200
     } while ((Get-Date) -lt $deadline)
+    if (@(Get-Process -Id $targetIds -ErrorAction SilentlyContinue).Count -eq 0) { return }
     Fail '无法结束正在运行的 Pulse。请从托盘菜单选择“退出”后重试。'
 }
 
