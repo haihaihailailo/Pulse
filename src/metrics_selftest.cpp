@@ -1,5 +1,5 @@
 // Console profiler: --samples N (default 60), --compact, --brief, --url URL,
-// --interval-ms 500|1000|2000, --switch-every N.
+// --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800.
 // Timings are per actual collection, not per cached Sample() call.
 // g++ -std=c++17 -O2 -municode -static -finput-charset=UTF-8 -fexec-charset=UTF-8
 //   -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp
@@ -40,13 +40,14 @@ struct TimingRow {
     unsigned long long count = 0;
     double wall = 0, cpu = 0, max_wall = 0, max_cpu = 0;
 };
-std::array<TimingRow, 22> g_timings{{
+std::array<TimingRow, 23> g_timings{{
     {L"Battery"}, {L"Power scheme"}, {L"PDH Energy Meter"}, {L"PDH GPU Engine"},
     {L"Network throughput"}, {L"NIC discovery (within throughput)"}, {L"CPU"}, {L"Memory"},
     {L"Process scan"}, {L"Network view (no HTTP)"}, {L"Sample total (includes stages)"},
     {L"Network primary"}, {L"Network backups (parallel)"}, {L"Network callback"},
     {L"Memory detail"}, {L"PDH Disk IO"}, {L"System disk"}, {L"PDH CPU frequency"},
-    {L"Uptime"}, {L"PDH GPU memory"}, {L"Wi-Fi"}, {L"Battery health"}
+    {L"Uptime"}, {L"PDH GPU memory"}, {L"Wi-Fi"}, {L"Battery health"},
+    {L"PDH CPU utility (shared query)"}
 }};
 
 void OnTiming(const wchar_t* name, double wall, double cpu, void*) {
@@ -88,6 +89,7 @@ void PrintTimings(double wall_ms, double process_cpu_ms) {
     std::wprintf(L"总墙钟 %.1f ms，进程全部线程 CPU %.3f ms，单核占用 %.4f%%\n",
         wall_ms, process_cpu_ms, wall_ms > 0 ? 100 * process_cpu_ms / wall_ms : 0.0);
     std::wprintf(L"Sample total 包含各采样项；NIC discovery 包含于网速，不可相加。\n"
+                 L"PDH CPU utility (shared query) 包含于 CPU；频率复用这次采集。\n"
                  L"Network primary/backups 是协调线程耗时；Network callback 单列。\n"
                  L"进程 CPU 包含 WinHTTP 内部线程、初始化、诊断及打印开销。线程 CPU 可能因计时粒度显示 0；建议 --brief --samples 120。\n");
 }
@@ -200,6 +202,9 @@ void PrintSample(int index, const pulse::Snapshot& s) {
     PrintInt(L"offline_since_unix", static_cast<long long>(s.offline_since_unix));
     PrintBool(L"offline_by_latency", s.offline_by_latency);
     PrintDouble(L"cpu_percent", s.cpu_percent);
+    PrintDouble(L"cpu_time_percent_GetSystemTimes", s.cpu_time_percent);
+    PrintDouble(L"cpu_utility_percent_PDH_uncapped", s.cpu_utility_percent);
+    PrintBool(L"cpu_from_utility", s.cpu_from_utility);
     PrintDouble(L"mem_percent", s.mem_percent);
     PrintInt(L"top_count", static_cast<long long>(s.top_procs.size()));
     for (std::size_t i = 0; i < s.top_procs.size(); ++i) {
@@ -250,6 +255,12 @@ int wmain(int argc, wchar_t** argv) {
         else if (std::wcscmp(argv[i], L"--brief") == 0) brief = true;
         else if (std::wcscmp(argv[i], L"--url") == 0 && i + 1 < argc)
             settings.probe_urls.emplace_back(argv[++i]);
+        else if (std::wcscmp(argv[i], L"--slow-ms") == 0 && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const long value = std::wcstol(argv[++i], &end, 10);
+            if (!end || *end || (value != 300 && value != 500 && value != 800)) return 2;
+            settings.slow_ms = static_cast<int>(value);
+        }
         else if (std::wcscmp(argv[i], L"--samples") == 0 && i + 1 < argc) {
             wchar_t* end = nullptr;
             const long value = std::wcstol(argv[++i], &end, 10);
@@ -266,7 +277,7 @@ int wmain(int argc, wchar_t** argv) {
             if (!end || *end || value < 1 || value > 86400) return 2;
             switch_every = static_cast<int>(value);
         } else {
-            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--url URL ...]\n");
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...]\n");
             return 2;
         }
     }
@@ -292,6 +303,8 @@ int wmain(int argc, wchar_t** argv) {
         std::wprintf(L"mode=%ls samples=%d full_interval_ms=%d compact_interval_ms=2000 switch_every=%d log=%ls\n",
             full ? L"full" : L"compact", samples, interval_ms, switch_every, metrics.LogPath().c_str());
         std::wprintf(L"Energy raw: pWh; W = delta_pwh * 3.6e-9 / QPC_seconds. Compact/fallback: Power mW / 1000.\n");
+        std::wprintf(L"CPU: Processor Utility (PDH, display clamped 0..100); GetSystemTimes prints the old Processor Time basis.\n"
+                     L"cpu_from_utility=false means warmup/fallback; unknown first interval prints nan. Network slow_ms=%d.\n", settings.slow_ms);
         metrics.Start(settings, OnNet, nullptr);
         for (int i = 0; i < samples; ++i) {
             const bool detailed = switch_every && (i / switch_every) % 2 ? !full : full;

@@ -52,6 +52,8 @@ public:
 
     View Get() const;
 
+    void SetSlowThreshold(int slow_ms); // Uses the same lock as result classification.
+
 private:
     struct Impl;
     Impl* impl_;

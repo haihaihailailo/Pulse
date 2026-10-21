@@ -78,7 +78,6 @@ constexpr double kEnergyStaleSec = 5.0;
 constexpr unsigned long long kPdhRetryMs = 30000;
 constexpr unsigned long long kDiskEveryMs = 1000;
 constexpr unsigned long long kSysDiskEveryMs = 30000;
-constexpr unsigned long long kCpuFreqEveryMs = 2000;
 constexpr unsigned long long kGpuMemEveryMs = 3000;
 constexpr unsigned long long kWifiEveryMs = 10000;
 constexpr unsigned long long kBatteryHealthEveryMs = 600000;
@@ -255,10 +254,10 @@ bool QueryArray(PDH_HQUERY query, PDH_HCOUNTER counter, std::vector<unsigned cha
     return FormatArray(counter, buffer, count, format);
 }
 
-bool FormatDouble(PDH_HCOUNTER counter, double& out) {
+bool FormatDouble(PDH_HCOUNTER counter, double& out, DWORD format = PDH_FMT_DOUBLE) {
     if (!counter) return false;
     PDH_FMT_COUNTERVALUE value{};
-    const PDH_STATUS status = PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, nullptr, &value);
+    const PDH_STATUS status = PdhGetFormattedCounterValue(counter, format, nullptr, &value);
     if (status != ERROR_SUCCESS) return false;
     if (value.CStatus != PDH_CSTATUS_VALID_DATA && value.CStatus != PDH_CSTATUS_NEW_DATA) return false;
     if (!std::isfinite(value.doubleValue)) return false;
@@ -773,6 +772,7 @@ bool ReadBatteryHealth(double& health, int& cycles) {
 
 struct Metrics::Impl {
     Impl() {
+        last_.cpu_percent = NAN; // No fabricated zero while both CPU sources warm up.
         if (NotifyIpInterfaceChange(AF_UNSPEC, NicChanged, this, FALSE, &nic_notify_) != NO_ERROR)
             nic_notify_ = nullptr;
     }
@@ -835,6 +835,15 @@ struct Metrics::Impl {
     uint64_t prev_idle_ = 0;
     uint64_t prev_total_ = 0;
 
+    // One persistent query; optional frequency counters join/leave it without
+    // disturbing Utility. Compact mode keeps only the single Utility counter.
+    PDH_HQUERY cpu_query_ = nullptr;
+    PDH_HCOUNTER cpu_utility_ = nullptr;
+    bool cpu_utility_warmed_ = false;
+    bool have_cpu_query_tick_ = false;
+    unsigned long long cpu_query_tick_ = 0;
+    unsigned long long cpu_query_retry_at_ = 0, cpu_utility_retry_at_ = 0;
+
     ProcScan procs_;
     std::vector<ProcUsage> top_cache_;
     double self_cache_ = NAN;
@@ -882,10 +891,7 @@ struct Metrics::Impl {
 
     bool cpu_freq_ok_ = false;
     bool cpu_freq_warmed_ = false;
-    bool have_cpu_freq_due_ = false;
-    unsigned long long cpu_freq_due_ = 0;
     unsigned long long cpu_freq_retry_at_ = 0;
-    PDH_HQUERY cpu_freq_query_ = nullptr;
     PDH_HCOUNTER cpu_freq_perf_ = nullptr;
     PDH_HCOUNTER cpu_freq_base_ = nullptr;
     double cpu_mhz_ = NAN;
@@ -934,6 +940,7 @@ private:
     void ReleaseGpu();
     void ReleaseProcs();
     void ReleaseDisk();
+    void ReleaseCpuQuery();
     void ReleaseCpuFreq();
     void ReleaseGpuMem();
     void ReleaseWifi();
@@ -943,7 +950,7 @@ private:
     Wants CurrentWants() const;
 
     void UpdateNet(Snapshot& s, unsigned long long now);
-    void UpdateCpu(Snapshot& s);
+    void UpdateCpu(Snapshot& s, unsigned long long now, bool frequency);
     void UpdateMem(Snapshot& s, bool detail);
     void UpdateBattery(Snapshot& s, unsigned long long now, double dt, bool has_dt);
     void UpdateScheme(unsigned long long now);
@@ -952,7 +959,7 @@ private:
     void UpdateProcs(Snapshot& s);
     void UpdateDisk(unsigned long long now, Snapshot& s);
     void UpdateSysDisk(unsigned long long now, Snapshot& s);
-    void UpdateCpuFreq(unsigned long long now, Snapshot& s);
+    void UpdateCpuFreq(Snapshot& s);
     void UpdateUptime(Snapshot& s);
     void UpdateGpuMemory(unsigned long long now, Snapshot& s);
     void UpdateWifi(unsigned long long now, Snapshot& s);
@@ -960,6 +967,8 @@ private:
     bool EnsureEnergy(bool full, unsigned long long now);
     bool EnsureGpu(unsigned long long now);
     bool EnsureDisk(unsigned long long now);
+    bool EnsureCpuQuery(unsigned long long now);
+    bool EnsureCpuUtility(unsigned long long now);
     bool EnsureCpuFreq(unsigned long long now);
     bool EnsureGpuMem(unsigned long long now);
     bool EnsureWifi(unsigned long long now);
@@ -1049,7 +1058,7 @@ void Metrics::Impl::UpdateNet(Snapshot& s, unsigned long long now) {
     s.tx_total = tx_total_;
 }
 
-void Metrics::Impl::UpdateCpu(Snapshot& s) {
+void Metrics::Impl::UpdateCpu(Snapshot& s, unsigned long long now, bool frequency) {
     diagnostics::ScopedTiming timing(L"CPU");
     FILETIME idle{};
     FILETIME kernel{};
@@ -1068,6 +1077,7 @@ void Metrics::Impl::UpdateCpu(Snapshot& s) {
                 cpu = 100.0 * (1.0 - idle_d / total_d);
                 if (cpu < 0) cpu = 0;
                 if (cpu > 100.0) cpu = 100.0;
+                s.cpu_time_percent = cpu;
             }
         }
         prev_idle_ = idle_v;
@@ -1075,9 +1085,46 @@ void Metrics::Impl::UpdateCpu(Snapshot& s) {
         have_cpu_ = true;
     } else {
         have_cpu_ = false;
-        cpu = NAN;
     }
     s.cpu_percent = cpu;
+
+    EnsureCpuUtility(now);
+    if (frequency) EnsureCpuFreq(now);
+    if (!cpu_query_ || (!cpu_utility_ && !cpu_freq_ok_)) return;
+    // Menu changes can request an immediate refresh beside a timer tick. Do not
+    // replace a useful rate interval with two nearly simultaneous PDH samples.
+    if (have_cpu_query_tick_ && now - cpu_query_tick_ < 250) {
+        s.cpu_percent = last_.cpu_percent;
+        s.cpu_utility_percent = last_.cpu_utility_percent;
+        s.cpu_from_utility = last_.cpu_from_utility;
+        if (frequency) s.cpu_mhz = cpu_mhz_;
+        return;
+    }
+    {
+        diagnostics::ScopedTiming pdh_timing(L"PDH CPU utility (shared query)");
+        if (PdhCollectQueryData(cpu_query_) != ERROR_SUCCESS) {
+            ReleaseCpuQuery();
+            cpu_query_retry_at_ = now + kPdhRetryMs;
+            return; // Keep GetSystemTimes or the last value during a PDH outage.
+        }
+    }
+    have_cpu_query_tick_ = true;
+    cpu_query_tick_ = now;
+    if (cpu_utility_) {
+        if (cpu_utility_warmed_) {
+            double utility = NAN;
+            if (FormatDouble(cpu_utility_, utility, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100)) {
+                s.cpu_utility_percent = utility;
+                s.cpu_from_utility = true;
+                s.cpu_percent = std::clamp(utility, 0.0, 100.0);
+            } else {
+                cpu_utility_warmed_ = false; // Re-establish two valid samples.
+            }
+        } else {
+            cpu_utility_warmed_ = true;
+        }
+    }
+    if (frequency) UpdateCpuFreq(s); // Formats this same collection; no extra query read.
 }
 
 void Metrics::Impl::UpdateMem(Snapshot& s, bool detail) {
@@ -1443,7 +1490,7 @@ void Metrics::Impl::CloseQueries() {
     ReleaseEnergy();
     ReleaseGpu();
     ReleaseDisk();
-    ReleaseCpuFreq();
+    ReleaseCpuQuery();
     ReleaseGpuMem();
     ReleaseWifi();
     ReleaseProcs();
@@ -1558,17 +1605,25 @@ void Metrics::Impl::ReleaseDisk() {
 }
 
 void Metrics::Impl::ReleaseCpuFreq() {
-    if (!cpu_freq_query_ && !cpu_freq_ok_ && !cpu_freq_warmed_ && !have_cpu_freq_due_ && std::isnan(cpu_mhz_)) return;
-    if (cpu_freq_query_) PdhCloseQuery(cpu_freq_query_);
-    cpu_freq_query_ = nullptr;
+    if (cpu_freq_perf_) PdhRemoveCounter(cpu_freq_perf_);
+    if (cpu_freq_base_) PdhRemoveCounter(cpu_freq_base_);
     cpu_freq_perf_ = nullptr;
     cpu_freq_base_ = nullptr;
     cpu_freq_ok_ = false;
     cpu_freq_warmed_ = false;
-    have_cpu_freq_due_ = false;
-    cpu_freq_due_ = 0;
     cpu_freq_retry_at_ = 0;
     cpu_mhz_ = NAN;
+}
+
+void Metrics::Impl::ReleaseCpuQuery() {
+    ReleaseCpuFreq();
+    if (cpu_query_) PdhCloseQuery(cpu_query_);
+    cpu_query_ = nullptr;
+    cpu_utility_ = nullptr;
+    cpu_utility_warmed_ = false;
+    have_cpu_query_tick_ = false;
+    cpu_query_tick_ = 0;
+    cpu_query_retry_at_ = cpu_utility_retry_at_ = 0;
 }
 
 void Metrics::Impl::ReleaseGpuMem() {
@@ -1638,16 +1693,48 @@ bool Metrics::Impl::EnsureDisk(unsigned long long now) {
     return disk_ok_;
 }
 
+bool Metrics::Impl::EnsureCpuQuery(unsigned long long now) {
+    if (cpu_query_) return true;
+    if (now < cpu_query_retry_at_) return false;
+    cpu_query_retry_at_ = now + kPdhRetryMs;
+    if (PdhOpenQueryW(nullptr, 0, &cpu_query_) != ERROR_SUCCESS) {
+        cpu_query_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
+bool Metrics::Impl::EnsureCpuUtility(unsigned long long now) {
+    if (cpu_utility_) return true;
+    if (now < cpu_utility_retry_at_) return false;
+    cpu_utility_retry_at_ = now + kPdhRetryMs;
+    if (!EnsureCpuQuery(now)) return false;
+    cpu_utility_warmed_ = false;
+    if (PdhAddEnglishCounterW(cpu_query_, L"\\Processor Information(_Total)\\% Processor Utility", 0,
+                              &cpu_utility_) != ERROR_SUCCESS) {
+        cpu_utility_ = nullptr;
+        return false;
+    }
+    return true;
+}
+
 bool Metrics::Impl::EnsureCpuFreq(unsigned long long now) {
     if (cpu_freq_ok_) return true;
     if (now < cpu_freq_retry_at_) return false;
     cpu_freq_retry_at_ = now + kPdhRetryMs;
-    const CounterBind binds[] = {
-        {L"\\Processor Information(_Total)\\% Processor Performance", &cpu_freq_perf_},
-        {L"\\Processor Information(_Total)\\Processor Frequency", &cpu_freq_base_},
-    };
+    if (!EnsureCpuQuery(now)) return false;
     cpu_freq_warmed_ = false;
-    cpu_freq_ok_ = OpenEnglishQuery(cpu_freq_query_, binds, 2);
+    // Frequency failures must not close the shared query or drop Utility.
+    if (PdhAddEnglishCounterW(cpu_query_, L"\\Processor Information(_Total)\\% Processor Performance", 0,
+                              &cpu_freq_perf_) != ERROR_SUCCESS ||
+        PdhAddEnglishCounterW(cpu_query_, L"\\Processor Information(_Total)\\Processor Frequency", 0,
+                              &cpu_freq_base_) != ERROR_SUCCESS) {
+        if (cpu_freq_perf_) PdhRemoveCounter(cpu_freq_perf_);
+        if (cpu_freq_base_) PdhRemoveCounter(cpu_freq_base_);
+        cpu_freq_perf_ = cpu_freq_base_ = nullptr;
+        return false;
+    }
+    cpu_freq_ok_ = true;
     return cpu_freq_ok_;
 }
 
@@ -1711,7 +1798,7 @@ PdhRead Metrics::Impl::ReadDisk(double& read_bps, double& write_bps) {
 }
 
 PdhRead Metrics::Impl::ReadCpuFreq(double& mhz) {
-    if (!cpu_freq_query_ || PdhCollectQueryData(cpu_freq_query_) != ERROR_SUCCESS) return PdhRead::Fail;
+    if (!cpu_query_ || !cpu_freq_perf_ || !cpu_freq_base_) return PdhRead::Fail;
     if (!cpu_freq_warmed_) {
         cpu_freq_warmed_ = true;
         return PdhRead::Warmup;
@@ -1922,19 +2009,9 @@ void Metrics::Impl::UpdateSysDisk(unsigned long long now, Snapshot& s) {
     s.sys_disk_free_gb = sys_free_gb_;
 }
 
-void Metrics::Impl::UpdateCpuFreq(unsigned long long now, Snapshot& s) {
-    if (have_cpu_freq_due_ && cpu_freq_warmed_ && now < cpu_freq_due_) {
-        s.cpu_mhz = cpu_mhz_;
-        return;
-    }
-    if (!cpu_freq_ok_ && now < cpu_freq_retry_at_) {
-        s.cpu_mhz = cpu_mhz_;
-        return;
-    }
+void Metrics::Impl::UpdateCpuFreq(Snapshot& s) {
     diagnostics::ScopedTiming timing(L"PDH CPU frequency");
-    cpu_freq_due_ = NextDue(have_cpu_freq_due_, cpu_freq_due_, now, kCpuFreqEveryMs);
-    have_cpu_freq_due_ = true;
-    if (!EnsureCpuFreq(now)) {
+    if (!cpu_freq_ok_) {
         cpu_mhz_ = NAN;
     } else {
         double mhz = NAN;
@@ -2067,8 +2144,8 @@ Snapshot Metrics::Impl::Take(bool full) {
         ReleaseEnergy();
         ReleaseGpu();
         have_net_ = have_cpu_ = have_tick_ = false;
-        disk_warmed_ = cpu_freq_warmed_ = false;
-        have_disk_due_ = have_cpu_freq_due_ = false;
+        disk_warmed_ = cpu_freq_warmed_ = cpu_utility_warmed_ = false;
+        have_disk_due_ = have_cpu_query_tick_ = false;
         if (!full && pdh_buf_.size() > 65536) std::vector<unsigned char>(65536).swap(pdh_buf_);
     }
     if (paused_.load(std::memory_order_relaxed)) {
@@ -2088,7 +2165,7 @@ Snapshot Metrics::Impl::Take(bool full) {
 
     Snapshot s;
     UpdateNet(s, now);
-    UpdateCpu(s);
+    UpdateCpu(s, now, wants.cpu_freq);
     UpdateMem(s, wants.memory_detail);
     UpdateBattery(s, now, dt, has_dt);
     UpdateScheme(now);
@@ -2111,7 +2188,6 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (full && wants.processes) UpdateProcs(s);
     if (wants.disk_io) UpdateDisk(now, s);
     if (wants.sys_disk) UpdateSysDisk(now, s);
-    if (wants.cpu_freq) UpdateCpuFreq(now, s);
     if (wants.uptime) UpdateUptime(s);
     if (wants.gpu_memory) UpdateGpuMemory(now, s);
     if (wants.wifi) UpdateWifi(now, s);
@@ -2146,5 +2222,7 @@ void Metrics::SetPaused(bool paused) {
 }
 
 std::wstring Metrics::LogPath() const { return impl_->probe.LogPath(); }
+
+void Metrics::SetSlowThreshold(int slow_ms) { impl_->probe.SetSlowThreshold(slow_ms); }
 
 }  // namespace pulse

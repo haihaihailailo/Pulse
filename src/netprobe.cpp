@@ -251,7 +251,7 @@ struct Config {
     int interval_s = 5;
     int timeout_s = 4;
     int fail_threshold = 3;
-    int slow_ms = 300;
+    int slow_ms = 500;
     int unusable_ms = 1000;
     std::vector<std::wstring> urls;
 };
@@ -261,10 +261,10 @@ Config Normalize(const Settings& settings) {
     config.interval_s = ClampInt(settings.probe_interval_s, 1, 86400, 5);
     config.timeout_s = ClampInt(settings.probe_timeout_s, 1, 3600, 4);
     config.fail_threshold = ClampInt(settings.fail_threshold, 1, 1000000, 3);
-    config.slow_ms = ClampInt(settings.slow_ms, 1, 2147483646, 300);
+    config.slow_ms = ClampInt(settings.slow_ms, 1, 999, 500);
     config.unusable_ms = ClampInt(settings.unusable_ms, 2, 2147483647, 1000);
     if (config.slow_ms >= config.unusable_ms) {
-        config.slow_ms = 300;
+        config.slow_ms = 500;
         config.unusable_ms = 1000;
     }
     if (settings.probe_urls.empty()) {
@@ -395,6 +395,20 @@ struct NetProbe::Impl {
         if (!cs_ready_) return view_;
         CsLock lock(&status_cs_);
         return view_;
+    }
+
+    void SetSlowThreshold(int slow_ms) {
+        CsLock lock(&status_cs_);
+        config_.slow_ms = ClampInt(slow_ms, 1, config_.unusable_ms - 1, 500);
+        // Classification and configuration share this lock with ApplyResult.
+        // Do not change failure counts, outage timestamps, logs or notifications.
+        if (status_.has_result && status_.latest_ok &&
+            status_.latest_ms < static_cast<ULONGLONG>(config_.unusable_ms) &&
+            (status_.display == Display::Online || status_.display == Display::Slow)) {
+            status_.display = status_.latest_ms >= static_cast<ULONGLONG>(config_.slow_ms)
+                                  ? Display::Slow : Display::Online;
+        }
+        view_ = MakeView(status_);
     }
 
 private:
@@ -712,5 +726,7 @@ void NetProbe::Stop() { impl_->Stop(); }
 std::wstring NetProbe::LogPath() const { return impl_->LogPath(); }
 
 NetProbe::View NetProbe::Get() const { return impl_->Get(); }
+
+void NetProbe::SetSlowThreshold(int slow_ms) { impl_->SetSlowThreshold(slow_ms); }
 
 }  // namespace pulse

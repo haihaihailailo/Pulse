@@ -72,6 +72,11 @@ struct Snapshot {
     double pkg_energy_delta_pwh = NAN, pkg_energy_interval_s = NAN;
     // 完整模式同次采集的 Power 对照值（mW / 1000），用于实测核验 Energy 单位。
     double pkg_power_counter_w = NAN;
+
+    // CPU 诊断：同一采样区间的旧口径，以及未截断的 Processor Utility。
+    // PDH 预热/失败时 Utility 为 NaN，cpu_percent 沿用旧口径或上一值。
+    double cpu_time_percent = NAN, cpu_utility_percent = NAN;
+    bool cpu_from_utility = false;
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。
@@ -84,6 +89,9 @@ struct Settings {
     int probe_interval_s = 5, probe_timeout_s = 4, fail_threshold = 3;
     int slow_ms = 300, unusable_ms = 1000;
     std::vector<std::wstring> probe_urls;  // 空 = 默认三个地址
+
+    // 默认构造使用 500 ms；按只追加约定保留已有字段声明。
+    Settings() : slow_ms(500) {}
 };
 
 // 界面告诉后端需要哪些可选数据；不需要的完全不采集，以省电。
@@ -120,6 +128,9 @@ public:
     void SetWants(const Wants& w);
     void SetPaused(bool paused);      // 窗口最小化/隐藏时暂停采样（网络探测继续，否则断网检测失效）
     std::wstring LogPath() const;
+
+    // 线程安全，立即按新阈值重算最近的可用结果；不重启探测或改变断网计数。
+    void SetSlowThreshold(int slow_ms);
 
 private:
     struct Impl;

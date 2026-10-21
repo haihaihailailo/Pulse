@@ -31,7 +31,9 @@ constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
 constexpr UINT CmdRefresh = 400;
+constexpr UINT CmdSlowThreshold = 450;
 constexpr std::array<UINT, 3> RefreshIntervals{{500u, 1000u, 2000u}};
+constexpr std::array<int, 7> SlowThresholds{{50, 100, 150, 200, 300, 500, 800}};
 constexpr DWORD MainStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
 constexpr DWORD ToastStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
 
@@ -120,6 +122,7 @@ HICON CreatePulseIcon(int size) {
 struct Config {
     int x = INT_MIN, y = INT_MIN;
     UINT refresh_ms = 1000;
+    int slow_ms = 500;
     bool compact = false, pinned = true;
     std::wstring file;
     Components components;
@@ -142,6 +145,11 @@ struct Config {
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
         const UINT interval = GetPrivateProfileIntW(L"Window", L"refresh_ms", 1000, file.c_str());
         refresh_ms = std::find(RefreshIntervals.begin(), RefreshIntervals.end(), interval) != RefreshIntervals.end() ? interval : 1000u;
+        wchar_t slow[32]{};
+        GetPrivateProfileStringW(L"Network", L"slow_ms", L"500", slow, 32, file.c_str());
+        slow_ms = 500;
+        for (const int threshold : SlowThresholds)
+            if (std::to_wstring(threshold) == slow) slow_ms = threshold;
         for (size_t i = 0; i < FullComponents.size(); ++i)
             components.full[i] = ReadComponent(L"Full", FullComponents[i]);
         for (size_t i = 0; i < CompactComponents.size(); ++i)
@@ -157,6 +165,8 @@ struct Config {
         WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
         const auto interval = std::to_wstring(refresh_ms);
         WritePrivateProfileStringW(L"Window", L"refresh_ms", interval.c_str(), file.c_str());
+        const auto slow = std::to_wstring(slow_ms);
+        WritePrivateProfileStringW(L"Network", L"slow_ms", slow.c_str(), file.c_str());
         for (size_t i = 0; i < FullComponents.size(); ++i)
             WritePrivateProfileStringW(L"Full", FullComponents[i].key, components.full[i] ? L"1" : L"0", file.c_str());
         for (size_t i = 0; i < CompactComponents.size(); ++i)
@@ -308,7 +318,9 @@ public:
         AddTray();
         metrics_ = std::make_unique<Metrics>();
         metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
-        metrics_->Start(Settings{}, NetworkEvent, this);
+        Settings settings;
+        settings.slow_ms = config_.slow_ms;
+        metrics_->Start(settings, NetworkEvent, this);
         running_ = true;
         const bool startMinimized = showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE || showCommand == SW_SHOWMINNOACTIVE;
         ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
@@ -558,6 +570,22 @@ private:
                             CmdRefresh + static_cast<UINT>(i), labels[i]);
             AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(refresh), L"刷新间隔");
         }
+        HMENU slow = CreatePopupMenu();
+        if (slow) {
+            const wchar_t* labels[] = {L"50 ms", L"100 ms", L"150 ms", L"200 ms",
+                                       L"300 ms", L"500 ms（默认）", L"800 ms"};
+            static_assert(sizeof(labels) / sizeof(labels[0]) == SlowThresholds.size(), "labels");
+            UINT selected = CmdSlowThreshold + 5;
+            for (size_t i = 0; i < SlowThresholds.size(); ++i) {
+                const UINT id = CmdSlowThreshold + static_cast<UINT>(i);
+                AppendMenuW(slow, MF_STRING, id, labels[i]);
+                if (config_.slow_ms == SlowThresholds[i]) selected = id;
+            }
+            CheckMenuRadioItem(slow, CmdSlowThreshold,
+                              CmdSlowThreshold + static_cast<UINT>(SlowThresholds.size()) - 1,
+                              selected, MF_BYCOMMAND);
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(slow), L"延迟较慢阈值");
+        }
         HMENU contents = CreatePopupMenu();
         HMENU full = CreatePopupMenu();
         HMENU compact = CreatePopupMenu();
@@ -592,6 +620,13 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (command >= CmdSlowThreshold && command < CmdSlowThreshold + static_cast<UINT>(SlowThresholds.size())) {
+            config_.slow_ms = SlowThresholds[command - CmdSlowThreshold];
+            if (metrics_) metrics_->SetSlowThreshold(config_.slow_ms);
+            Refresh(); // Repaint the reclassified result immediately; no new HTTP probe.
+            Save();
+            return;
+        }
         if (command >= CmdRefresh && command < CmdRefresh + static_cast<UINT>(RefreshIntervals.size())) {
             config_.refresh_ms = RefreshIntervals[command - CmdRefresh];
             if (!config_.compact) Sampling(false, true);
