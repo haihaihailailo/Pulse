@@ -15,3 +15,8 @@ shot*.png
 # 打包与 MSVC 构建输出
 dist/
 build-msvc/
+# 仅本地保留的内部文件（交接文档、任务说明、旧截图、帖子草稿）
+CLAUDE.md
+docs/agent-tasks/
+docs/screenshots/python-*.png
+docs/promo/

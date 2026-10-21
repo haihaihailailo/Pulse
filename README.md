@@ -2,6 +2,11 @@
 
 Pulse 是 Windows 桌面悬浮小组件：一个静态链接的 `Pulse.exe`，用原生 C++17、Win32 和 Direct2D 显示硬件、电池与网络状态。
 
+[下载最新版](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11 64 位 · 免安装
+
+<p align="center"><img src="docs/screenshots/demo-full.webp" alt="Pulse 完整模式" width="400"></p>
+<p align="center"><img src="docs/screenshots/demo-compact.webp" alt="Pulse 迷你模式" width="760"></p>
+
 ## 功能
 
 完整模式默认自上而下显示：
