@@ -1,0 +1,317 @@
+// Console profiler: --samples N (default 60), --compact, --brief, --url URL,
+// --interval-ms 500|1000|2000, --switch-every N.
+// Timings are per actual collection, not per cached Sample() call.
+// g++ -std=c++17 -O2 -municode -static -finput-charset=UTF-8 -fexec-charset=UTF-8
+//   -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp
+//   -lwinhttp -lpowrprof -lpdh -liphlpapi -lws2_32 -lsetupapi
+
+#include "metrics.h"
+#include "netprobe.h"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include <windows.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cwchar>
+#include <cstdlib>
+#include <array>
+#include <algorithm>
+#include <fcntl.h>
+#include <io.h>
+#include <string>
+
+#ifndef _O_U16TEXT
+#define _O_U16TEXT 0x00020000
+#endif
+
+namespace {
+
+CRITICAL_SECTION g_print{};
+struct TimingRow {
+    const wchar_t* name = nullptr;
+    unsigned long long count = 0;
+    double wall = 0, cpu = 0, max_wall = 0, max_cpu = 0;
+};
+std::array<TimingRow, 22> g_timings{{
+    {L"Battery"}, {L"Power scheme"}, {L"PDH Energy Meter"}, {L"PDH GPU Engine"},
+    {L"Network throughput"}, {L"NIC discovery (within throughput)"}, {L"CPU"}, {L"Memory"},
+    {L"Process scan"}, {L"Network view (no HTTP)"}, {L"Sample total (includes stages)"},
+    {L"Network primary"}, {L"Network backups (parallel)"}, {L"Network callback"},
+    {L"Memory detail"}, {L"PDH Disk IO"}, {L"System disk"}, {L"PDH CPU frequency"},
+    {L"Uptime"}, {L"PDH GPU memory"}, {L"Wi-Fi"}, {L"Battery health"}
+}};
+
+void OnTiming(const wchar_t* name, double wall, double cpu, void*) {
+    // No console I/O or allocation in the measured sampling/network paths.
+    EnterCriticalSection(&g_print);
+    for (auto& row : g_timings) {
+        if (!row.name) row.name = name;
+        if (std::wcscmp(row.name, name) != 0) continue;
+        ++row.count;
+        row.wall += wall; row.cpu += cpu;
+        row.max_wall = std::max(row.max_wall, wall);
+        row.max_cpu = std::max(row.max_cpu, cpu);
+        break;
+    }
+    LeaveCriticalSection(&g_print);
+}
+
+unsigned long long ProcessCpuTicks() {
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    ULARGE_INTEGER k{}, u{};
+    k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+    return k.QuadPart + u.QuadPart;
+}
+
+void PrintTimings(double wall_ms, double process_cpu_ms) {
+    std::wprintf(L"\n每次实际采样耗时 ms / 线程 CPU ms（QPC / GetThreadTimes）\n");
+    for (const auto& row : g_timings) {
+        if (!row.count) {
+            std::wprintf(L"%ls: n=0（未执行）\n", row.name);
+            continue;
+        }
+        const double count = static_cast<double>(row.count);
+        std::wprintf(L"%ls: n=%llu, 每次 %.4f ms / %.4f CPU ms, 最大 %.4f / %.4f, 累计 %.4f / %.4f\n",
+            row.name, row.count, row.wall / count, row.cpu / count,
+            row.max_wall, row.max_cpu, row.wall, row.cpu);
+    }
+    std::wprintf(L"总墙钟 %.1f ms，进程全部线程 CPU %.3f ms，单核占用 %.4f%%\n",
+        wall_ms, process_cpu_ms, wall_ms > 0 ? 100 * process_cpu_ms / wall_ms : 0.0);
+    std::wprintf(L"Sample total 包含各采样项；NIC discovery 包含于网速，不可相加。\n"
+                 L"Network primary/backups 是协调线程耗时；Network callback 单列。\n"
+                 L"进程 CPU 包含 WinHTTP 内部线程、初始化、诊断及打印开销。线程 CPU 可能因计时粒度显示 0；建议 --brief --samples 120。\n");
+}
+
+bool CheckDurations() {
+    const std::uint64_t seconds[] = {0, 59, 60, 3599, 3600, 3660, 90000};
+    const wchar_t* expected[] = {L"0 秒", L"59 秒", L"1 分 0 秒", L"59 分 59 秒",
+                                 L"1 小时 0 分", L"1 小时 1 分", L"25 小时 0 分"};
+    for (std::size_t i = 0; i < sizeof(seconds) / sizeof(seconds[0]); ++i) {
+        if (pulse::FormatOutageDuration(seconds[i]) != expected[i]) {
+            std::wprintf(L"FAIL duration at %llu seconds\n", static_cast<unsigned long long>(seconds[i]));
+            return false;
+        }
+    }
+    std::wprintf(L"duration boundaries: PASS\n");
+    return true;
+}
+
+const wchar_t* ModeName(pulse::PowerMode mode) {
+    switch (mode) {
+    case pulse::PowerMode::Unknown:
+        return L"Unknown";
+    case pulse::PowerMode::NoBattery:
+        return L"NoBattery";
+    case pulse::PowerMode::Discharging:
+        return L"Discharging";
+    case pulse::PowerMode::Charging:
+        return L"Charging";
+    case pulse::PowerMode::AcIdle:
+        return L"AcIdle";
+    }
+    return L"?";
+}
+
+const wchar_t* NetName(pulse::NetState state) {
+    switch (state) {
+    case pulse::NetState::Checking:
+        return L"Checking";
+    case pulse::NetState::Online:
+        return L"Online";
+    case pulse::NetState::Slow:
+        return L"Slow";
+    case pulse::NetState::Offline:
+        return L"Offline";
+    }
+    return L"?";
+}
+
+void LockPrint() { EnterCriticalSection(&g_print); }
+void UnlockPrint() { LeaveCriticalSection(&g_print); }
+
+void PrintDouble(const wchar_t* key, double value) {
+    LockPrint();
+    if (std::isnan(value)) std::wprintf(L"%ls=nan\n", key);
+    else std::wprintf(L"%ls=%ls\n", key, std::to_wstring(value).c_str());
+    UnlockPrint();
+}
+
+void PrintBool(const wchar_t* key, bool value) {
+    LockPrint();
+    std::wprintf(L"%ls=%ls\n", key, value ? L"true" : L"false");
+    UnlockPrint();
+}
+
+void PrintInt(const wchar_t* key, long long value) {
+    LockPrint();
+    std::wprintf(L"%ls=%ls\n", key, std::to_wstring(value).c_str());
+    UnlockPrint();
+}
+
+void PrintText(const wchar_t* key, const std::wstring& value) {
+    LockPrint();
+    std::wprintf(L"%ls=%ls\n", key, value.c_str());
+    UnlockPrint();
+}
+
+void PrintSample(int index, const pulse::Snapshot& s) {
+    LockPrint();
+    std::wprintf(L"--- sample %ls ---\n", std::to_wstring(index).c_str());
+    UnlockPrint();
+    PrintText(L"mode", ModeName(s.mode));
+    PrintInt(L"percent", s.percent);
+    PrintDouble(L"power_w", s.power_w);
+    PrintDouble(L"eta_s", s.eta_s);
+    PrintBool(L"eta_from_system", s.eta_from_system);
+    PrintDouble(L"eta20_s", s.eta20_s);
+    PrintDouble(L"pct_per_hour", s.pct_per_hour);
+    PrintDouble(L"on_battery_s", s.on_battery_s);
+    PrintBool(L"on_battery_since_start", s.on_battery_since_start);
+    PrintDouble(L"avg_w", s.avg_w);
+    PrintDouble(L"remaining_wh", s.remaining_wh);
+    PrintDouble(L"full_wh", s.full_wh);
+    PrintBool(L"battery_saver", s.battery_saver);
+    PrintText(L"power_scheme", s.power_scheme);
+    PrintDouble(L"pkg_w", s.pkg_w);
+    PrintDouble(L"cpu_w", s.cpu_w);
+    PrintDouble(L"gpu_w", s.gpu_w);
+    PrintDouble(L"mem_w", s.mem_w);
+    PrintBool(L"pkg_power_from_energy", s.pkg_power_from_energy);
+    PrintDouble(L"pkg_energy_delta_pwh", s.pkg_energy_delta_pwh);
+    PrintDouble(L"pkg_energy_interval_s", s.pkg_energy_interval_s);
+    PrintDouble(L"pkg_power_counter_w", s.pkg_power_counter_w);
+    PrintDouble(L"gpu_percent", s.gpu_percent);
+    PrintDouble(L"down_bps", s.down_bps);
+    PrintDouble(L"up_bps", s.up_bps);
+    PrintInt(L"rx_total", static_cast<long long>(s.rx_total));
+    PrintInt(L"tx_total", static_cast<long long>(s.tx_total));
+    PrintText(L"net_state", NetName(s.net_state));
+    PrintDouble(L"latency_ms", s.latency_ms);
+    PrintInt(L"offline_since_unix", static_cast<long long>(s.offline_since_unix));
+    PrintBool(L"offline_by_latency", s.offline_by_latency);
+    PrintDouble(L"cpu_percent", s.cpu_percent);
+    PrintDouble(L"mem_percent", s.mem_percent);
+    PrintInt(L"top_count", static_cast<long long>(s.top_procs.size()));
+    for (std::size_t i = 0; i < s.top_procs.size(); ++i) {
+        const std::wstring name_key = L"top" + std::to_wstring(i) + L"_name";
+        const std::wstring cpu_key = L"top" + std::to_wstring(i) + L"_cpu";
+        PrintText(name_key.c_str(), s.top_procs[i].name);
+        PrintDouble(cpu_key.c_str(), s.top_procs[i].cpu_percent);
+    }
+    PrintDouble(L"self_cpu_percent", s.self_cpu_percent);
+    PrintDouble(L"mem_used_gb", s.mem_used_gb);
+    PrintDouble(L"mem_total_gb", s.mem_total_gb);
+    PrintDouble(L"disk_read_bps", s.disk_read_bps);
+    PrintDouble(L"disk_write_bps", s.disk_write_bps);
+    PrintDouble(L"sys_disk_used_percent", s.sys_disk_used_percent);
+    PrintDouble(L"sys_disk_free_gb", s.sys_disk_free_gb);
+    PrintDouble(L"cpu_mhz", s.cpu_mhz);
+    PrintInt(L"process_count", s.process_count);
+    PrintDouble(L"uptime_s", s.uptime_s);
+    PrintDouble(L"gpu_shared_mem_mb", s.gpu_shared_mem_mb);
+    PrintDouble(L"gpu_dedicated_mem_mb", s.gpu_dedicated_mem_mb);
+    PrintText(L"wifi_ssid", s.wifi_ssid);
+    PrintInt(L"wifi_signal", s.wifi_signal);
+    PrintDouble(L"battery_health_percent", s.battery_health_percent);
+    PrintInt(L"battery_cycles", s.battery_cycles);
+    PrintDouble(L"fps", s.fps);
+    LockPrint();
+    std::fflush(stdout);
+    UnlockPrint();
+}
+
+void OnNet(const pulse::NetEvent& event, void*) {
+    LockPrint();
+    std::wprintf(L"NET recovered=%ls msg=%ls\n", event.recovered ? L"true" : L"false",
+                 event.message.c_str());
+    std::fflush(stdout);
+    UnlockPrint();
+}
+
+}  // namespace
+
+int wmain(int argc, wchar_t** argv) {
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    int samples = 60, interval_ms = 1000, switch_every = 0;
+    bool full = true, brief = false;
+    pulse::Settings settings;
+    for (int i = 1; i < argc; ++i) {
+        if (std::wcscmp(argv[i], L"--compact") == 0) full = false;
+        else if (std::wcscmp(argv[i], L"--brief") == 0) brief = true;
+        else if (std::wcscmp(argv[i], L"--url") == 0 && i + 1 < argc)
+            settings.probe_urls.emplace_back(argv[++i]);
+        else if (std::wcscmp(argv[i], L"--samples") == 0 && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const long value = std::wcstol(argv[++i], &end, 10);
+            if (!end || *end || value < 1 || value > 86400) return 2;
+            samples = static_cast<int>(value);
+        } else if (std::wcscmp(argv[i], L"--interval-ms") == 0 && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const long value = std::wcstol(argv[++i], &end, 10);
+            if (!end || *end || (value != 500 && value != 1000 && value != 2000)) return 2;
+            interval_ms = static_cast<int>(value);
+        } else if (std::wcscmp(argv[i], L"--switch-every") == 0 && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const long value = std::wcstol(argv[++i], &end, 10);
+            if (!end || *end || value < 1 || value > 86400) return 2;
+            switch_every = static_cast<int>(value);
+        } else {
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--url URL ...]\n");
+            return 2;
+        }
+    }
+    if (!CheckDurations()) return 1;
+    InitializeCriticalSection(&g_print);
+    pulse::diagnostics::SetTimingCallback(OnTiming, nullptr);
+    LARGE_INTEGER frequency{}, start{}, finish{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    const auto cpu_start = ProcessCpuTicks();
+    {
+        pulse::Metrics metrics;
+        const auto wants_for = [](bool detailed, pulse::PowerMode mode) {
+            pulse::Wants w;
+            w.chip_power = detailed || mode != pulse::PowerMode::Discharging;
+            w.gpu_usage = w.processes = detailed;
+            w.memory_detail = w.disk_io = w.sys_disk = w.cpu_freq = detailed;
+            w.uptime = w.gpu_memory = w.wifi = w.battery_health = detailed;
+            return w;
+        };
+        pulse::PowerMode mode = pulse::PowerMode::Unknown;
+        metrics.SetWants(wants_for(full, mode));
+        std::wprintf(L"mode=%ls samples=%d full_interval_ms=%d compact_interval_ms=2000 switch_every=%d log=%ls\n",
+            full ? L"full" : L"compact", samples, interval_ms, switch_every, metrics.LogPath().c_str());
+        std::wprintf(L"Energy raw: pWh; W = delta_pwh * 3.6e-9 / QPC_seconds. Compact/fallback: Power mW / 1000.\n");
+        metrics.Start(settings, OnNet, nullptr);
+        for (int i = 0; i < samples; ++i) {
+            const bool detailed = switch_every && (i / switch_every) % 2 ? !full : full;
+            if (i > 0) Sleep(detailed ? static_cast<DWORD>(interval_ms) : 2000u);
+            metrics.SetWants(wants_for(detailed, mode));
+            const auto snapshot = metrics.Sample(detailed);
+            mode = snapshot.mode;
+            if (!brief) {
+                std::wprintf(L"collection_mode=%ls\n", detailed ? L"full" : L"compact");
+                PrintSample(i, snapshot);
+            }
+        }
+    } // Stop WinHTTP and wait for its callbacks before clearing the diagnostics sink.
+    const auto cpu_finish = ProcessCpuTicks();
+    QueryPerformanceCounter(&finish);
+    pulse::diagnostics::SetTimingCallback(nullptr, nullptr);
+    const double wall_ms = frequency.QuadPart > 0 ?
+        (finish.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart : 0.0;
+    PrintTimings(wall_ms, static_cast<double>(cpu_finish - cpu_start) / 10000.0);
+    DeleteCriticalSection(&g_print);
+    return 0;
+}
+

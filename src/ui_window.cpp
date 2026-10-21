@@ -1,0 +1,931 @@
+﻿#include "ui_window.h"
+#include "ui_renderer.h"
+#include "metrics.h"
+#include <windowsx.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <mmsystem.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <climits>
+#include <cwchar>
+#include <memory>
+#include <utility>
+#include <vector>
+
+namespace pulse::ui {
+namespace {
+constexpr wchar_t MainClass[] = L"Pulse.Native.Main.v1";
+constexpr wchar_t ToastClass[] = L"Pulse.Native.Notification.v1";
+constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr UINT SampleTimer = 1;
+constexpr UINT TrayMessage = WM_APP + 1;
+constexpr UINT NetMessage = WM_APP + 2;
+constexpr UINT ShowMessage = WM_APP + 3;
+constexpr UINT ReapToastMessage = WM_APP + 4;
+constexpr UINT ArrangeToastMessage = WM_APP + 5;
+constexpr UINT DpiFitMessage = WM_APP + 6;
+constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
+constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
+constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
+constexpr UINT CmdRefresh = 400;
+constexpr std::array<UINT, 3> RefreshIntervals{{500u, 1000u, 2000u}};
+constexpr DWORD MainStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
+constexpr DWORD ToastStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
+
+void SetSampleTimer(HWND window, bool compact, UINT fullInterval) {
+    using CoalescableTimerFn = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
+    static const auto coalescable = reinterpret_cast<CoalescableTimerFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetCoalescableTimer"));
+    const UINT interval = compact ? 2000u : fullInterval;
+    // Full mode prioritizes response time; keep compact mode's existing coalescing.
+    const ULONG tolerance = compact ? 300u : 0xffffffffu; // TIMERV_NO_COALESCING
+    if (!coalescable || !coalescable(window, SampleTimer, interval, nullptr, tolerance))
+        SetTimer(window, SampleTimer, interval, nullptr);
+}
+
+int Pixels(float dip, UINT dpi) { return static_cast<int>(std::ceil(dip * dpi / 96.0f)); }
+int ClampCoordinate(int value, int start, int end, int size) {
+    return std::max(start, std::min(value, std::max(start, end - size)));
+}
+RECT WorkArea(HMONITOR monitor) {
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info)) return info.rcWork;
+    RECT work{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    return work;
+}
+struct PaintSession {
+    HWND window;
+    PAINTSTRUCT state{};
+    explicit PaintSession(HWND value) : window(value) { BeginPaint(window, &state); }
+    ~PaintSession() { EndPaint(window, &state); }
+};
+std::wstring ExecutablePath() {
+    std::vector<wchar_t> buffer(512);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (!length) return {};
+        if (length < buffer.size() - 1) return std::wstring(buffer.data(), length);
+        if (buffer.size() >= 32768) return {};
+        buffer.resize(std::min(size_t(32768), buffer.size() * 2));
+    }
+}
+HICON CreatePulseIcon(int size) {
+    BITMAPV5HEADER header{};
+    header.bV5Size = sizeof(header);
+    header.bV5Width = size;
+    header.bV5Height = -size;
+    header.bV5Planes = 1;
+    header.bV5BitCount = 32;
+    header.bV5Compression = BI_BITFIELDS;
+    header.bV5RedMask = 0x00ff0000;
+    header.bV5GreenMask = 0x0000ff00;
+    header.bV5BlueMask = 0x000000ff;
+    header.bV5AlphaMask = 0xff000000;
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, reinterpret_cast<BITMAPINFO*>(&header), DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!color) return nullptr;
+    auto* pixels = static_cast<DWORD*>(bits);
+    const POINT wave[] = {{3,16},{9,16},{12,8},{17,25},{21,13},{24,16},{29,16}};
+    auto segmentDistance = [](float x, float y, POINT a, POINT b) {
+        const float dx = static_cast<float>(b.x - a.x), dy = static_cast<float>(b.y - a.y);
+        const float t = std::clamp(((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy), 0.0f, 1.0f);
+        return std::hypot(x - (a.x + t * dx), y - (a.y + t * dy));
+    };
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const float u = (x + .5f) * 32 / size, v = (y + .5f) * 32 / size;
+        const float qx = std::max(std::abs(u - 16) - 9, 0.0f), qy = std::max(std::abs(v - 16) - 9, 0.0f);
+        if (std::hypot(qx, qy) > 6) { pixels[y * size + x] = 0; continue; }
+        float distance = 100;
+        for (size_t i = 1; i < sizeof(wave) / sizeof(wave[0]); ++i)
+            distance = std::min(distance, segmentDistance(u, v, wave[i - 1], wave[i]));
+        pixels[y * size + x] = distance <= 1.2f ? 0xff34d399 : 0xff151c2f;
+    }
+    const std::vector<BYTE> maskBits(static_cast<size_t>((size + 15) / 16 * 2 * size), 0);
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits.data());
+    ICONINFO info{};
+    info.fIcon = TRUE;
+    info.hbmColor = color;
+    info.hbmMask = mask;
+    HICON icon = mask ? CreateIconIndirect(&info) : nullptr;
+    if (mask) DeleteObject(mask);
+    DeleteObject(color);
+    return icon;
+}
+
+struct Config {
+    int x = INT_MIN, y = INT_MIN;
+    UINT refresh_ms = 1000;
+    bool compact = false, pinned = true;
+    std::wstring file;
+    Components components;
+    bool ReadComponent(const wchar_t* section, const ComponentInfo& info) const {
+        wchar_t value[16]{};
+        GetPrivateProfileStringW(section, info.key, L"", value, 16, file.c_str());
+        if (std::wcscmp(value, L"0") == 0) return false;
+        if (std::wcscmp(value, L"1") == 0) return true;
+        return info.enabled;
+    }
+    bool Load() {
+        wchar_t directory[MAX_PATH]{};
+        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, nullptr, SHGFP_TYPE_CURRENT, directory))) return false;
+        std::wstring folder = std::wstring(directory) + L"\\Pulse";
+        if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+        file = folder + L"\\settings.ini";
+        x = static_cast<int>(GetPrivateProfileIntW(L"Window", L"X", INT_MIN, file.c_str()));
+        y = static_cast<int>(GetPrivateProfileIntW(L"Window", L"Y", INT_MIN, file.c_str()));
+        compact = GetPrivateProfileIntW(L"Window", L"Compact", 0, file.c_str()) != 0;
+        pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
+        const UINT interval = GetPrivateProfileIntW(L"Window", L"refresh_ms", 1000, file.c_str());
+        refresh_ms = std::find(RefreshIntervals.begin(), RefreshIntervals.end(), interval) != RefreshIntervals.end() ? interval : 1000u;
+        for (size_t i = 0; i < FullComponents.size(); ++i)
+            components.full[i] = ReadComponent(L"Full", FullComponents[i]);
+        for (size_t i = 0; i < CompactComponents.size(); ++i)
+            components.compact[i] = ReadComponent(L"Compact", CompactComponents[i]);
+        return true;
+    }
+    void Save() const {
+        if (file.empty()) return;
+        const auto sx = std::to_wstring(x), sy = std::to_wstring(y);
+        WritePrivateProfileStringW(L"Window", L"X", sx.c_str(), file.c_str());
+        WritePrivateProfileStringW(L"Window", L"Y", sy.c_str(), file.c_str());
+        WritePrivateProfileStringW(L"Window", L"Compact", compact ? L"1" : L"0", file.c_str());
+        WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
+        const auto interval = std::to_wstring(refresh_ms);
+        WritePrivateProfileStringW(L"Window", L"refresh_ms", interval.c_str(), file.c_str());
+        for (size_t i = 0; i < FullComponents.size(); ++i)
+            WritePrivateProfileStringW(L"Full", FullComponents[i].key, components.full[i] ? L"1" : L"0", file.c_str());
+        for (size_t i = 0; i < CompactComponents.size(); ++i)
+            WritePrivateProfileStringW(L"Compact", CompactComponents[i].key, components.compact[i] ? L"1" : L"0", file.c_str());
+    }
+};
+
+class Toast {
+public:
+    explicit Toast(NetEvent event, HWND notify) : event_(std::move(event)), notify_(notify) {}
+    ~Toast() { if (window_) DestroyWindow(window_); }
+    bool Open(HINSTANCE instance, UINT dpi) {
+        if (FAILED(renderer_.Initialize())) return false;
+        dpi_ = dpi;
+        height_ = renderer_.ToastHeight(event_.message);
+        window_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            ToastClass, L"Pulse · 网络提醒", ToastStyle, 0, 0, Pixels(300, dpi_), Pixels(height_, dpi_),
+            nullptr, nullptr, instance, this);
+        return window_ != nullptr;
+    }
+    HWND Window() const { return window_; }
+    int Width(UINT dpi) const { return Pixels(300, dpi); }
+    int Height(UINT dpi) const { return Pixels(height_, dpi); }
+    void Place(int x, int y, int height, UINT dpi) {
+        dpi_ = dpi;
+        renderer_.SetDpi(dpi);
+        SetWindowPos(window_, HWND_TOPMOST, x, y, Width(dpi), height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    static LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
+        auto* self = reinterpret_cast<Toast*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (message == WM_NCCREATE) {
+            self = static_cast<Toast*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+            self->window_ = window;
+            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (!self) return DefWindowProcW(window, message, w, l);
+        try {
+        switch (message) {
+        case WM_CREATE:
+            self->dpi_ = WindowDpi(window);
+            self->renderer_.SetWindow(window, self->dpi_);
+            StyleWindow(window);
+            return 0;
+        case WM_NCCALCSIZE: return 0;
+        case WM_NCHITTEST: return HTCLIENT;
+        case WM_ERASEBKGND: return 1;
+        case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+        case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE;
+        case WM_PAINT: {
+            PaintSession paint(window);
+            self->renderer_.PaintToast(self->event_);
+            return 0;
+        }
+        case WM_SIZE: self->renderer_.Resize(); return 0;
+        case WM_DPICHANGED: {
+            self->dpi_ = HIWORD(w);
+            self->renderer_.SetDpi(self->dpi_);
+            const auto* r = reinterpret_cast<RECT*>(l);
+            SetWindowPos(window, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(window, nullptr, FALSE);
+            PostMessageW(self->notify_, ArrangeToastMessage, 0, 0);
+            return 0;
+        }
+        case WM_DWMCOMPOSITIONCHANGED: StyleWindow(window); return 0;
+        case WM_LBUTTONUP: case WM_CLOSE: DestroyWindow(window); return 0;
+        case WM_NCDESTROY:
+            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+            self->window_ = nullptr;
+            self->renderer_.DiscardTarget();
+            PostMessageW(self->notify_, ReapToastMessage, 0, 0);
+            break;
+        }
+        return DefWindowProcW(window, message, w, l);
+        } catch (...) {
+            if (message == WM_NCCREATE) return FALSE;
+            if (message == WM_CREATE) return -1;
+            PostMessageW(window, WM_CLOSE, 0, 0);
+            return 0;
+        }
+    }
+private:
+    NetEvent event_;
+    HWND window_ = nullptr, notify_ = nullptr;
+    Renderer renderer_;
+    UINT dpi_ = 96;
+    float height_ = 96;
+};
+
+class Application {
+public:
+    explicit Application(HINSTANCE instance) : instance_(instance) {}
+    ~Application() {
+        callbackWindow_.store(nullptr, std::memory_order_release);
+        metrics_.reset();
+        toasts_.clear();
+        if (window_ && IsWindow(window_)) DestroyWindow(window_);
+        RemoveTray();
+        if (registeredMain_) UnregisterClassW(MainClass, instance_);
+        if (registeredToast_) UnregisterClassW(ToastClass, instance_);
+        if (icon_) DestroyIcon(icon_);
+        if (smallIcon_) DestroyIcon(smallIcon_);
+    }
+    int Execute(int showCommand) {
+        config_.Load();
+        if (FAILED(renderer_.Initialize())) {
+            MessageBoxW(nullptr, L"无法初始化 Direct2D / DirectWrite。", L"Pulse", MB_OK | MB_ICONERROR);
+            return 1;
+        }
+        icon_ = CreatePulseIcon(32);
+        smallIcon_ = CreatePulseIcon(16);
+        WNDCLASSEXW cls{};
+        cls.cbSize = sizeof(cls);
+        cls.style = CS_DBLCLKS;
+        cls.lpfnWndProc = Procedure;
+        cls.hInstance = instance_;
+        cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        cls.hIcon = icon_;
+        cls.hIconSm = smallIcon_;
+        cls.lpszClassName = MainClass;
+        if (!RegisterClassExW(&cls)) return 1;
+        registeredMain_ = true;
+        cls.lpfnWndProc = Toast::Procedure;
+        cls.lpszClassName = ToastClass;
+        if (!RegisterClassExW(&cls)) return 1;
+        registeredToast_ = true;
+        taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
+        POINT initial{config_.x == INT_MIN ? 0 : config_.x, config_.y == INT_MIN ? 0 : config_.y};
+        const auto monitor = MonitorFromPoint(initial, config_.x == INT_MIN ? MONITOR_DEFAULTTOPRIMARY : MONITOR_DEFAULTTONEAREST);
+        const RECT work = WorkArea(monitor);
+        dpi_ = MonitorDpi(monitor);
+        renderer_.SetComponents(config_.components, config_.compact);
+        model_.Update(Snapshot{}, config_.compact, config_.components);
+        const int width = Pixels(ContentWidth(), dpi_);
+        const int height = config_.compact ? Pixels(ContentHeight(), dpi_) :
+            std::min(Pixels(ContentHeight(), dpi_), std::max(1, static_cast<int>(work.bottom - work.top)));
+        if (config_.x == INT_MIN || config_.y == INT_MIN) {
+            config_.x = work.right - width - Pixels(24, dpi_);
+            config_.y = work.top + Pixels(24, dpi_);
+        }
+        config_.x = ClampCoordinate(config_.x, work.left, work.right, width);
+        config_.y = ClampCoordinate(config_.y, work.top, work.bottom, height);
+        window_ = CreateWindowExW(WS_EX_APPWINDOW, MainClass, L"Pulse", MainStyle,
+            config_.x, config_.y, width, height, nullptr, nullptr, instance_, this);
+        if (!window_) return 1;
+        callbackWindow_.store(window_, std::memory_order_release);
+        Fit(false);
+        SetWindowPos(window_, config_.pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        AddTray();
+        metrics_ = std::make_unique<Metrics>();
+        metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
+        metrics_->Start(Settings{}, NetworkEvent, this);
+        running_ = true;
+        const bool startMinimized = showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE || showCommand == SW_SHOWMINNOACTIVE;
+        ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
+        Sampling(true);
+        UpdateWindow(window_);
+        MSG message{};
+        BOOL result;
+        while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        return result < 0 ? 1 : static_cast<int>(message.wParam);
+    }
+    static LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
+        auto* self = reinterpret_cast<Application*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (message == WM_NCCREATE) {
+            self = static_cast<Application*>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+            self->window_ = window;
+            SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (!self) return DefWindowProcW(window, message, w, l);
+        try { return self->Handle(message, w, l); }
+        catch (...) {
+            if (message == WM_NCCREATE) return FALSE;
+            if (message == WM_CREATE) return -1;
+            // Never unwind a C++ exception through a Win32 window procedure.
+            PostMessageW(window, WM_CLOSE, 0, 0);
+            return 0;
+        }
+    }
+private:
+    static void NetworkEvent(const NetEvent& event, void* user) noexcept {
+        auto* app = static_cast<Application*>(user);
+        const HWND window = app->callbackWindow_.load(std::memory_order_acquire);
+        if (!window) return;
+        try {
+            auto copy = std::make_unique<NetEvent>(event);
+            if (PostMessageW(window, NetMessage, 0, reinterpret_cast<LPARAM>(copy.get()))) copy.release();
+        } catch (...) {}
+    }
+    float ContentWidth() const { return config_.compact ? renderer_.CompactWidth() : 320; }
+    float ContentHeight() const { return config_.compact ? 40 : FullLayout(config_.components).height; }
+    float CurrentWidth() const {
+        RECT r{};
+        GetClientRect(window_, &r);
+        return static_cast<float>(r.right) * 96 / dpi_;
+    }
+    Button Hit(LPARAM l) const {
+        return renderer_.HitTest(GET_X_LPARAM(l) * 96.0f / dpi_, GET_Y_LPARAM(l) * 96.0f / dpi_, config_.compact, CurrentWidth());
+    }
+    void CapturePosition() {
+        if (!window_ || IsIconic(window_)) return;
+        RECT r{};
+        if (GetWindowRect(window_, &r)) { config_.x = r.left; config_.y = r.top; }
+    }
+    void Save() { CapturePosition(); config_.Save(); }
+    void Fit(bool anchor, const RECT* suggestion = nullptr) {
+        if (!window_ || fitting_ || IsIconic(window_)) return;
+        RECT old{};
+        GetWindowRect(window_, &old);
+        RECT base = suggestion ? *suggestion : old;
+        const auto monitor = MonitorFromRect(&base, MONITOR_DEFAULTTONEAREST);
+        const RECT work = WorkArea(monitor);
+        const int width = Pixels(ContentWidth(), dpi_);
+        const int height = config_.compact ? Pixels(ContentHeight(), dpi_) :
+            std::min(Pixels(ContentHeight(), dpi_), std::max(1, static_cast<int>(work.bottom - work.top)));
+        int x = base.left, y = base.top;
+        if (anchor && !suggestion) {
+            MONITORINFO info{};
+            info.cbSize = sizeof(info);
+            const RECT screen = GetMonitorInfoW(monitor, &info) ? info.rcMonitor : work;
+            if (static_cast<long long>(old.left) + old.right > static_cast<long long>(screen.left) + screen.right) x = old.right - width;
+            if (static_cast<long long>(old.top) + old.bottom > static_cast<long long>(screen.top) + screen.bottom) y = old.bottom - height;
+        }
+        x = ClampCoordinate(x, work.left, work.right, width);
+        y = ClampCoordinate(y, work.top, work.bottom, height);
+        ClampScroll(height * 96.0f / dpi_);
+        if (old.left == x && old.top == y && old.right - old.left == width && old.bottom - old.top == height) return;
+        fitting_ = true;
+        SetWindowPos(window_, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+        fitting_ = false;
+        CapturePosition();
+    }
+    void ClampScroll(float viewport = 0) {
+        if (viewport <= 0) {
+            RECT client{};
+            GetClientRect(window_, &client);
+            viewport = client.bottom * 96.0f / dpi_;
+        }
+        scroll_ = config_.compact ? 0 : std::clamp(scroll_, 0.0f, std::max(0.0f, ContentHeight() - viewport));
+        renderer_.SetScroll(scroll_);
+    }
+    Snapshot ReadMetrics() {
+        auto sample = metrics_->Sample(!config_.compact);
+        if (powerMode_ != sample.mode) {
+            powerMode_ = sample.mode;
+            metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
+        }
+        return sample;
+    }
+    void Refresh() {
+        if (!running_ || !active_ || !metrics_) return;
+        const auto sample = ReadMetrics();
+        if (model_.Update(sample, config_.compact, config_.components) || renderLost_) repaintPending_ = true;
+        // Keep sampling while covered, then draw the newest view when exposed.
+        // Checking once per sample also recovers if no exposure WM_PAINT arrives.
+        if (repaintPending_ && renderer_.CanRender()) {
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+    }
+    void Sampling(bool sampleNow, bool resetTimer = false) {
+        if (!running_ || !metrics_) return;
+        const bool active = IsWindowVisible(window_) && !IsIconic(window_);
+        const bool changed = active_ != active;
+        if (changed || resetTimer || !active) KillTimer(window_, SampleTimer);
+        metrics_->SetPaused(!active);
+        active_ = active;
+        if (!active) return;
+        if (changed) model_.BreakHistory();
+        if (changed || resetTimer) SetSampleTimer(window_, config_.compact, config_.refresh_ms);
+        if (sampleNow || changed) Refresh();
+    }
+    void Reconfigure(bool resetHistory, bool visibleChanged = true) {
+        if (metrics_) metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
+        if (!visibleChanged) { Save(); return; }
+        hover_ = pressed_ = Button::None;
+        scroll_ = 0;
+        renderer_.SetScroll(0);
+        renderer_.SetComponents(config_.components, config_.compact);
+        if (resetHistory) model_.BreakHistory();
+        const Snapshot sample = metrics_ ? ReadMetrics() : Snapshot{};
+        model_.Update(sample, config_.compact, config_.components);
+        repaintPending_ = true;
+        Fit(true);
+        Sampling(false, true);
+        Save();
+        if (active_) InvalidateRect(window_, nullptr, FALSE);
+    }
+    void SetCompact(bool compact) {
+        if (config_.compact == compact) return;
+        config_.compact = compact;
+        Reconfigure(true);
+    }
+    void TogglePin() {
+        config_.pinned = !config_.pinned;
+        SetWindowPos(window_, config_.pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        Save();
+        if (active_) InvalidateRect(window_, nullptr, FALSE);
+    }
+    void Show() {
+        ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
+        Fit(false);
+        SetForegroundWindow(window_);
+        Sampling(true);
+    }
+    void ToggleVisibility() {
+        if (IsWindowVisible(window_) && !IsIconic(window_)) {
+            Save();
+            ShowWindow(window_, SW_HIDE);
+            Sampling(false);
+        } else Show();
+    }
+    void AddTray() {
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = window_;
+        data.uID = TrayId;
+        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+        data.uCallbackMessage = TrayMessage;
+        data.hIcon = icon_ ? icon_ : LoadIconW(nullptr, IDI_APPLICATION);
+        std::swprintf(data.szTip, sizeof(data.szTip) / sizeof(data.szTip[0]), L"%ls", L"Pulse · 双击窗口切换模式");
+        tray_ = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
+        if (tray_) {
+            data.uVersion = NOTIFYICON_VERSION_4;
+            trayVersion4_ = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE;
+        }
+    }
+    void RemoveTray() {
+        if (!tray_) return;
+        NOTIFYICONDATAW data{};
+        data.cbSize = sizeof(data);
+        data.hWnd = window_;
+        data.uID = TrayId;
+        Shell_NotifyIconW(NIM_DELETE, &data);
+        tray_ = false;
+    }
+    bool StartupEnabled() const {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, RunKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return false;
+        DWORD type = 0, bytes = 0;
+        const LSTATUS status = RegQueryValueExW(key, L"Pulse", nullptr, &type, nullptr, &bytes);
+        bool enabled = false;
+        if (status == ERROR_SUCCESS && type == REG_SZ && bytes >= sizeof(wchar_t)) {
+            std::vector<wchar_t> value(bytes / sizeof(wchar_t) + 1, 0);
+            if (RegQueryValueExW(key, L"Pulse", nullptr, nullptr, reinterpret_cast<BYTE*>(value.data()), &bytes) == ERROR_SUCCESS) {
+                const auto expected = L"\"" + ExecutablePath() + L"\"";
+                enabled = _wcsicmp(value.data(), expected.c_str()) == 0;
+            }
+        }
+        RegCloseKey(key);
+        return enabled;
+    }
+    void ToggleStartup() {
+        const bool disable = StartupEnabled();
+        HKEY key = nullptr;
+        LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, RunKey, 0, nullptr, 0,
+                                         KEY_SET_VALUE, nullptr, &key, nullptr);
+        if (status == ERROR_SUCCESS) {
+            if (disable) {
+                status = RegDeleteValueW(key, L"Pulse");
+                if (status == ERROR_FILE_NOT_FOUND) status = ERROR_SUCCESS;
+            } else {
+                const auto executable = ExecutablePath();
+                const auto command = L"\"" + executable + L"\"";
+                status = executable.empty() ? ERROR_FILE_NOT_FOUND : RegSetValueExW(key, L"Pulse", 0, REG_SZ,
+                    reinterpret_cast<const BYTE*>(command.c_str()), static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+            }
+            RegCloseKey(key);
+        }
+        if (status != ERROR_SUCCESS) MessageBoxW(window_, L"无法更新当前用户的开机自启设置。", L"Pulse", MB_OK | MB_ICONWARNING);
+    }
+    void OpenLog() {
+        if (!metrics_) return;
+        const auto log = metrics_->LogPath();
+        if (log.empty()) {
+            MessageBoxW(window_, L"日志路径尚未就绪。", L"Pulse", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(window_, L"open", log.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+        if (result <= 32) {
+            const auto parameter = L"\"" + log + L"\"";
+            result = reinterpret_cast<INT_PTR>(ShellExecuteW(window_, L"open", L"notepad.exe", parameter.c_str(), nullptr, SW_SHOWNORMAL));
+        }
+        if (result <= 32) MessageBoxW(window_, L"无法打开日志，日志文件可能尚未生成。", L"Pulse", MB_OK | MB_ICONINFORMATION);
+    }
+    void Menu(POINT point) {
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return;
+        AppendMenuW(menu, MF_STRING | (!config_.compact ? MF_CHECKED : 0), CmdFull, L"完整模式");
+        AppendMenuW(menu, MF_STRING | (config_.compact ? MF_CHECKED : 0), CmdCompact, L"迷你模式");
+        HMENU refresh = CreatePopupMenu();
+        if (refresh) {
+            const wchar_t* labels[] = {L"0.5 秒", L"1 秒（默认）", L"2 秒"};
+            for (size_t i = 0; i < RefreshIntervals.size(); ++i)
+                AppendMenuW(refresh, MF_STRING | (config_.refresh_ms == RefreshIntervals[i] ? MF_CHECKED : 0),
+                            CmdRefresh + static_cast<UINT>(i), labels[i]);
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(refresh), L"刷新间隔");
+        }
+        HMENU contents = CreatePopupMenu();
+        HMENU full = CreatePopupMenu();
+        HMENU compact = CreatePopupMenu();
+        if (contents && full && compact) {
+            for (size_t i = 0; i < FullComponents.size(); ++i)
+                AppendMenuW(full, MF_STRING | (config_.components.full[i] ? MF_CHECKED : 0),
+                            CmdFullComponent + static_cast<UINT>(i), FullComponents[i].label);
+            for (size_t i = 0; i < CompactComponents.size(); ++i)
+                AppendMenuW(compact, MF_STRING | (config_.components.compact[i] ? MF_CHECKED : 0),
+                            CmdCompactComponent + static_cast<UINT>(i), CompactComponents[i].label);
+            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(full), L"完整模式");
+            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(compact), L"迷你模式");
+            AppendMenuW(contents, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(contents, MF_STRING, CmdDefaults, L"恢复默认");
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(contents), L"显示内容");
+        } else {
+            if (contents) DestroyMenu(contents);
+            if (full) DestroyMenu(full);
+            if (compact) DestroyMenu(compact);
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING | (config_.pinned ? MF_CHECKED : 0), CmdPin, L"窗口置顶");
+        AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CmdStartup, L"开机自启");
+        AppendMenuW(menu, MF_STRING, CmdLog, L"打开日志");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, CmdExit, L"退出");
+        SetForegroundWindow(window_);
+        const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                                              point.x, point.y, window_, nullptr);
+        DestroyMenu(menu);
+        PostMessageW(window_, WM_NULL, 0, 0);
+        if (command) Command(command);
+    }
+    void Command(UINT command) {
+        if (command >= CmdRefresh && command < CmdRefresh + static_cast<UINT>(RefreshIntervals.size())) {
+            config_.refresh_ms = RefreshIntervals[command - CmdRefresh];
+            if (!config_.compact) Sampling(false, true);
+            Save();
+            return;
+        }
+        if (command >= CmdFullComponent && command < CmdFullComponent + static_cast<UINT>(FullComponents.size())) {
+            const size_t i = command - CmdFullComponent;
+            config_.components.full[i] = !config_.components.full[i];
+            Reconfigure(false, !config_.compact);
+            return;
+        }
+        if (command >= CmdCompactComponent && command < CmdCompactComponent + static_cast<UINT>(CompactComponents.size())) {
+            const size_t i = command - CmdCompactComponent;
+            config_.components.compact[i] = !config_.components.compact[i];
+            Reconfigure(false, config_.compact);
+            return;
+        }
+        switch (command) {
+        case CmdDefaults: config_.components.Reset(); Reconfigure(true); break;
+        case CmdFull: SetCompact(false); break;
+        case CmdCompact: SetCompact(true); break;
+        case CmdPin: TogglePin(); break;
+        case CmdStartup: ToggleStartup(); break;
+        case CmdLog: OpenLog(); break;
+        case CmdExit: SendMessageW(window_, WM_CLOSE, 0, 0); break;
+        }
+    }
+    void ActivateButton(Button button) {
+        switch (button) {
+        case Button::Mode: SetCompact(!config_.compact); break;
+        case Button::Pin: TogglePin(); break;
+        case Button::Minimize: ShowWindow(window_, SW_MINIMIZE); Sampling(false); break;
+        case Button::Close: SendMessageW(window_, WM_CLOSE, 0, 0); break;
+        default: break;
+        }
+    }
+    void ArrangeToasts() {
+        const auto monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+        const RECT work = WorkArea(monitor);
+        const UINT dpi = MonitorDpi(monitor);
+        const int margin = Pixels(16, dpi), gap = Pixels(10, dpi);
+        int bottom = work.bottom - margin, column = 0;
+        for (auto i = toasts_.rbegin(); i != toasts_.rend(); ++i) {
+            auto& toast = *i;
+            if (!toast->Window()) continue;
+            const int width = toast->Width(dpi);
+            const int availableHeight = static_cast<int>(work.bottom - work.top) - 2 * margin;
+            const int height = std::min(toast->Height(dpi), std::max(1, availableHeight));
+            if (bottom - height < work.top + margin && bottom != work.bottom - margin) {
+                ++column;
+                bottom = work.bottom - margin;
+            }
+            const int x = ClampCoordinate(work.right - margin - width - column * (width + gap), work.left, work.right, width);
+            const int y = ClampCoordinate(bottom - height, work.top, work.bottom, height);
+            toast->Place(x, y, height, dpi);
+            bottom = y - gap;
+        }
+    }
+    void Notify(const NetEvent& event) {
+        PlaySoundW(L"C:\\Windows\\Media\\Windows Notify System Generic.wav", nullptr,
+                   SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+        auto toast = std::make_unique<Toast>(event, window_);
+        if (toast->Open(instance_, dpi_)) {
+            toasts_.push_back(std::move(toast));
+            ArrangeToasts();
+        }
+    }
+    void Shutdown() {
+        if (stopping_) return;
+        stopping_ = true;
+        Save();
+        running_ = active_ = false;
+        KillTimer(window_, SampleTimer);
+        callbackWindow_.store(nullptr, std::memory_order_release);
+        if (metrics_) metrics_->SetPaused(true);
+        metrics_.reset(); // Joins callbacks while HWND and Application are still alive.
+        MSG message{};
+        while (PeekMessageW(&message, window_, NetMessage, NetMessage, PM_REMOVE))
+            delete reinterpret_cast<NetEvent*>(message.lParam);
+        toasts_.clear();
+        RemoveTray();
+        PostQuitMessage(0);
+    }
+    LRESULT Handle(UINT message, WPARAM w, LPARAM l) {
+        if (taskbarCreated_ && message == taskbarCreated_) { tray_ = false; AddTray(); return 0; }
+        switch (message) {
+        case WM_CREATE:
+            dpi_ = WindowDpi(window_);
+            renderer_.SetWindow(window_, dpi_);
+            StyleWindow(window_);
+            return 0;
+        case WM_NCCALCSIZE: return 0;
+        case WM_NCHITTEST: return HTCLIENT;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PaintSession paint(window_);
+            if (renderer_.CanRender()) {
+                const HRESULT hr = renderer_.Paint(model_.Data(), config_.compact, config_.pinned, hover_, pressed_);
+                renderLost_ = FAILED(hr);
+                repaintPending_ = hr != S_OK;
+            } else repaintPending_ = true;
+            return 0;
+        }
+        case WM_SIZE:
+            if (w != SIZE_MINIMIZED) {
+                renderer_.Resize();
+                ClampScroll();
+                if (running_ && !fitting_) Fit(true);
+            }
+            Sampling(false);
+            return 0;
+        case WM_GETMINMAXINFO: {
+            auto* limits = reinterpret_cast<MINMAXINFO*>(l);
+            const RECT work = WorkArea(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST));
+            const int height = config_.compact ? Pixels(ContentHeight(), dpi_) :
+                std::min(Pixels(ContentHeight(), dpi_), std::max(1, static_cast<int>(work.bottom - work.top)));
+            limits->ptMinTrackSize = {Pixels(ContentWidth(), dpi_), height};
+            limits->ptMaxTrackSize = limits->ptMinTrackSize;
+            return 0;
+        }
+        case WM_SHOWWINDOW: Sampling(w != 0); break;
+        case WM_TIMER: if (w == SampleTimer) Refresh(); return 0;
+        case WM_DPICHANGED: {
+            dpi_ = HIWORD(w);
+            renderer_.SetDpi(dpi_);
+            // SetWindowPos can synchronously change DPI while Fit is already in progress.
+            if (fitting_) {
+                if (!dpiFitPending_) {
+                    dpiFitPending_ = true;
+                    PostMessageW(window_, DpiFitMessage, 0, 0);
+                }
+            } else Fit(false, reinterpret_cast<RECT*>(l));
+            Save();
+            if (!IsIconic(window_)) InvalidateRect(window_, nullptr, FALSE);
+            return 0;
+        }
+        case WM_DISPLAYCHANGE:
+            Fit(false);
+            ArrangeToasts();
+            if (active_) InvalidateRect(window_, nullptr, FALSE);
+            return 0;
+        case WM_SETTINGCHANGE:
+            if (w == SPI_SETWORKAREA) { Fit(false); ArrangeToasts(); }
+            return 0;
+        case WM_EXITSIZEMOVE: Fit(false); Save(); return 0;
+        case WM_DWMCOMPOSITIONCHANGED: StyleWindow(window_); return 0;
+        case WM_SYSCOMMAND:
+            if ((w & 0xfff0) == SC_MAXIMIZE || (w & 0xfff0) == SC_SIZE) return 0;
+            break;
+        case WM_MOUSEWHEEL: {
+            if (!config_.compact) {
+                const float previous = scroll_;
+                scroll_ -= static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA * 66;
+                ClampScroll();
+                if (scroll_ != previous) InvalidateRect(window_, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            pressed_ = Hit(l);
+            if (pressed_ != Button::None) InvalidateRect(window_, nullptr, FALSE);
+            else {
+                GetCursorPos(&dragOrigin_);
+                GetWindowRect(window_, &dragRect_);
+                dragCandidate_ = true;
+            }
+            SetCapture(window_);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window_, 0};
+            TrackMouseEvent(&track);
+            if (dragCandidate_ && GetCapture() == window_) {
+                POINT cursor{};
+                GetCursorPos(&cursor);
+                const int dx = cursor.x - dragOrigin_.x, dy = cursor.y - dragOrigin_.y;
+                if (dragging_ || std::abs(dx) >= GetSystemMetrics(SM_CXDRAG) || std::abs(dy) >= GetSystemMetrics(SM_CYDRAG)) {
+                    dragging_ = true;
+                    SetWindowPos(window_, nullptr, dragRect_.left + dx, dragRect_.top + dy, 0, 0,
+                                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            } else {
+                const auto hover = Hit(l);
+                if (hover != hover_) { hover_ = hover; InvalidateRect(window_, nullptr, FALSE); }
+            }
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            const auto pressed = pressed_;
+            const bool click = pressed != Button::None && Hit(l) == pressed;
+            const bool moved = dragging_;
+            pressed_ = Button::None;
+            dragging_ = dragCandidate_ = false;
+            if (GetCapture() == window_) ReleaseCapture();
+            if (moved) { Fit(false); Save(); }
+            if (pressed != Button::None) InvalidateRect(window_, nullptr, FALSE);
+            if (click) ActivateButton(pressed);
+            return 0;
+        }
+        case WM_LBUTTONDBLCLK:
+            if (Hit(l) == Button::None) SetCompact(!config_.compact);
+            return 0;
+        case WM_MOUSELEAVE:
+            if (hover_ != Button::None) { hover_ = Button::None; InvalidateRect(window_, nullptr, FALSE); }
+            return 0;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE: {
+            const bool redraw = pressed_ != Button::None;
+            if (dragging_) { Fit(false); Save(); }
+            dragging_ = dragCandidate_ = false;
+            pressed_ = Button::None;
+            if (redraw && active_) InvalidateRect(window_, nullptr, FALSE);
+            return 0;
+        }
+        case WM_SETCURSOR:
+            if (LOWORD(l) == HTCLIENT) {
+                POINT p{};
+                GetCursorPos(&p);
+                ScreenToClient(window_, &p);
+                const auto button = renderer_.HitTest(p.x * 96.0f / dpi_, p.y * 96.0f / dpi_, config_.compact, CurrentWidth());
+                SetCursor(LoadCursorW(nullptr, button == Button::None ? IDC_ARROW : IDC_HAND));
+                return TRUE;
+            }
+            break;
+        case WM_CONTEXTMENU: {
+            POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            if (p.x == -1 && p.y == -1) GetCursorPos(&p);
+            Menu(p);
+            return 0;
+        }
+        case WM_COMMAND: Command(LOWORD(w)); return 0;
+        case TrayMessage:
+            if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT ||
+                (!trayVersion4_ && LOWORD(l) == WM_LBUTTONUP)) ToggleVisibility();
+            else if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) {
+                POINT p{};
+                GetCursorPos(&p);
+                Menu(p);
+            }
+            return 0;
+        case NetMessage: {
+            std::unique_ptr<NetEvent> event(reinterpret_cast<NetEvent*>(l));
+            if (event && !stopping_) Notify(*event);
+            return 0;
+        }
+        case ShowMessage: Show(); return 0;
+        case ReapToastMessage:
+            toasts_.erase(std::remove_if(toasts_.begin(), toasts_.end(), [](const auto& t) { return !t->Window(); }), toasts_.end());
+            ArrangeToasts();
+            return 0;
+        case ArrangeToastMessage: ArrangeToasts(); return 0;
+        case DpiFitMessage:
+            dpiFitPending_ = false;
+            Fit(false);
+            Save();
+            if (active_) InvalidateRect(window_, nullptr, FALSE);
+            return 0;
+        case WM_QUERYENDSESSION: Save(); return TRUE;
+        case WM_ENDSESSION: if (w) { Save(); DestroyWindow(window_); } return 0;
+        case WM_CLOSE: Save(); DestroyWindow(window_); return 0;
+        case WM_DESTROY: Shutdown(); return 0;
+        case WM_NCDESTROY: {
+            const HWND old = window_;
+            SetWindowLongPtrW(old, GWLP_USERDATA, 0);
+            window_ = nullptr;
+            return DefWindowProcW(old, message, w, l);
+        }
+        }
+        return DefWindowProcW(window_, message, w, l);
+    }
+
+    HINSTANCE instance_;
+    HWND window_ = nullptr;
+    HICON icon_ = nullptr, smallIcon_ = nullptr;
+    std::atomic<HWND> callbackWindow_{nullptr};
+    Renderer renderer_;
+    Model model_;
+    Config config_;
+    std::unique_ptr<Metrics> metrics_;
+    std::vector<std::unique_ptr<Toast>> toasts_;
+    UINT dpi_ = 96, taskbarCreated_ = 0;
+    PowerMode powerMode_ = PowerMode::Unknown;
+    bool active_ = false, running_ = false, stopping_ = false, fitting_ = false, dpiFitPending_ = false;
+    bool tray_ = false, trayVersion4_ = false;
+    bool registeredMain_ = false, registeredToast_ = false, renderLost_ = false;
+    float scroll_ = 0;
+    bool repaintPending_ = true;
+    bool dragCandidate_ = false, dragging_ = false;
+    POINT dragOrigin_{};
+    RECT dragRect_{};
+    Button hover_ = Button::None, pressed_ = Button::None;
+};
+
+struct HandleCloser { void operator()(void* handle) const { if (handle) CloseHandle(handle); } };
+struct ComApartment {
+    HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+};
+} // namespace
+
+void EnableDpiAwareness() {
+    using SetContextFn = BOOL(WINAPI*)(HANDLE);
+    auto setContext = reinterpret_cast<SetContextFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"));
+    if (setContext && setContext(reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)))) return; // Per-Monitor V2.
+    using SetAwarenessFn = HRESULT(WINAPI*)(int);
+    HMODULE shcore = LoadLibraryW(L"shcore.dll");
+    if (shcore) {
+        const auto setAwareness = reinterpret_cast<SetAwarenessFn>(GetProcAddress(shcore, "SetProcessDpiAwareness"));
+        const bool success = setAwareness && SUCCEEDED(setAwareness(2));
+        FreeLibrary(shcore);
+        if (success) return;
+    }
+    SetProcessDPIAware();
+}
+
+int Run(HINSTANCE instance, int showCommand) {
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\Pulse.Native.SingleInstance.v1");
+    const DWORD error = GetLastError();
+    if (!mutex) return 1;
+    std::unique_ptr<void, HandleCloser> uniqueInstance(mutex);
+    if (error == ERROR_ALREADY_EXISTS) {
+        HWND previous = FindWindowW(MainClass, nullptr);
+        if (previous) {
+            DWORD process = 0;
+            GetWindowThreadProcessId(previous, &process);
+            AllowSetForegroundWindow(process);
+            PostMessageW(previous, ShowMessage, 0, 0);
+        }
+        return 0;
+    }
+    ComApartment apartment;
+    if (FAILED(apartment.result)) return 1;
+    Application app(instance);
+    return app.Execute(showCommand);
+}
+} // namespace pulse::ui

@@ -1,0 +1,14 @@
+# 编译产物
+*.exe
+*.dll
+*.o
+*.obj
+*.res
+build_out.txt
+# 运行时生成的配置与日志
+settings.ini
+settings.json
+*.log
+# 本地临时文件
+shot*.png
+*_log.txt

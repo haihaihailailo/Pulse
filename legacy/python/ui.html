@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Pulse</title>
+<style>
+  :root {
+    --bg1: #0c111d;
+    --bg2: #151c2f;
+    --panel: rgba(255, 255, 255, .035);
+    --line: rgba(255, 255, 255, .07);
+    --text: #e9edf6;
+    --muted: #8b94aa;
+    --faint: #586079;
+    --down: #38bdf8;
+    --up: #a78bfa;
+    --drain: #fbbf24;
+    --charge: #34d399;
+    --ac: #60a5fa;
+    --danger: #f87171;
+    --accent: var(--drain);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg1); user-select: none; cursor: default; }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  .num { font-family: "Segoe UI Variable Display", "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; }
+  .discharging { --accent: var(--drain); }
+  .charging { --accent: var(--charge); }
+  .ac, .nobattery { --accent: var(--ac); }
+  .low { --accent: var(--danger); }
+
+  /* 注意：这里刻意不用任何持续动画和数值过渡——每秒一次的刷新如果带 0.6s 过渡，
+     合成器一半时间都在跑 60fps，比数据采集本身耗电得多。 */
+  .card {
+    background:
+      radial-gradient(110% 45% at 0% 0%, rgba(56, 189, 248, .10), transparent 60%),
+      radial-gradient(90% 40% at 100% 100%, rgba(167, 139, 250, .09), transparent 60%),
+      linear-gradient(160deg, var(--bg2), var(--bg1));
+  }
+
+  /* ================= 完整模式 ================= */
+  body:not(.compact) .card { width: 320px; padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+  body.compact .full-view, body:not(.compact) .compact-view { display: none !important; }
+  .full-view { display: contents; }
+
+  header { display: flex; align-items: center; gap: 8px; height: 26px; padding-left: 2px; }
+  .brand { display: flex; align-items: center; gap: 7px; font-weight: 600; font-size: 13.5px; letter-spacing: .3px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .clock { margin-left: auto; color: var(--muted); font-size: 12.5px; }
+  .ctrls { display: flex; gap: 1px; }
+  button.icon {
+    width: 24px; height: 24px; border: 0; border-radius: 7px; background: transparent; color: var(--faint);
+    display: grid; place-items: center; cursor: pointer; transition: background .15s, color .15s;
+  }
+  button.icon:hover { background: rgba(255, 255, 255, .08); color: var(--text); }
+  button.icon.close:hover { background: rgba(248, 113, 113, .18); color: var(--danger); }
+  button.icon.on { color: var(--accent); }
+  button.icon svg { width: 14px; height: 14px; }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 9px 12px 10px; }
+  .label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+  .label .sub { color: var(--faint); font-size: 11px; white-space: nowrap; }
+  .k { font-size: 11px; color: var(--muted); }
+  canvas { display: block; width: 100%; }
+
+  /* 电池 */
+  .chip {
+    font-size: 11px; padding: 1px 8px; border-radius: 999px; color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+  .bat-row { display: flex; align-items: center; gap: 14px; }
+  .ring { position: relative; width: 74px; height: 74px; flex: none; }
+  .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+  .ring .track { stroke: rgba(255, 255, 255, .07); }
+  .ring .fg { stroke: var(--ringColor, var(--charge)); }
+  .ring .center { position: absolute; inset: 0; display: grid; place-items: center; }
+  .ring .center b { font-size: 20px; font-weight: 600; }
+  .ring .center small { font-size: 11px; color: var(--muted); }
+  .ring .bolt { position: absolute; left: 50%; bottom: 11px; transform: translateX(-50%); width: 10px; height: 10px; color: var(--charge); display: none; }
+  .charging .ring .bolt { display: block; }
+
+  .bat-main { flex: 1; min-width: 0; }
+  .hero { display: flex; align-items: baseline; gap: 2px; margin: 1px 0 6px; white-space: nowrap; }
+  .hero b { font-size: 25px; font-weight: 600; line-height: 1.1; color: var(--accent); }
+  .hero small { font-size: 12px; color: var(--muted); margin-right: 5px; }
+  .hero .word { font-size: 19px; font-weight: 600; color: var(--text); }
+  .minis { display: flex; gap: 16px; }
+  .minis div { display: flex; flex-direction: column; }
+  .minis b { font-size: 14px; font-weight: 600; }
+  .minis b small { font-size: 10.5px; color: var(--muted); font-weight: 400; margin-left: 1px; }
+  .bat-foot { margin-top: 7px; font-size: 11px; color: var(--faint); min-height: 14px; }
+  #pwrChart { height: 32px; margin-top: 6px; }
+
+  /* 网络 */
+  .speeds { display: flex; gap: 18px; align-items: baseline; }
+  .speed { display: flex; align-items: baseline; gap: 4px; }
+  .speed i { font-style: normal; font-size: 12px; font-weight: 700; }
+  .speed b { font-size: 19px; font-weight: 600; }
+  .speed span { font-size: 11px; color: var(--muted); }
+  #netChart { height: 32px; margin-top: 6px; }
+
+  /* 进程 */
+  .proc { display: grid; grid-template-columns: 1fr 70px 42px; align-items: center; gap: 8px; height: 19px; font-size: 12px; }
+  .proc .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proc .bar { height: 4px; border-radius: 99px; background: rgba(255, 255, 255, .06); overflow: hidden; }
+  .proc .bar div { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #f59e0b, var(--drain)); }
+  .proc .pct { text-align: right; color: var(--muted); }
+  .proc.empty { color: var(--faint); }
+
+  /* CPU / 内存 */
+  .bars { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 2px 2px 0; }
+  .bar2 .row { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .bar2 .row b { color: var(--text); font-weight: 600; }
+  .bar2 .track { height: 4px; border-radius: 99px; background: rgba(255, 255, 255, .07); overflow: hidden; }
+  .bar2 .fill { height: 100%; width: 0; border-radius: 99px; }
+  #cpuFill { background: linear-gradient(90deg, var(--down), #22d3ee); }
+  #memFill { background: linear-gradient(90deg, var(--up), #f0abfc); }
+
+  /* ================= 迷你模式 ================= */
+  body.compact .card {
+    width: max-content; height: 40px; padding: 0 6px 0 14px;
+    display: flex; align-items: center;
+  }
+  .compact-view { display: flex; align-items: center; gap: 9px; height: 100%; font-size: 12px; white-space: nowrap; }
+  .c-item { display: flex; align-items: baseline; gap: 2px; }
+  .c-item i { font-style: normal; font-weight: 700; font-size: 11px; }
+  .c-item b { font-size: 14px; font-weight: 600; }
+  .c-item small { font-size: 10.5px; color: var(--muted); }
+  /* 给数字留固定宽度，数值变化时整条不会左右抖动 */
+  .c-speed b { min-width: 1.9em; text-align: right; }
+  .c-speed small { min-width: 2.5em; }
+  .c-sep { width: 1px; height: 16px; background: var(--line); }
+  .c-watt svg { width: 11px; height: 11px; color: var(--accent); align-self: center; margin-right: 1px; }
+  .c-watt b { color: var(--accent); min-width: 1.9em; text-align: right; }
+  .c-bat { align-items: center; }
+  .batt { width: 19px; height: 10px; border: 1.5px solid var(--muted); border-radius: 3px; padding: 1px; position: relative; margin-right: 5px; }
+  .batt::after { content: ""; position: absolute; right: -4px; top: 2px; width: 2px; height: 3px; border-radius: 0 1px 1px 0; background: var(--muted); }
+  .batt div { height: 100%; border-radius: 1px; background: var(--ringColor, var(--charge)); }
+  .c-eta { margin-left: 6px; color: var(--muted); }
+  .c-eta b { color: var(--text); font-size: 13px; min-width: 2.2em; margin-left: 3px; }
+</style>
+</head>
+<body>
+<div class="card pywebview-drag-region discharging" id="card">
+
+  <!-- ================= 完整模式 ================= -->
+  <div class="full-view">
+    <header>
+      <div class="brand"><span class="dot"></span>Pulse</div>
+      <div class="clock num" id="clock">--:--</div>
+      <div class="ctrls">
+        <button class="icon" id="toCompact" title="迷你模式（也可双击空白处）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>
+        </button>
+        <button class="icon" id="pin" title="窗口置顶">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>
+        </button>
+        <button class="icon" id="min" title="最小化">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
+        </button>
+        <button class="icon close" id="close" title="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="label"><span class="chip" id="chip">读取中…</span><span class="sub" id="pmode"></span></div>
+      <div class="bat-row">
+        <div class="ring" id="ring">
+          <svg viewBox="0 0 100 100">
+            <circle class="track" cx="50" cy="50" r="42" fill="none" stroke-width="9"/>
+            <circle class="fg" id="ringFg" cx="50" cy="50" r="42" fill="none" stroke-width="9" stroke-linecap="round"
+                    stroke-dasharray="263.9" stroke-dashoffset="263.9"/>
+          </svg>
+          <div class="center"><div class="num"><b id="pct">--</b><small>%</small></div></div>
+          <svg class="bolt" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>
+        </div>
+        <div class="bat-main">
+          <div class="k" id="etaLabel">预计可用</div>
+          <div class="hero num" id="eta"><span class="word">--</span></div>
+          <div class="minis">
+            <div><span class="k" id="wattLabel">实时功耗</span><b class="num" id="watt">--</b></div>
+            <div><span class="k" id="pphLabel">每小时耗电</span><b class="num" id="pph">--</b></div>
+            <div id="eta20Wrap" style="display:none"><span class="k">到 20%</span><b class="num" id="eta20">--</b></div>
+          </div>
+        </div>
+      </div>
+      <div class="bat-foot num" id="batFoot"></div>
+      <canvas id="pwrChart"></canvas>
+    </section>
+
+    <section class="panel">
+      <div class="label"><span>网络</span><span class="sub num" id="netTotal"></span></div>
+      <div class="speeds num">
+        <div class="speed"><i style="color:var(--down)">↓</i><b id="dv">0</b><span id="du">KB/s</span></div>
+        <div class="speed"><i style="color:var(--up)">↑</i><b id="uv">0</b><span id="uu">KB/s</span></div>
+      </div>
+      <canvas id="netChart"></canvas>
+    </section>
+
+    <section class="panel">
+      <div class="label"><span>占用最高的进程</span><span class="sub num" id="selfPct"></span></div>
+      <div id="procs">
+        <div class="proc empty"><span class="name">统计中…</span></div>
+      </div>
+    </section>
+
+    <section class="bars">
+      <div class="bar2"><div class="row"><span>CPU</span><b class="num" id="cpuV">0%</b></div><div class="track"><div class="fill" id="cpuFill"></div></div></div>
+      <div class="bar2"><div class="row"><span>内存</span><b class="num" id="memV">0%</b></div><div class="track"><div class="fill" id="memFill"></div></div></div>
+    </section>
+  </div>
+
+  <!-- ================= 迷你模式 ================= -->
+  <div class="compact-view num" title="双击展开">
+    <span class="c-item c-speed"><i style="color:var(--down)">↓</i><b id="cDv">0</b><small id="cDu">KB/s</small></span>
+    <span class="c-item c-speed"><i style="color:var(--up)">↑</i><b id="cUv">0</b><small id="cUu">KB/s</small></span>
+    <span class="c-sep"></span>
+    <span class="c-item c-watt"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg><b id="cWatt">--</b><small>W</small></span>
+    <span class="c-sep"></span>
+    <span class="c-item c-bat">
+      <span class="batt"><div id="cBattFill" style="width:0"></div></span><b id="cPct">--</b><small>%</small>
+      <span class="c-eta" id="cEtaWrap"><span id="cEtaLabel">可用</span><b id="cEta">--</b></span>
+    </span>
+    <button class="icon" id="toFull" title="展开">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+    </button>
+  </div>
+</div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const rootStyle = getComputedStyle(document.documentElement);
+  const COLORS = Object.fromEntries(['faint', 'danger', 'drain', 'charge', 'up', 'down'].map(name => [name, rootStyle.getPropertyValue('--' + name).trim()]));
+  const NET_N = 60, PWR_N = 120;
+  const hist = { down: Array(NET_N).fill(0), up: Array(NET_N).fill(0), pwr: Array(PWR_N).fill(null) };
+  const RING_C = 2 * Math.PI * 42;
+  let api = null, compact = false;
+
+  // 只在内容真的变化时写 DOM，避免每秒无意义的重排重绘
+  const cache = new Map();
+  function put(id, value, html = false) {
+    if (cache.get(id) === value) return;
+    cache.set(id, value);
+    if (html) $(id).innerHTML = value; else $(id).textContent = value;
+  }
+  function style(el, prop, value) {
+    const key = el.id + ':' + prop;
+    if (cache.get(key) === value) return;
+    cache.set(key, value);
+    el.style.setProperty(prop, value);
+  }
+
+  function fmtSpeed(b) {
+    const units = ['KB/s', 'MB/s', 'GB/s'];
+    let v = b / 1024, i = 0;
+    while (v >= 1000 && i < units.length - 1) { v /= 1024; i++; }
+    return [v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(i ? 2 : 1), units[i]];
+  }
+  function fmtBytes(b) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+    return (i === 0 ? b.toFixed(0) : b.toFixed(b >= 100 ? 0 : 1)) + ' ' + units[i];
+  }
+  function durParts(s) {
+    const m = Math.round(s / 60), h = Math.floor(m / 60);
+    if (h >= 100) return [['99+', '小时']];
+    return h ? [[h, '小时'], [m % 60, '分']] : [[m, '分钟']];
+  }
+  const fmtDur = s => (s == null || !isFinite(s)) ? '--' : durParts(s).map(p => p.join(' ')).join(' ');
+  const fmtClock = s => {
+    if (s == null || !isFinite(s)) return '--';
+    const m = Math.round(s / 60);
+    return m >= 6000 ? '99+' : `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
+  };
+  function rgba(hex, a) {
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`;
+  }
+
+  function drawChart(cv, sets, floor) {
+    const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+    if (!w) return;
+    if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    const c = cv.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    c.clearRect(0, 0, w, h);
+    let max = floor;
+    for (const s of sets) for (const v of s.data) if (v != null && v > max) max = v;
+    max *= 1.15;
+    c.strokeStyle = 'rgba(255,255,255,.05)';
+    c.lineWidth = 1;
+    const mid = Math.round(h / 2) + .5;
+    c.beginPath(); c.moveTo(0, mid); c.lineTo(w, mid); c.stroke();
+    for (const s of sets) {
+      const n = s.data.length, step = w / (n - 1), pts = [];
+      s.data.forEach((v, i) => { if (v != null) pts.push([i * step, h - 2 - (v / max) * (h - 5)]); });
+      if (pts.length < 2) continue;
+      const path = new Path2D();
+      path.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) {
+        const [x0, y0] = pts[i - 1], [x1, y1] = pts[i], mx = (x0 + x1) / 2;
+        path.bezierCurveTo(mx, y0, mx, y1, x1, y1);
+      }
+      const area = new Path2D(path);
+      area.lineTo(pts[pts.length - 1][0], h);
+      area.lineTo(pts[0][0], h);
+      area.closePath();
+      const g = c.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, rgba(s.color, .28));
+      g.addColorStop(1, rgba(s.color, 0));
+      c.fillStyle = g;
+      c.fill(area);
+      c.strokeStyle = s.color;
+      c.lineWidth = 1.5;
+      c.lineJoin = 'round';
+      c.stroke(path);
+    }
+  }
+
+  const MODES = {
+    discharging: { chip: '放电中', eta: '预计可用', watt: '实时功耗', pph: '每小时耗电', c: '可用' },
+    charging:    { chip: '充电中', eta: '预计充满', watt: '充电功率', pph: '每小时充入', c: '充满' },
+    ac:          { chip: '外接电源', eta: '电池状态', watt: '电池功率', pph: '每小时', c: '' },
+    nobattery:   { chip: '无电池', eta: '电池状态', watt: '功耗', pph: '每小时', c: '' },
+  };
+
+  function render(d) {
+    hist.down.push(d.down); hist.down.shift();
+    hist.up.push(d.up); hist.up.shift();
+    hist.pwr.push(d.power_w); hist.pwr.shift();
+
+    const mode = d.mode, m = MODES[mode], pct = d.percent;
+    const low = mode === 'discharging' && pct != null && pct <= 20;
+    const cls = `card pywebview-drag-region ${mode}${low ? ' low' : ''}`;
+    if ($('card').className !== cls) $('card').className = cls;
+    const ringColor = pct == null ? COLORS.faint : pct <= 20 ? COLORS.danger : pct <= 45 ? COLORS.drain : COLORS.charge;
+    const [dv, du] = fmtSpeed(d.down), [uv, uu] = fmtSpeed(d.up);
+    const watt = d.power_w != null ? d.power_w.toFixed(d.power_w >= 100 ? 0 : 1) : '--';
+
+    if (compact) {
+      put('cDv', dv); put('cDu', du); put('cUv', uv); put('cUu', uu);
+      put('cWatt', watt);
+      put('cPct', pct != null ? String(Math.round(pct)) : '--');
+      style($('cBattFill'), 'width', (pct || 0) + '%');
+      style($('cBattFill'), '--ringColor', ringColor);
+      const showEta = (mode === 'discharging' || mode === 'charging') && d.eta_s != null;
+      style($('cEtaWrap'), 'display', showEta ? '' : 'none');
+      put('cEtaLabel', m.c);
+      put('cEta', fmtClock(d.eta_s));
+      return;
+    }
+
+    const t = new Date();
+    put('clock', t.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }));
+
+    // —— 电池 ——
+    put('chip', low ? '电量低' : m.chip);
+    put('pmode', d.saver ? '节电模式已开启' : d.power_mode ? `电源模式 · ${d.power_mode}` : '');
+    put('pct', pct != null ? String(Math.round(pct)) : '--');
+    style($('ringFg'), 'stroke-dashoffset', (pct != null ? RING_C * (1 - pct / 100) : RING_C).toFixed(1) + 'px');
+    style($('ringFg'), '--ringColor', ringColor);
+    $('ring').title = d.full_wh ? `剩余 ${d.remaining_wh.toFixed(1)} Wh / 满电 ${d.full_wh.toFixed(1)} Wh` : '';
+
+    put('etaLabel', m.eta + (d.eta_source === 'system' ? '（系统估计）' : ''));
+    let hero;
+    if ((mode === 'discharging' || mode === 'charging') && d.eta_s != null) {
+      hero = durParts(d.eta_s).map(([n, u]) => `<b>${n}</b><small>${u}</small>`).join('');
+    } else if (mode === 'discharging' || mode === 'charging') {
+      hero = '<span class="word">计算中…</span>';
+    } else if (mode === 'ac') {
+      hero = `<span class="word">${pct >= 99 ? '已充满' : '电源供电'}</span>`;
+    } else {
+      hero = '<span class="word">未检测到电池</span>';
+    }
+    put('eta', hero, true);
+    put('wattLabel', m.watt);
+    put('watt', watt === '--' ? '--' : `${watt}<small>W</small>`, true);
+    put('pphLabel', m.pph);
+    put('pph', d.pct_per_h != null ? `${d.pct_per_h.toFixed(d.pct_per_h >= 10 ? 0 : 1)}<small>%</small>` : '--', true);
+    style($('eta20Wrap'), 'display', d.eta20_s != null ? '' : 'none');
+    put('eta20', fmtClock(d.eta20_s));
+
+    let foot = '';
+    if (mode === 'discharging' && d.on_battery_s != null) {
+      foot = `${d.since_start ? '组件启动后' : '拔电后'}已用 ${fmtDur(d.on_battery_s)}`;
+      if (d.avg_w != null) foot += ` · 平均 ${d.avg_w.toFixed(1)} W`;
+    } else if (d.full_wh) {
+      foot = `剩余 ${d.remaining_wh.toFixed(1)} Wh / 满电 ${d.full_wh.toFixed(1)} Wh`;
+    }
+    put('batFoot', foot);
+    drawChart($('pwrChart'), [{ data: hist.pwr, color: mode === 'charging' ? COLORS.charge : COLORS.drain }], 5);
+
+    // —— 网络 ——
+    put('dv', dv); put('du', du); put('uv', uv); put('uu', uu);
+    put('netTotal', `本次 ↓ ${fmtBytes(d.rx_total)} · ↑ ${fmtBytes(d.tx_total)}`);
+    drawChart($('netChart'), [
+      { data: hist.up, color: COLORS.up },
+      { data: hist.down, color: COLORS.down },
+    ], 50 * 1024);
+
+    // —— 进程 ——
+    if (d.top && d.top.length) {
+      const top = Math.max(d.top[0][1], 5);
+      const esc = s => s.replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+      put('procs', d.top.map(([name, p]) =>
+        `<div class="proc"><span class="name" title="${esc(name)}">${esc(name)}</span>` +
+        `<div class="bar"><div style="width:${(p / top * 100).toFixed(0)}%"></div></div>` +
+        `<span class="pct num">${p.toFixed(1)}%</span></div>`).join(''), true);
+    }
+    if (d.self_pct != null) put('selfPct', `本组件 ${d.self_pct.toFixed(1)}%`);
+
+    // —— CPU / 内存 ——
+    put('cpuV', Math.round(d.cpu) + '%');
+    style($('cpuFill'), 'width', d.cpu.toFixed(0) + '%');
+    put('memV', Math.round(d.mem) + '%');
+    style($('memFill'), 'width', d.mem + '%');
+  }
+
+  window.render = render;
+
+  // 窗口大小始终贴合内容
+  function fit() {
+    const r = $('card').getBoundingClientRect();
+    api.fit(Math.ceil(r.width), Math.ceil(r.height));
+  }
+
+  function setCompact(on, save = true) {
+    compact = on;
+    document.body.classList.toggle('compact', on);
+    cache.clear();
+    if (save) api.set_compact(on);
+  }
+
+  window.addEventListener('pywebviewready', async () => {
+    api = window.pywebview.api;
+    for (const b of document.querySelectorAll('button')) b.addEventListener('mousedown', e => e.stopPropagation());
+    const st = await api.get_state();
+    $('pin').classList.toggle('on', st.on_top);
+    $('pin').onclick = async () => $('pin').classList.toggle('on', await api.toggle_top());
+    $('min').onclick = () => api.minimize();
+    $('close').onclick = () => api.close();
+    $('toCompact').onclick = () => setCompact(true);
+    $('toFull').onclick = () => setCompact(false);
+    $('card').addEventListener('dblclick', e => { if (!e.target.closest('button')) setCompact(!compact); });
+    new ResizeObserver(fit).observe($('card'));
+    setCompact(st.compact, false);
+  });
+</script>
+</body>
+</html>
