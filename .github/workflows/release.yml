@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Build, package and publish in sequence; there is no MSVC dependency.
+  mingw:
+    name: Release with MinGW x64
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up MinGW-w64
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+
+      - name: Add MinGW-w64 to PATH
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $mingwBin = Join-Path $env:MSYS2_LOCATION 'mingw64\bin'
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $mingwBin
+
+      - name: Build GUI and console self-test
+        shell: cmd
+        run: call build.bat
+
+      - name: Validate tag against app.rc
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $tagMatch = [regex]::Match($tag, '\Av(?<core>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?\z')
+          if (-not $tagMatch.Success) {
+            throw "Invalid release tag '$tag'. Expected vX.Y.Z or vX.Y.Z-beta."
+          }
+          $version = $tag.Substring(1)
+          if ($version.Length -gt 32) {
+            throw "Version '$version' exceeds package.ps1's 32-character limit."
+          }
+          $coreVersion = $tagMatch.Groups['core'].Value
+          $rc = [System.IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'app.rc'))
+          $numericMatches = [regex]::Matches($rc, '(?m)^\s*FILEVERSION\s+(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)')
+          $stringMatches = [regex]::Matches($rc, '(?m)^\s*VALUE\s+"FileVersion"\s*,\s*"(\d+\.\d+\.\d+\.\d+)(?:\\0)?"')
+          if ($numericMatches.Count -ne 1 -or $stringMatches.Count -ne 1) {
+            throw 'app.rc must contain exactly one numeric FILEVERSION and one four-part VALUE "FileVersion".'
+          }
+          $numeric = $numericMatches[0]
+          $numericVersion = [version]('{0}.{1}.{2}.{3}' -f $numeric.Groups[1].Value, $numeric.Groups[2].Value, $numeric.Groups[3].Value, $numeric.Groups[4].Value)
+          $fileVersion = [version]$stringMatches[0].Groups[1].Value
+          if ($numericVersion -ne $fileVersion) {
+            throw "app.rc is inconsistent: FILEVERSION=$numericVersion, FileVersion=$fileVersion."
+          }
+          $resourceCore = '{0}.{1}.{2}' -f $fileVersion.Major, $fileVersion.Minor, $fileVersion.Build
+          if ($resourceCore -cne $coreVersion) {
+            throw "Version mismatch: tag '$tag' has base version $coreVersion, but app.rc FileVersion is $fileVersion (base $resourceCore). Update app.rc before tagging."
+          }
+          Write-Host "Validated tag '$tag' against app.rc FileVersion $fileVersion."
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "version=$version"
+
+      - name: Package release
+        shell: pwsh
+        env:
+          PULSE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          pwsh -NoProfile -File scripts\package.ps1 -NoBuild -Version "$env:PULSE_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Create GitHub Release and upload ZIP
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PULSE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path 'dist' "Pulse-${env:PULSE_VERSION}-win-x64.zip"
+          if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
+            throw "Expected release archive was not generated: $zip"
+          }
+          $releaseArgs = @('release', 'create', $env:GITHUB_REF_NAME, $zip,
+            '--verify-tag', '--title', "Pulse $env:PULSE_VERSION", '--generate-notes')
+          if ($env:GITHUB_REF_NAME.Contains('-')) {
+            $releaseArgs += '--prerelease'
+          }
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

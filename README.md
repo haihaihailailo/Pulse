@@ -1,42 +1,64 @@
 # Pulse
 
-Pulse 是 Windows 桌面悬浮小组件：一个静态链接的 `Pulse.exe`，用原生 C++17、Win32 和 Direct2D 显示电池、功耗与网络状态。
+Pulse 是 Windows 桌面悬浮小组件：一个静态链接的 `Pulse.exe`，用原生 C++17、Win32 和 Direct2D 显示硬件、电池与网络状态。
 
 ## 功能
 
-- 电池充放电功率
-- 平滑续航预计（到 20% 的时间、拔电后的平均功耗）
-- 芯片、CPU、核显功耗
-- 网速（只统计物理网卡）
-- 真实网络延迟与断网判定
-- 断网与恢复提醒卡片
-- 进程 CPU 占用前三
-- CPU 与内存占用
-- 完整模式与迷你单行模式
-- 托盘图标
-- 开机自启
+完整模式默认自上而下显示：
+
+- 硬件四格：CPU、GPU（3D 引擎）、内存显示占用与功耗；「处理器」显示整颗芯片功耗。内存功耗来自 RAPL DRAM。
+- 电池：充放电功率、平滑续航或充满时间预计、放电到 20% 的时间、拔电后平均功耗。若启动时已在用电池，平均功耗从组件启动后计算。
+- 网络：只统计物理网卡的上下行网速，醒目显示 HTTP 延迟和断网状态。
+- 进程 CPU 占用前三，不含 Pulse 自身；组件自身占用另列。
+
+迷你模式为单行，可显示电量、续航或充满时间、充电闪电标记和外接电源标记。迷你模式的「总功耗」和完整模式的「功耗走势图」在放电时标为「整机」，显示电池放电功率；其余供电状态标为「处理器」，显示整颗芯片功耗。硬件四格的第四格始终标为「处理器」。
+
+右键窗口或托盘图标，在「显示内容」中分别设置两种模式的组件：
+
+| 模式 | 可选组件 |
+| --- | --- |
+| 完整模式 | 硬件四格、电池与充电、功耗走势图、网络、进程前三、磁盘读写速度、系统盘占用、系统信息、显存、Wi-Fi、电池健康、帧数 |
+| 迷你模式 | 电量 %、续航/充满、总功耗、CPU %、内存 %、GPU %、网速、延迟、磁盘读写、CPU 频率、FPS |
+
+可选指标只在勾选后采集，取消即停止；CPU、内存、电池、网速等基础采样和网络探测始终运行。「系统信息」包含 CPU 频率、内存已用/总量、进程数和开机时长。
+
+其他功能：
+
+- 前台程序帧数（FPS）：基于 ETW 的 DXGI/D3D9 Present 事件，需要管理员权限。勾选后若权限不足，菜单会出现「以管理员身份重启（显示帧数需要）」。部分程序可能无法读到帧数。
+- 完整模式刷新间隔可选 0.5 / 1 / 2 秒，默认 1 秒；迷你模式固定约 2 秒刷新。
+- 延迟「较慢」阈值可选 50 / 100 / 150 / 200 / 300 / 500 / 800 ms，默认 500 ms。
+- 断网与恢复提醒卡片，约 8 秒后自动淡出；鼠标悬停时暂停，移开后约 3 秒淡出。提醒和提示音可分别关闭，睡眠不算断网。
+- 界面大小 80%–200%，支持 Ctrl + 滚轮缩放。
+- 深色右键菜单、托盘图标、窗口置顶、开机自启和恢复默认组件。
 
 ## 截图
 
+完整模式：
+
 ![Pulse 完整模式](docs/screenshots/native-full.png)
+
+迷你模式：
+
+![Pulse 迷你模式](docs/screenshots/native-compact.png)
 
 ## 系统要求
 
-- Windows 10 或 Windows 11，64 位
-- 普通用户权限即可运行，不需要管理员
-- 芯片、CPU、核显功耗来自性能计数器 `\Energy Meter(*)\Power`（RAPL）。机器没有这组计数器时，这几项显示为未知，其余功能仍可用
+- Windows 10 或 Windows 11，64 位。
+- 普通用户权限即可运行；只有帧数功能需要管理员权限。
+- 硬件功耗来自性能计数器 Energy Meter（RAPL），无需管理员。完整模式优先对 `\Energy Meter(*)\Energy` 做差分，不可用时回退到 `\Energy Meter(*)\Power`；迷你模式直接使用 Power。
+- 没有这组计数器或对应实例时，相关功耗显示为未知（`--`）。内存功耗需要 DRAM 实例；电池充放电功率由 Windows 电池接口读取。
 
 ## 安装
 
 下载 zip 并解压后，运行 `scripts\install.cmd`。脚本会：
 
-1. 若 Pulse 正在运行，先退出它
-2. 把 `Pulse.exe` 复制到 `%LOCALAPPDATA%\Pulse`
-3. 创建当前用户的开始菜单快捷方式
-4. 按下面的参数决定是否创建桌面快捷方式和开机自启
-5. 启动安装后的 Pulse
+1. 若 Pulse 正在运行，先退出它。
+2. 把 `Pulse.exe` 复制到 `%LOCALAPPDATA%\Pulse`。
+3. 创建当前用户的开始菜单快捷方式。
+4. 按下面的参数决定是否创建桌面快捷方式和开机自启。
+5. 启动安装后的 Pulse。
 
-不需要管理员。也可以不解压后安装，直接双击 zip 里的 `Pulse.exe` 免安装运行。免安装时，配置仍写在 `%LOCALAPPDATA%\Pulse`。
+安装和普通运行不需要管理员，帧数功能除外。也可以解压后直接运行 `Pulse.exe`，无需安装；配置仍写在 `%LOCALAPPDATA%\Pulse`。
 
 `install.ps1` 在脚本同级和上一级查找 `Pulse.exe`。从本仓库运行时，请先编译出根目录的 `Pulse.exe`。
 
@@ -55,15 +77,15 @@ scripts\install.cmd -Desktop -Autostart
 scripts\install.cmd -Quiet
 ```
 
-开机自启写在当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `Pulse`，内容是带引号的 `Pulse.exe` 完整路径。这与程序托盘菜单里的「开机自启」是同一项。托盘菜单写入的是**当前正在运行的那一份**程序路径；安装脚本写入的是 `%LOCALAPPDATA%\Pulse\Pulse.exe`。
+开机自启写在当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `Pulse`，内容是带引号的 `Pulse.exe` 完整路径。这与程序菜单里的「开机自启」是同一项。程序菜单写入当前正在运行的那一份程序路径；安装脚本写入 `%LOCALAPPDATA%\Pulse\Pulse.exe`。
 
 ## 卸载
 
-运行 `scripts\uninstall.cmd`。脚本会退出所有名为 Pulse 的进程，删除上述 Run 值，并删除开始菜单和桌面上目标为 `Pulse.exe` 的 `Pulse.lnk`。
+运行 `scripts\uninstall.cmd`。脚本会退出所有名为 Pulse 的进程，删除上述 Run 值，并删除开始菜单和桌面上目标为 `Pulse.exe` 或已失效的 `Pulse.lnk`。
 
-窗口位置、迷你模式和置顶保存在 `%LOCALAPPDATA%\Pulse\settings.ini`。网络探测日志在 `%LOCALAPPDATA%\Pulse\pulse_net.log`。这两个文件与安装目录是同一个文件夹。`%APPDATA%`（Roaming）下没有配置文件；卸载脚本仍会检查那里是否存在同名文件。
+窗口位置、模式、置顶、显示内容、刷新间隔、界面大小、延迟较慢阈值、断网提醒和提示音设置保存在 `%LOCALAPPDATA%\Pulse\settings.ini`。网络探测和帧数诊断等日志在 `%LOCALAPPDATA%\Pulse\pulse_net.log`，与安装目录同属一个文件夹。`%APPDATA%`（漫游目录）下不写配置；卸载脚本仍会检查那里是否存在同名配置或日志。
 
-发现这些文件时，脚本会询问是否一并删除。选 Y 会删除整个 `%LOCALAPPDATA%\Pulse` 目录；选 N 则只删除 `Pulse.exe` 和快捷方式，保留配置与日志。
+发现这些文件时，脚本会询问是否一并删除。选 Y 会删除整个 `%LOCALAPPDATA%\Pulse` 目录，并清理检测到的漫游目录同名文件；选 N 只删除 `Pulse.exe` 和快捷方式，保留配置与日志。未发现配置或日志时，默认删除安装目录。
 
 | 参数 | 作用 |
 | --- | --- |
@@ -73,30 +95,51 @@ scripts\install.cmd -Quiet
 
 ## 使用说明
 
-- 拖动窗口空白处可以移动。位置会记住。
-- 双击窗口空白处，或点击模式按钮，在完整模式和迷你单行模式之间切换。迷你模式是单行。
-- 置顶按钮切换「始终置顶」。默认置顶。
-- 最小化，或左键单击托盘图标，会隐藏窗口并暂停采样；再次显示后继续采样。
-- 关闭按钮退出程序，程序不会留在托盘里继续跑。
-- 右键窗口或托盘图标：完整模式、迷你模式、窗口置顶、开机自启、打开日志、退出。
-- 断网和恢复时，屏幕角落会弹出提醒卡片。
+- 拖动窗口空白处移动，位置会保存。
+- 双击窗口空白处，或点击模式按钮，在完整模式和迷你模式之间切换。
+- 置顶按钮切换「窗口置顶」，默认开启。
+- 最小化会暂停界面采样；左键单击托盘图标可隐藏或显示窗口。隐藏时同样暂停界面采样，网络探测继续；再次显示后恢复采样。
+- 关闭按钮直接退出程序。
+- 在窗口内按 Ctrl + 滚轮，每格缩放 10 个百分点，范围为 80%–200%。内容超出屏幕时可用普通滚轮浏览。
+
+窗口和托盘共用以下右键菜单：
+
+| 菜单项 | 作用 |
+| --- | --- |
+| 完整模式 / 迷你模式 | 切换显示模式 |
+| 界面大小 | 80% / 100%（默认）/ 125% / 150% / 175% / 200% |
+| 刷新间隔 | 设置完整模式的 0.5 / 1（默认）/ 2 秒刷新间隔 |
+| 延迟较慢阈值 | 50 / 100 / 150 / 200 / 300 / 500（默认）/ 800 ms |
+| 断网提醒 | 开关断网与恢复提醒卡片，默认开启 |
+| 提醒提示音 | 单独开关提示音，默认开启；关闭断网提醒后此项不可用 |
+| 显示内容 → 完整模式 / 迷你模式 | 分别勾选组件 |
+| 显示内容 → 恢复默认 | 只恢复两种模式的默认组件勾选 |
+| 窗口置顶 | 开关置顶 |
+| 开机自启 | 开关当前用户的开机自启 |
+| 打开日志 | 打开本机日志 |
+| 以管理员身份重启（显示帧数需要） | 当前模式启用帧数且权限不足时出现 |
+| 退出 | 退出程序 |
 
 ## 网络延迟
 
-延迟用 HTTP 探测，不使用 ICMP ping。Clash TUN 等代理会让任何 ping 都返回 0 ms，这个数不能代表真实网络。Pulse 通过 WinHTTP 走系统代理访问：
+延迟通过 WinHTTP 的 HTTP 请求测量，走系统代理，不使用 ICMP ping。部分代理或 TUN 环境的 ping 结果可能不能反映实际访问延迟。探测地址为：
 
 - `http://www.msftconnecttest.com/connecttest.txt`
 - `http://www.gstatic.com/generate_204`
 - `http://connect.rom.miui.com/generate_204`
 
-主地址失败后会再请求备用地址。
+正常时约每 5 秒优先请求第一个地址，失败后并行请求两个备用地址；出现不可用结果或网卡变化后，会并行请求三个地址，以最先收到的响应头为准。不检查响应正文，也不跟随重定向。延迟按当前探测阶段计时，备用阶段不累计主地址的失败等待时间。
 
 | 结果 | 判定 |
 | --- | --- |
-| 延迟 ≥ 300 ms | 较慢 |
-| 请求失败，或延迟 ≥ 1000 ms | 记一次不可用 |
+| 请求成功，延迟 < 所选阈值 | 正常 |
+| 延迟 ≥ 所选阈值（默认 500 ms），且 < 1000 ms | 较慢 |
+| 本轮请求失败，或延迟 ≥ 1000 ms | 记一次不可用 |
 | 连续 3 次不可用 | 判定断网 |
-| 一次成功且延迟 < 1000 ms | 判定恢复 |
+| 一次请求成功且延迟 < 1000 ms | 清除失败计数；已断网时判定恢复 |
+| 所有物理网卡均断开，并通过短暂去抖确认 | 直接判定断网，无需等待 3 次 HTTP 不可用 |
+
+不可用后约每 1 秒确认，断网后约每 1.5 秒重试。物理网卡断开后，即使本地代理返回成功，也需物理连接恢复才能判定恢复。系统睡眠会暂停探测并清除断网计时；唤醒约 3 秒后重新探测。
 
 ## 从源码编译
 
@@ -112,7 +155,7 @@ PowerShell：
 & .\build.bat
 ```
 
-脚本生成静态链接的 `Pulse.exe` 和控制台自测程序 `metrics_selftest.exe`。源码是 C++17，也可以用 MSVC 编译；仓库里提供的构建脚本是面向 MinGW 的 `build.bat`。
+脚本生成静态链接的 `Pulse.exe` 和控制台自测程序 `metrics_selftest.exe`。源码为 C++17，也可用 MSVC 编译：在 x64 开发者命令提示符里运行 `build_msvc.bat`，产物在 `build-msvc\`。发布版用 MinGW 编译。
 
 打包 zip（会先调用 `build.bat`）：
 
@@ -122,20 +165,42 @@ scripts\package.cmd -NoBuild
 scripts\package.cmd -Version 1.0.0
 ```
 
-`-NoBuild` 仅在仓库根目录已经有 `Pulse.exe` 时跳过编译。未指定 `-Version` 时，从 `app.rc` 的 `FileVersion` 读取，读不到则用 `0.1.0`。输出文件为 `dist\Pulse-<版本>-win-x64.zip`，其中包含 `Pulse.exe`、本说明、`LICENSE`、`THIRD_PARTY_NOTICES.md`，以及 `scripts\` 下的安装和卸载脚本。
+`-NoBuild` 仅在仓库根目录已有 `Pulse.exe` 时跳过编译。未指定 `-Version` 时，从 `app.rc` 的 `FileVersion` 读取，读不到则用 `0.1.0`。输出为 `dist\Pulse-<版本>-win-x64.zip`，包含 `Pulse.exe`、本说明、`LICENSE`、`THIRD_PARTY_NOTICES.md` 和 `scripts\` 下的安装、卸载脚本。
+
+GitHub Actions 会在推送 `v*` 标签时自动编译并发布 Release。
 
 ## 功耗
 
-在一台 Intel Core Ultra 5 226V（Arc 130V 核显）的笔记本上，完整模式大约占用单核 0.96% CPU，内存大约 105 MB。**待更新**（迷你模式，以及后续的降功耗改动，尚未计入这组数字）。
+以下为 Intel Core Ultra 5 226V 笔记本使用电池时，按 Pulse 进程 CPU 时间折算的单核占用参考：
+
+| 模式 | CPU 占用 |
+| --- | --- |
+| 迷你模式 | 约单核 0.1%–0.3% |
+| 完整模式 | 每次刷新执行完整采集路径，约单核 0.5%–1.5% |
+
+可选指标仍受组件勾选和各自采集间隔控制。数字随机器、所选组件、刷新间隔和后台负载变化，仅供参考。
 
 ## 致谢
 
 见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 免责声明与隐私
+
+- 本软件按“原样”提供，不提供任何担保；使用风险自负，作者不对使用本软件造成的任何损失负责，具体以 [LICENSE](LICENSE)（MIT）为准。
+- Pulse 读取系统性能计数器、电池、进程和网络状态等信息，除用户选择的开机自启外，不修改系统设置。正常环境下，运行时只将设置和日志写入 `%LOCALAPPDATA%\Pulse`；开关「开机自启」时写入或删除 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `Pulse` 值。安装脚本另会复制程序并创建上述快捷方式。
+- 联网只用于测延迟，定期请求上面列出的三个探测地址，走系统代理。不通过网络收集或上传个人数据，没有统计、遥测，也没有自动更新。
+- 日志只保存在本机，不会上传。
+- 管理员权限只用于帧数功能的 ETW 会话；不需要帧数就无需管理员。
+- `Pulse.exe` 没有代码签名，首次运行可能被 Windows SmartScreen 提示，可点「更多信息 → 仍要运行」；建议只从本项目的 GitHub Releases 下载。
+
 ## 许可证
 
-[MIT License](LICENSE)。Copyright (c) 2026 yftx。
+[MIT 许可证](LICENSE)。版权所有 © 2026 yftx。
 
 ## English
 
-Pulse is a native Windows desktop widget: one statically linked `Pulse.exe` (C++17, Win32, Direct2D). It shows battery charge and discharge power, smoothed runtime (time to 20% and average power after unplug), package/CPU/iGPU power via Energy Meter (RAPL, no administrator), physical-adapter throughput, HTTP latency and offline detection, a recovery card, the top three processes by CPU, and CPU/memory usage. It has a full card, a one-line mini mode, a tray icon, and per-user startup. Windows 10/11 x64. Unzip and run `scripts\install.cmd`, or start `Pulse.exe` directly. Latency uses HTTP because proxies such as Clash TUN answer every ping with 0 ms; 300 ms is slow, a failure or 1000 ms counts as unavailable, three failures mark the link down, and one success under 1000 ms marks recovery. MIT License. Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Pulse is a native Windows 10/11 x64 desktop widget: one statically linked `Pulse.exe` built with C++17, Win32 and Direct2D. Full mode shows CPU/GPU/memory usage and power, processor package power, battery power and smoothed runtime, physical-adapter throughput, HTTP latency, and the top three processes by CPU. Mini mode is a single line with optional runtime/time-to-full and charging indicators. Both modes have separate component selections; optional collectors run only when needed, while basic sampling and network probes remain active.
+
+Hardware power uses Energy Meter (RAPL, no administrator required): full mode prefers Energy differences with a Power fallback; mini mode reads Power directly. Foreground FPS uses ETW and requires administrator privileges. Full-mode refresh is selectable at 0.5, 1 or 2 seconds. The slow-latency threshold is adjustable from the menu and defaults to 500 ms. A failed round or latency ≥ 1000 ms counts as unavailable; three consecutive unavailable rounds mark the connection offline, and one success below 1000 ms restores it. Confirmed loss of all physical adapters marks it offline directly. Sleep is excluded.
+
+Unzip and run `scripts\install.cmd`, or start `Pulse.exe` directly. Pulse supports 80%–200% zoom (Ctrl + mouse wheel), a tray icon, per-user startup, and optional offline/recovery cards and sounds. For networking, it only requests the three probe URLs listed above via the system proxy, with no telemetry or automatic updates. Settings and logs stay local. The software is provided as is, see [LICENSE](LICENSE). Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

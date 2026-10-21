@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mingw:
+    name: MinGW x64
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up MinGW-w64
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+
+      - name: Add MinGW-w64 to PATH
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          $mingwBin = Join-Path $env:MSYS2_LOCATION 'mingw64\bin'
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $mingwBin
+
+      - name: Build GUI and console self-test
+        shell: cmd
+        run: call build.bat
+
+      - name: Upload MinGW executables
+        uses: actions/upload-artifact@v7
+        with:
+          name: Pulse-mingw-win-x64
+          path: |
+            Pulse.exe
+            metrics_selftest.exe
+          if-no-files-found: error
+
+  # This check is independent. Release builds use only MinGW.
+  msvc:
+    name: MSVC x64 portability check
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build GUI and console self-test
+        shell: cmd
+        run: call build_msvc.bat
+
+      - name: Upload MSVC executables
+        uses: actions/upload-artifact@v7
+        with:
+          name: Pulse-msvc-win-x64
+          path: |
+            build-msvc/Pulse.exe
+            build-msvc/metrics_selftest.exe
+          if-no-files-found: error

@@ -12,3 +12,6 @@ settings.json
 # 本地临时文件
 shot*.png
 *_log.txt
+# 打包与 MSVC 构建输出
+dist/
+build-msvc/
