@@ -1,5 +1,6 @@
 #include <windows.h>
 
+1 ICON "pulse.ico"
 1 RT_MANIFEST "app.manifest"
 
 1 VERSIONINFO

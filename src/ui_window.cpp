@@ -35,6 +35,7 @@ constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Native.SingleInstance.v
 constexpr wchar_t RestartedArg[] = L"--restarted";
 constexpr wchar_t ToastClass[] = L"Pulse.Native.Notification.v1";
 constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr int kAppIconId = 1;
 constexpr UINT SampleTimer = 1;
 constexpr UINT TrayMessage = WM_APP + 1;
 constexpr UINT NetMessage = WM_APP + 2;
@@ -98,47 +99,18 @@ std::wstring ExecutablePath() {
         buffer.resize(std::min(size_t(32768), buffer.size() * 2));
     }
 }
-HICON CreatePulseIcon(int size) {
-    BITMAPV5HEADER header{};
-    header.bV5Size = sizeof(header);
-    header.bV5Width = size;
-    header.bV5Height = -size;
-    header.bV5Planes = 1;
-    header.bV5BitCount = 32;
-    header.bV5Compression = BI_BITFIELDS;
-    header.bV5RedMask = 0x00ff0000;
-    header.bV5GreenMask = 0x0000ff00;
-    header.bV5BlueMask = 0x000000ff;
-    header.bV5AlphaMask = 0xff000000;
-    void* bits = nullptr;
-    HBITMAP color = CreateDIBSection(nullptr, reinterpret_cast<BITMAPINFO*>(&header), DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!color) return nullptr;
-    auto* pixels = static_cast<DWORD*>(bits);
-    const POINT wave[] = {{3,16},{9,16},{12,8},{17,25},{21,13},{24,16},{29,16}};
-    auto segmentDistance = [](float x, float y, POINT a, POINT b) {
-        const float dx = static_cast<float>(b.x - a.x), dy = static_cast<float>(b.y - a.y);
-        const float t = std::clamp(((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy), 0.0f, 1.0f);
-        return std::hypot(x - (a.x + t * dx), y - (a.y + t * dy));
-    };
-    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
-        const float u = (x + .5f) * 32 / size, v = (y + .5f) * 32 / size;
-        const float qx = std::max(std::abs(u - 16) - 9, 0.0f), qy = std::max(std::abs(v - 16) - 9, 0.0f);
-        if (std::hypot(qx, qy) > 6) { pixels[y * size + x] = 0; continue; }
-        float distance = 100;
-        for (size_t i = 1; i < sizeof(wave) / sizeof(wave[0]); ++i)
-            distance = std::min(distance, segmentDistance(u, v, wave[i - 1], wave[i]));
-        pixels[y * size + x] = distance <= 1.2f ? 0xff34d399 : 0xff151c2f;
-    }
-    const std::vector<BYTE> maskBits(static_cast<size_t>((size + 15) / 16 * 2 * size), 0);
-    HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits.data());
-    ICONINFO info{};
-    info.fIcon = TRUE;
-    info.hbmColor = color;
-    info.hbmMask = mask;
-    HICON icon = mask ? CreateIconIndirect(&info) : nullptr;
-    if (mask) DeleteObject(mask);
-    DeleteObject(color);
-    return icon;
+HICON LoadPulseIcon(int xMetric, int yMetric, UINT dpi) {
+    using MetricsForDpiFn = int(WINAPI*)(int, UINT);
+    static const auto metricsForDpi = reinterpret_cast<MetricsForDpiFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi"));
+    const int cx = metricsForDpi ? metricsForDpi(xMetric, dpi) : GetSystemMetrics(xMetric);
+    const int cy = metricsForDpi ? metricsForDpi(yMetric, dpi) : GetSystemMetrics(yMetric);
+    return static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(kAppIconId),
+        IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR));
+}
+HICON IconOrDefault(HICON icon) {
+    // Keep the shared fallback out of the owned icon handles.
+    return icon ? icon : LoadIconW(nullptr, IDI_APPLICATION);
 }
 
 struct Config {
@@ -400,6 +372,8 @@ public:
         if (registeredToast_) UnregisterClassW(ToastClass, instance_);
         if (icon_) DestroyIcon(icon_);
         if (smallIcon_) DestroyIcon(smallIcon_);
+        if (classIcon_) DestroyIcon(classIcon_);
+        if (classSmallIcon_) DestroyIcon(classSmallIcon_);
     }
     int Execute(int showCommand, bool restarted) {
         config_.Load();
@@ -408,16 +382,20 @@ public:
             MessageBoxW(nullptr, L"无法初始化 Direct2D / DirectWrite。", L"Pulse", MB_OK | MB_ICONERROR);
             return 1;
         }
-        icon_ = CreatePulseIcon(32);
-        smallIcon_ = CreatePulseIcon(16);
+        POINT initial{config_.x == INT_MIN ? 0 : config_.x, config_.y == INT_MIN ? 0 : config_.y};
+        const auto monitor = MonitorFromPoint(initial, config_.x == INT_MIN ? MONITOR_DEFAULTTOPRIMARY : MONITOR_DEFAULTTONEAREST);
+        const RECT work = WorkArea(monitor);
+        dpi_ = MonitorDpi(monitor);
+        classIcon_ = LoadPulseIcon(SM_CXICON, SM_CYICON, dpi_);
+        classSmallIcon_ = LoadPulseIcon(SM_CXSMICON, SM_CYSMICON, dpi_);
         WNDCLASSEXW cls{};
         cls.cbSize = sizeof(cls);
         cls.style = CS_DBLCLKS;
         cls.lpfnWndProc = Procedure;
         cls.hInstance = instance_;
         cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        cls.hIcon = icon_;
-        cls.hIconSm = smallIcon_;
+        cls.hIcon = IconOrDefault(classIcon_);
+        cls.hIconSm = IconOrDefault(classSmallIcon_);
         cls.lpszClassName = MainClass;
         if (!RegisterClassExW(&cls)) return 1;
         registeredMain_ = true;
@@ -426,10 +404,6 @@ public:
         if (!RegisterClassExW(&cls)) return 1;
         registeredToast_ = true;
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
-        POINT initial{config_.x == INT_MIN ? 0 : config_.x, config_.y == INT_MIN ? 0 : config_.y};
-        const auto monitor = MonitorFromPoint(initial, config_.x == INT_MIN ? MONITOR_DEFAULTTOPRIMARY : MONITOR_DEFAULTTONEAREST);
-        const RECT work = WorkArea(monitor);
-        dpi_ = MonitorDpi(monitor);
         renderer_.SetZoom(config_.zoom);
         renderer_.SetComponents(config_.components, config_.compact);
         model_.Update(Snapshot{}, config_.compact, config_.components);
@@ -676,6 +650,23 @@ private:
             Sampling(false);
         } else Show();
     }
+    void UpdateIcons() {
+        const HICON oldIcon = std::exchange(icon_, LoadPulseIcon(SM_CXICON, SM_CYICON, dpi_));
+        const HICON oldSmallIcon = std::exchange(smallIcon_, LoadPulseIcon(SM_CXSMICON, SM_CYSMICON, dpi_));
+        SendMessageW(window_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(IconOrDefault(icon_)));
+        SendMessageW(window_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(IconOrDefault(smallIcon_)));
+        if (tray_) {
+            NOTIFYICONDATAW data{};
+            data.cbSize = sizeof(data);
+            data.hWnd = window_;
+            data.uID = TrayId;
+            data.uFlags = NIF_ICON;
+            data.hIcon = IconOrDefault(smallIcon_);
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+        if (oldIcon) DestroyIcon(oldIcon);
+        if (oldSmallIcon) DestroyIcon(oldSmallIcon);
+    }
     void AddTray() {
         NOTIFYICONDATAW data{};
         data.cbSize = sizeof(data);
@@ -683,7 +674,7 @@ private:
         data.uID = TrayId;
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TrayMessage;
-        data.hIcon = icon_ ? icon_ : LoadIconW(nullptr, IDI_APPLICATION);
+        data.hIcon = IconOrDefault(smallIcon_);
         std::swprintf(data.szTip, sizeof(data.szTip) / sizeof(data.szTip[0]), L"%ls", L"Pulse · 双击窗口切换模式");
         tray_ = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
         if (tray_) {
@@ -976,6 +967,7 @@ private:
         switch (message) {
         case WM_CREATE:
             dpi_ = WindowDpi(window_);
+            UpdateIcons();
             renderer_.SetWindow(window_, dpi_);
             StyleWindow(window_);
             return 0;
@@ -1030,6 +1022,7 @@ private:
         case WM_TIMER: if (w == SampleTimer) Refresh(); return 0;
         case WM_DPICHANGED: {
             dpi_ = HIWORD(w);
+            UpdateIcons();
             renderer_.SetDpi(dpi_);
             // SetWindowPos can synchronously change DPI while Fit is already in progress.
             if (fitting_) {
@@ -1194,6 +1187,8 @@ private:
     HINSTANCE instance_;
     HWND window_ = nullptr;
     HICON icon_ = nullptr, smallIcon_ = nullptr;
+    // Class icons must outlive every main/notification window and both classes.
+    HICON classIcon_ = nullptr, classSmallIcon_ = nullptr;
     std::atomic<HWND> callbackWindow_{nullptr};
     // Low bit enables reminders; every toggle advances the value so an old
     // callback cannot replay its card after reminders have been re-enabled.
