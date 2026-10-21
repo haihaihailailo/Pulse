@@ -14,6 +14,7 @@
 #include <windows.h>
 
 namespace pulse::ui {
+void EnableDarkMode();
 void EnableDpiAwareness();
-int Run(HINSTANCE instance, int showCommand);
+int Run(HINSTANCE instance, int showCommand, const wchar_t* commandLine);
 }

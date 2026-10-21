@@ -87,6 +87,7 @@ Wants CollectionWants(const Components& c, bool compact, PowerMode mode) {
     w.gpu_memory = !compact && c.Enabled(FullComponent::GpuMemory);
     w.wifi = !compact && c.Enabled(FullComponent::Wifi);
     w.battery_health = !compact && c.Enabled(FullComponent::BatteryHealth);
+    w.fps = compact ? c.Enabled(CompactComponent::Fps) : c.Enabled(FullComponent::Fps);
     return w;
 }
 
@@ -113,7 +114,8 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
         if (c.Enabled(CompactComponent::DiskIO) &&
             std::tie(diskRead, diskWrite) != std::tie(r.diskRead, r.diskWrite)) return false;
         if (c.Enabled(CompactComponent::CpuFrequency) && cpuFrequency != r.cpuFrequency) return false;
-        if (c.Enabled(CompactComponent::Fps) && fps != r.fps) return false;
+        if (c.Enabled(CompactComponent::Fps) &&
+            std::tie(fps, fpsAdmin) != std::tie(r.fps, r.fpsAdmin)) return false;
         return true;
     }
     if (clock != r.clock) return false; // Always-visible title clock.
@@ -145,6 +147,7 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
         std::tie(wifi, wifiSsid, wifiSignal) != std::tie(r.wifi, r.wifiSsid, r.wifiSignal)) return false;
     if (c.Enabled(FullComponent::BatteryHealth) &&
         std::tie(health, cycles) != std::tie(r.health, r.cycles)) return false;
+    if (c.Enabled(FullComponent::Fps) && std::tie(fps, fpsAdmin) != std::tie(r.fps, r.fpsAdmin)) return false;
     return true;
 }
 
@@ -231,7 +234,12 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
             v.diskWrite = L"写 " + CompactSpeed(s.disk_write_bps);
         }
         if (c.Enabled(CompactComponent::CpuFrequency)) v.cpuFrequency = Number(s.cpu_mhz / 1000, 2) + L" GHz";
-        if (c.Enabled(CompactComponent::Fps)) v.fps = Number(s.fps, 0);
+        if (c.Enabled(CompactComponent::Fps)) {
+            v.fpsAdmin = s.fps_status == 2;
+            if (v.fpsAdmin) v.fps = L"需管理员";
+            else if (s.fps_status == 1 && Known(s.fps)) v.fps = Number(s.fps, 0);
+            else v.fps = L"--";
+        }
     } else {
         if (hardware) {
             v.cpu = Fraction(s.cpu_percent); v.gpu = Fraction(s.gpu_percent); v.memory = Fraction(s.mem_percent);
@@ -315,6 +323,14 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
         if (c.Enabled(FullComponent::BatteryHealth)) {
             v.health = Known(s.battery_health_percent) ? Number(s.battery_health_percent, 1) + L"%" : L"--";
             v.cycles = s.battery_cycles < 0 ? L"--" : std::to_wstring(s.battery_cycles);
+        }
+        if (c.Enabled(FullComponent::Fps)) {
+            v.fpsAdmin = s.fps_status == 2;
+            if (v.fpsAdmin) v.fps = L"需要管理员权限";
+            else if (s.fps_status == 1 && Known(s.fps)) {
+                v.fps = Number(s.fps, 0) + L" fps";
+                if (!s.fps_process.empty()) v.fps += L" · " + s.fps_process;
+            } else v.fps = L"--";
         }
         std::time_t now = std::time(nullptr);
         std::tm local{};

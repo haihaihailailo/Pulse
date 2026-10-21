@@ -9,7 +9,7 @@ namespace pulse::ui {
 
 enum class FullComponent : std::size_t {
     Hardware, Battery, PowerChart, Network, Processes, DiskIO, SystemDisk,
-    SystemInfo, GpuMemory, Wifi, BatteryHealth, Count
+    SystemInfo, GpuMemory, Wifi, BatteryHealth, Fps, Count
 };
 enum class CompactComponent : std::size_t {
     Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, Count
@@ -31,7 +31,8 @@ inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(FullComponen
     {L"system_info", L"系统信息", false, 114},
     {L"gpu_memory", L"显存", false, 84},
     {L"wifi", L"Wi-Fi", false, 80},
-    {L"battery_health", L"电池健康", false, 78}
+    {L"battery_health", L"电池健康", false, 78},
+    {L"fps", L"帧数", false, 72}
 }};
 inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(CompactComponent::Count)> CompactComponents{{
     {L"battery", L"电量 %", true, 68},
@@ -50,7 +51,7 @@ inline constexpr std::array<FullComponent, FullComponents.size()> FullOrder{{
     FullComponent::Hardware, FullComponent::Battery, FullComponent::PowerChart,
     FullComponent::Network, FullComponent::DiskIO, FullComponent::SystemDisk,
     FullComponent::SystemInfo, FullComponent::GpuMemory, FullComponent::Wifi,
-    FullComponent::BatteryHealth, FullComponent::Processes
+    FullComponent::BatteryHealth, FullComponent::Fps, FullComponent::Processes
 }};
 struct Components {
     std::array<bool, FullComponents.size()> full{};
@@ -94,6 +95,7 @@ struct View {
     std::wstring latency, netHint, compactUp, compactDown, diskRead, diskWrite;
     std::wstring diskPercent, diskFree, cpuFrequency, memoryDetail, processCount, uptime;
     std::wstring sharedMemory, dedicatedMemory, wifiSsid, wifiSignal, health, cycles, fps;
+    bool fpsAdmin = false;
     Speed down, up, read, write;
     std::vector<Process> processes;
     std::vector<float> powerHistory; // Allocated only while the chart is visible.

@@ -1,10 +1,11 @@
 ﻿#include "ui_window.h"
 #include <exception>
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
+    pulse::ui::EnableDarkMode();
     pulse::ui::EnableDpiAwareness();
     try {
-        return pulse::ui::Run(instance, showCommand);
+        return pulse::ui::Run(instance, showCommand, commandLine);
     } catch (const std::exception&) {
         MessageBoxW(nullptr, L"Pulse 启动失败，请检查系统图形组件与可用内存。", L"Pulse", MB_OK | MB_ICONERROR);
     } catch (...) {

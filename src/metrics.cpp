@@ -27,6 +27,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <tlhelp32.h>
+#include "fpsmon.h"
 #include <powrprof.h>
 #include <pdh.h>
 #include <pdhmsg.h>
@@ -102,6 +104,7 @@ constexpr unsigned kWantUptime = 1u << 7;
 constexpr unsigned kWantGpuMem = 1u << 8;
 constexpr unsigned kWantWifi = 1u << 9;
 constexpr unsigned kWantBattery = 1u << 10;
+constexpr unsigned kWantFps = 1u << 11;
 constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc;
 
 static_assert(sizeof(void*) == 8, "x64 only");
@@ -541,6 +544,17 @@ public:
         return true;
     }
 
+    // prev_ is sorted by pid after Scan, including the baseline pass. Empty when
+    // process collection is off or the snapshot could not be read.
+    bool LookupName(std::uint64_t pid, std::wstring& out) const {
+        if (!have_ || pid == 0) return false;
+        const auto it = std::lower_bound(prev_.begin(), prev_.end(), pid,
+            [](const ProcPoint& row, std::uint64_t id) { return row.pid < id; });
+        if (it == prev_.end() || it->pid != pid || it->name.empty()) return false;
+        out = it->name;
+        return true;
+    }
+
 private:
     bool Read(std::vector<ProcPoint>& out) {
         if (!nt_) return false;
@@ -632,10 +646,11 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.gpu_memory) bits |= kWantGpuMem;
     if (w.wifi) bits |= kWantWifi;
     if (w.battery_health) bits |= kWantBattery;
+    if (w.fps) bits |= kWantFps;
     return bits;
 }
 
-Wants UnpackWants(unsigned bits) {
+constexpr Wants UnpackWants(unsigned bits) {
     Wants w;
     w.chip_power = (bits & kWantChip) != 0;
     w.gpu_usage = (bits & kWantGpu) != 0;
@@ -648,10 +663,23 @@ Wants UnpackWants(unsigned bits) {
     w.gpu_memory = (bits & kWantGpuMem) != 0;
     w.wifi = (bits & kWantWifi) != 0;
     w.battery_health = (bits & kWantBattery) != 0;
+    w.fps = (bits & kWantFps) != 0;
     return w;
 }
 
 static_assert(PackWants(Wants{}) == kWantDefault, "default Wants");
+
+constexpr Wants FpsWantOnly() {
+    Wants wants{};
+    wants.chip_power = false;
+    wants.gpu_usage = false;
+    wants.processes = false;
+    wants.fps = true;
+    return wants;
+}
+static_assert(PackWants(FpsWantOnly()) == kWantFps, "fps want bit");
+static_assert(UnpackWants(kWantFps).fps, "unpack fps");
+static_assert(!UnpackWants(kWantDefault).fps, "default fps off");
 
 using WlanOpenHandleFn = DWORD(WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
 using WlanCloseHandleFn = DWORD(WINAPI*)(HANDLE, PVOID);
@@ -773,6 +801,216 @@ bool ReadBatteryHealth(double& health, int& cycles) {
     health = best_health;
     cycles = best_cycles;
     return true;
+}
+
+void StripExeSuffix(std::wstring& name) {
+    if (name.size() < 4) return;
+    const std::size_t pos = name.size() - 4;
+    const wchar_t* tail = name.c_str() + pos;
+    if (tail[0] == L'.' && LowerChar(tail[1]) == L'e' && LowerChar(tail[2]) == L'x' &&
+        LowerChar(tail[3]) == L'e') {
+        name.resize(pos);
+    }
+}
+
+std::wstring QueryImageBaseName(DWORD pid) {
+    if (pid == 0) return L"";
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return L"";
+    std::wstring path(512, L'\0');
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DWORD size = static_cast<DWORD>(path.size());
+        if (QueryFullProcessImageNameW(process, 0, &path[0], &size)) {
+            path.resize(size);
+            ok = true;
+            break;
+        }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size <= 1 || size > 32768) break;
+        path.assign(size, L'\0');
+    }
+    CloseHandle(process);
+    if (!ok) return L"";
+    const auto slash = path.find_last_of(L"\\/");
+    std::wstring base = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    StripExeSuffix(base);
+    return base;
+}
+
+bool ProcessStillExists(DWORD pid) {
+    if (pid == 0) return false;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process) {
+        CloseHandle(process);
+        return true;
+    }
+    // A reused or exited pid fails with ERROR_INVALID_PARAMETER. Access denied still exists.
+    return GetLastError() != ERROR_INVALID_PARAMETER;
+}
+
+bool IsDesktopOrTaskbar(HWND hwnd) {
+    if (!hwnd) return true;
+    if (hwnd == GetDesktopWindow() || hwnd == GetShellWindow()) return true;
+    wchar_t cls[64];
+    cls[0] = 0;
+    if (GetClassNameW(hwnd, cls, 64) <= 0) return false;
+    const wchar_t* ignored[] = {L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
+                                L"NotifyIconOverflowWindow"};
+    for (const wchar_t* name : ignored) {
+        if (std::wcscmp(cls, name) == 0) return true;
+    }
+    return false;
+}
+
+struct FpsWindowCandidate { DWORD pid = 0; };
+
+BOOL CALLBACK FindFpsApplication(HWND hwnd, LPARAM context) {
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsDesktopOrTaskbar(hwnd)) return TRUE;
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) return TRUE;
+    wchar_t cls[64]{};
+    GetClassNameW(hwnd, cls, 64);
+    // A second Pulse instance or one of its cards is not a render target either.
+    if (std::wcscmp(cls, L"Pulse.Native.Main.v1") == 0 ||
+        std::wcscmp(cls, L"Pulse.Native.Notification.v1") == 0) return TRUE;
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect) || rect.right <= rect.left || rect.bottom <= rect.top) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0 || pid == GetCurrentProcessId()) return TRUE;
+    reinterpret_cast<FpsWindowCandidate*>(context)->pid = pid;
+    return FALSE;
+}
+
+// Clicking this widget, the desktop, or the taskbar keeps a live previous target.
+// An elevated/new instance has no previous pid. When Pulse owns the foreground,
+// seed it from the next visible application in Z order instead of staying empty.
+DWORD TrackedForegroundPid(DWORD previous) {
+    const HWND hwnd = GetForegroundWindow();
+    DWORD pid = 0;
+    if (hwnd) GetWindowThreadProcessId(hwnd, &pid);
+    if (!IsDesktopOrTaskbar(hwnd) && pid != 0 && pid != GetCurrentProcessId()) return pid;
+    if (ProcessStillExists(previous)) return previous;
+    if (pid == GetCurrentProcessId()) {
+        FpsWindowCandidate candidate;
+        EnumWindows(FindFpsApplication, reinterpret_cast<LPARAM>(&candidate));
+        return candidate.pid;
+    }
+    return 0;
+}
+
+// Parent links for the foreground Present rate. Toolhelp is not the process-CPU
+// scan: that scan is off in compact mode, and FPS must still see GPU children.
+// The snapshot is refreshed every few seconds, or immediately when the foreground
+// process changes. Sample walks this cache; it does not snapshot every tick.
+class FpsTree {
+public:
+    bool idle() const { return at_ == 0 && rows_.empty(); }
+    bool Due(unsigned long long now, bool root_changed) const {
+        if (root_changed || at_ == 0) return true;
+        return now - at_ >= 3000ull;
+    }
+    void Clear() {
+        std::vector<Row>().swap(rows_);
+        std::vector<Child>().swap(children_);
+        at_ = 0;
+    }
+    void Refresh(unsigned long long now);
+    bool Lookup(DWORD pid, std::wstring& name) const;
+    void Collect(DWORD root, std::vector<DWORD>& out) const;
+
+private:
+    struct Row {
+        DWORD pid = 0;
+        DWORD ppid = 0;
+        std::wstring name;
+    };
+    struct Child {
+        DWORD parent = 0;
+        DWORD child = 0;
+    };
+    std::vector<Row> rows_;
+    std::vector<Child> children_;
+    unsigned long long at_ = 0;
+};
+
+void FpsTree::Refresh(unsigned long long now) {
+    at_ = now;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    std::vector<Row> rows;
+    rows.reserve(rows_.empty() ? 256 : rows_.size());
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snap, &entry)) {
+        do {
+            Row row;
+            row.pid = entry.th32ProcessID;
+            row.ppid = entry.th32ParentProcessID;
+            if (row.pid != 0) {
+                row.name.assign(entry.szExeFile);
+                StripExeSuffix(row.name);
+                rows.push_back(std::move(row));
+            }
+            entry.dwSize = sizeof(entry);
+        } while (Process32NextW(snap, &entry));
+    }
+    CloseHandle(snap);
+    if (rows.empty()) return;
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.pid < b.pid; });
+    rows.erase(std::unique(rows.begin(), rows.end(),
+                           [](const Row& a, const Row& b) { return a.pid == b.pid; }),
+               rows.end());
+    std::vector<Child> children;
+    children.reserve(rows.size());
+    for (const Row& row : rows) {
+        if (row.ppid == row.pid) continue;
+        Child link;
+        link.parent = row.ppid;
+        link.child = row.pid;
+        children.push_back(link);
+    }
+    std::sort(children.begin(), children.end(), [](const Child& a, const Child& b) {
+        return a.parent < b.parent || (a.parent == b.parent && a.child < b.child);
+    });
+    rows_.swap(rows);
+    children_.swap(children);
+}
+
+bool FpsTree::Lookup(DWORD pid, std::wstring& name) const {
+    if (pid == 0 || rows_.empty()) return false;
+    const auto it = std::lower_bound(rows_.begin(), rows_.end(), pid,
+        [](const Row& row, DWORD key) { return row.pid < key; });
+    if (it == rows_.end() || it->pid != pid || it->name.empty()) return false;
+    name = it->name;
+    return true;
+}
+
+void FpsTree::Collect(DWORD root, std::vector<DWORD>& out) const {
+    out.clear();
+    if (root == 0) return;
+    out.push_back(root);
+    // Direct children are stored in pid order, so a browser's early GPU process
+    // is kept even when a later cap drops extra renderers.
+    for (std::size_t i = 0; i < out.size() && out.size() < 512; ++i) {
+        Child key;
+        key.parent = out[i];
+        key.child = 0;
+        const auto range = std::equal_range(children_.begin(), children_.end(), key,
+            [](const Child& a, const Child& b) { return a.parent < b.parent; });
+        for (auto it = range.first; it != range.second && out.size() < 512; ++it) {
+            const DWORD child = it->child;
+            if (child == 0 || child == out[i]) continue;
+            bool seen = false;
+            for (DWORD id : out) {
+                if (id == child) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) out.push_back(child);
+        }
+    }
 }
 
 }  // namespace
@@ -962,6 +1200,17 @@ struct Metrics::Impl {
     double battery_health_ = NAN;
     int battery_cycles_ = -1;
 
+    FpsMonitor fps_mon_;
+    bool fps_attempted_ = false;
+    bool fps_ok_ = false;
+    unsigned long long fps_retry_at_ = 0;
+    DWORD fps_pid_ = 0;
+    std::wstring fps_name_;
+    FpsTree fps_tree_;
+    std::vector<DWORD> fps_family_;
+    int fps_logged_status_ = 0;
+    bool fps_logged_ready_ = false;
+
     std::vector<unsigned char> pdh_buf_ = std::vector<unsigned char>(65536);
 
 private:
@@ -976,6 +1225,7 @@ private:
     void ReleaseWifi();
     void ReleaseSysDisk();
     void ReleaseBatteryHealth();
+    void ReleaseFps(const wchar_t* reason = L"disabled");
     void ClearTurnedOff(Snapshot& s, const Wants& wants);
     Wants CurrentWants() const;
 
@@ -994,6 +1244,7 @@ private:
     void UpdateGpuMemory(unsigned long long now, Snapshot& s);
     void UpdateWifi(unsigned long long now, Snapshot& s);
     void UpdateBatteryHealth(unsigned long long now, Snapshot& s);
+    void UpdateFps(Snapshot& s, unsigned long long now);
     bool EnsureEnergy(bool full, unsigned long long now);
     bool EnsureGpu(unsigned long long now);
     bool EnsureDisk(unsigned long long now);
@@ -1516,6 +1767,7 @@ void Metrics::Impl::UpdateGpu(bool full, unsigned long long now) {
 }
 
 void Metrics::Impl::CloseQueries() {
+    ReleaseFps(L"shutdown");
     ReleaseEnergy();
     ReleaseGpu();
     ReleaseDisk();
@@ -1572,6 +1824,12 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
     if (!w.battery_health) {
         s.battery_health_percent = NAN;
         s.battery_cycles = -1;
+    }
+    if (!w.fps) {
+        s.fps = NAN;
+        s.fps_status = 0;
+        s.fps_process.clear();
+        s.fps_top.clear();
     }
 }
 
@@ -2135,6 +2393,99 @@ void Metrics::Impl::UpdateBatteryHealth(unsigned long long now, Snapshot& s) {
     s.battery_cycles = battery_cycles_;
 }
 
+void Metrics::Impl::ReleaseFps(const wchar_t* reason) {
+    if (!fps_attempted_ && !fps_ok_ && fps_pid_ == 0 && fps_name_.empty() && fps_tree_.idle() &&
+        fps_family_.empty()) {
+        return;
+    }
+    fps_mon_.Stop();
+    if (fps_attempted_ || fps_logged_status_ != 0) {
+        diagnostics::WriteLog(L"FPS", L"status " + std::to_wstring(fps_logged_status_) +
+            L"->0 ready=0 reason=" + reason + L" error=0");
+    }
+    fps_logged_status_ = 0;
+    fps_logged_ready_ = false;
+    fps_attempted_ = false;
+    fps_ok_ = false;
+    fps_retry_at_ = 0;
+    fps_pid_ = 0;
+    fps_name_.clear();
+    fps_tree_.Clear();
+    std::vector<DWORD>().swap(fps_family_);
+}
+
+void Metrics::Impl::UpdateFps(Snapshot& s, unsigned long long now) {
+    const bool tried = !fps_attempted_ || (!fps_ok_ && now >= fps_retry_at_);
+    if (tried) {
+        fps_attempted_ = true;
+        fps_ok_ = fps_mon_.Start();
+    }
+    // StartTrace can block. Steady state is the foreground query, a cached
+    // parent walk, and one counter snapshot. Toolhelp runs only while the
+    // session is up, and only every 3s or when the foreground process changes.
+    diagnostics::ScopedTiming timing(L"FPS");
+    const DWORD root = TrackedForegroundPid(fps_pid_);
+    const bool root_changed = root != fps_pid_;
+    if (root_changed) {
+        fps_pid_ = root;
+        fps_name_.clear();
+    }
+    fps_family_.clear();
+    if (fps_mon_.Active()) {
+        if (fps_tree_.Due(now, root_changed)) fps_tree_.Refresh(now);
+        if (root != 0) fps_tree_.Collect(root, fps_family_);
+    }
+    if (root == 0) fps_name_.clear();
+    else if (fps_name_.empty()) {
+        if (!fps_tree_.Lookup(root, fps_name_) && !procs_.LookupName(root, fps_name_))
+            fps_name_ = QueryImageBaseName(root);
+    }
+    double fps = NAN;
+    int status = 0;
+    DWORD source = 0;
+    FpsPresent top[3]{};
+    int top_count = 0;
+    const DWORD* ids = fps_family_.empty() ? nullptr : fps_family_.data();
+    fps_mon_.Sample(ids, fps_family_.size(), fps, status, source, top, 3, top_count);
+    if (fps_ok_ && status == 4) {
+        fps_ok_ = false;
+        fps_retry_at_ = now + kPdhRetryMs;
+    } else if (tried && !fps_ok_) {
+        fps_retry_at_ = status == 2 ? ~0ull : now + kPdhRetryMs;
+    }
+    s.fps = fps;
+    s.fps_status = status;
+    if (status == 1 && source != 0) {
+        if (source == root) s.fps_process = fps_name_;
+        else if (!fps_tree_.Lookup(source, s.fps_process)) s.fps_process = QueryImageBaseName(source);
+        if (s.fps_process.empty()) s.fps_process = fps_name_;
+    } else {
+        s.fps_process = fps_name_;
+    }
+    const bool ready = std::isfinite(fps);
+    if (status != fps_logged_status_ || ready != fps_logged_ready_ || root_changed) {
+        std::wstring message = L"status " + std::to_wstring(fps_logged_status_) + L"->" +
+            std::to_wstring(status) + L" ready=" + (ready ? L"1" : L"0") +
+            L" full=" + (detail_ ? L"1" : L"0") + L" root=" + std::to_wstring(root) +
+            L" source=" + std::to_wstring(source) + L" family=" + std::to_wstring(fps_family_.size()) +
+            L" process=" + s.fps_process + L" error=" + std::to_wstring(fps_mon_.LastError());
+        if (top_count > 0) message += L" top=" + std::to_wstring(top[0].pid) +
+            L":" + std::to_wstring(top[0].frames);
+        diagnostics::WriteLog(L"FPS", message);
+        fps_logged_status_ = status;
+        fps_logged_ready_ = ready;
+    }
+    s.fps_top.clear();
+    for (int i = 0; i < top_count; ++i) {
+        FpsRank rank;
+        rank.pid = top[i].pid;
+        rank.frames = top[i].frames;
+        if (!fps_tree_.Lookup(top[i].pid, rank.name)) rank.name = QueryImageBaseName(top[i].pid);
+        if (rank.name.empty()) rank.name = std::to_wstring(static_cast<unsigned long long>(top[i].pid));
+        s.fps_top.push_back(std::move(rank));
+    }
+}
+
 void Metrics::Impl::UpdateProcs(Snapshot& s) {
     procs_buffers_ = true;
     diagnostics::ScopedTiming timing(L"Process scan");
@@ -2161,6 +2512,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (!wants.wifi) ReleaseWifi();
     if (!wants.sys_disk) ReleaseSysDisk();
     if (!wants.battery_health) ReleaseBatteryHealth();
+    if (!wants.fps) ReleaseFps();
     const bool reset = reset_intervals_.exchange(false, std::memory_order_acq_rel);
     if (detail_ != full || reset) {
         detail_ = full;
@@ -2178,7 +2530,13 @@ Snapshot Metrics::Impl::Take(bool full) {
         if (!full && pdh_buf_.size() > 65536) std::vector<unsigned char>(65536).swap(pdh_buf_);
     }
     if (paused_.load(std::memory_order_relaxed)) {
+        // A hidden widget must not keep a system-wide Present consumer.
+        ReleaseFps(L"paused");
         ClearTurnedOff(last_, wants);
+        last_.fps = NAN;
+        last_.fps_status = 0;
+        last_.fps_process.clear();
+        last_.fps_top.clear();
         return last_;
     }
     diagnostics::ScopedTiming timing(L"Sample total (includes stages)");
@@ -2221,6 +2579,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (wants.gpu_memory) UpdateGpuMemory(now, s);
     if (wants.wifi) UpdateWifi(now, s);
     if (wants.battery_health) UpdateBatteryHealth(now, s);
+    if (wants.fps) UpdateFps(s, now);
 
     NetProbe::View view;
     {

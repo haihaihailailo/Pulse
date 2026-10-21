@@ -114,6 +114,7 @@ constexpr ULONGLONG kOfflineIntervalMs = 1500;
 constexpr ULONGLONG kNicDebounceMs = 300;
 constexpr ULONGLONG kResumeDelayMs = 3000;
 constexpr ULONGLONG kSuspendGapMs = 60000;
+constexpr ULONGLONG kProbeLogIntervalMs = 10000;
 
 std::int64_t ProbeClockNow() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -209,7 +210,17 @@ struct ProbeContext {
     std::atomic<bool> headers{false};
     std::atomic<bool> failed{false};
     std::atomic<bool> timed_out{false};
+    std::atomic<DWORD> error{ERROR_SUCCESS};
+    std::atomic<DWORD> phase{0};
+    std::atomic<DWORD_PTR> error_api{0};
     std::atomic<std::int64_t> response_tick{0};
+    void Fail(DWORD code) {
+        error.store(code, std::memory_order_relaxed);
+        timed_out.store(code == ERROR_WINHTTP_TIMEOUT, std::memory_order_relaxed);
+        response_tick.store(ProbeClockNow(), std::memory_order_relaxed);
+        failed.store(true, std::memory_order_release);
+        SetEvent(signal->event);
+    }
     std::atomic<int> refs{1};
     explicit ProbeContext(std::shared_ptr<ProbeSignal> value) : signal(std::move(value)) {}
     void Release() {
@@ -222,6 +233,15 @@ struct ProbeRequest {
     HINTERNET connection = nullptr;
     ProbeContext* probe = nullptr;
     bool receiving = false;
+    std::size_t url_index = 0;
+    std::int64_t start_tick = 0;
+    const wchar_t* step = L"create";
+    DWORD setup_error = ERROR_SUCCESS;
+    bool Fail(DWORD error) {
+        setup_error = error;
+        if (probe) probe->Fail(error);
+        return false;
+    }
     ~ProbeRequest() {
         if (request) WinHttpCloseHandle(request); // Cancels pending async I/O.
         if (connection) WinHttpCloseHandle(connection);
@@ -233,6 +253,8 @@ void CALLBACK ProbeCallback(HINTERNET, DWORD_PTR context, DWORD status, void* in
     if (!context) return;
     diagnostics::ScopedTiming timing(L"Network callback");
     auto* probe = reinterpret_cast<ProbeContext*>(context);
+    if (status != WINHTTP_CALLBACK_STATUS_REQUEST_ERROR && status != WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING)
+        probe->phase.store(status, std::memory_order_relaxed);
     switch (status) {
     case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
         probe->sent.store(true, std::memory_order_release);
@@ -243,18 +265,35 @@ void CALLBACK ProbeCallback(HINTERNET, DWORD_PTR context, DWORD status, void* in
         probe->headers.store(true, std::memory_order_release);
         SetEvent(probe->signal->event);
         break;
-    case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
-        if (info && info_size >= sizeof(WINHTTP_ASYNC_RESULT) &&
-            static_cast<const WINHTTP_ASYNC_RESULT*>(info)->dwError == ERROR_WINHTTP_TIMEOUT)
-            probe->timed_out.store(true, std::memory_order_relaxed);
-        probe->failed.store(true, std::memory_order_release);
-        SetEvent(probe->signal->event);
+    case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
+        DWORD error = ERROR_GEN_FAILURE;
+        if (info && info_size >= sizeof(WINHTTP_ASYNC_RESULT)) {
+            const auto* result = static_cast<const WINHTTP_ASYNC_RESULT*>(info);
+            probe->error_api.store(result->dwResult, std::memory_order_relaxed);
+            error = result->dwError;
+        }
+        probe->Fail(error);
         break;
+    }
     case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
         probe->Release();
         break;
     default:
         break;
+    }
+}
+
+const wchar_t* ProbePhase(DWORD status) {
+    switch (status) {
+    case WINHTTP_CALLBACK_STATUS_DETECTING_PROXY: return L"proxy";
+    case WINHTTP_CALLBACK_STATUS_RESOLVING_NAME: return L"dns";
+    case WINHTTP_CALLBACK_STATUS_NAME_RESOLVED: return L"dns_done";
+    case WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER: return L"connect";
+    case WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER: return L"connected";
+    case WINHTTP_CALLBACK_STATUS_SENDING_REQUEST: return L"send";
+    case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE: return L"sent";
+    case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: return L"headers";
+    default: return L"setup";
     }
 }
 
@@ -313,7 +352,36 @@ private:
     CRITICAL_SECTION* cs_;
 };
 
+// One append per line, including the BOM on a new file. A single WriteFile with
+// FILE_APPEND_DATA keeps concurrent GUI/self-test records from overwriting.
+void WriteLogLine(const std::wstring& path, const wchar_t* category, const std::wstring& message) {
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    const std::wstring line = L"[" + LocalTimeText(now, true) + L"] [pid=" +
+        std::to_wstring(GetCurrentProcessId()) + L"] [" + category + L"] " + message + L"\r\n";
+    const int count = WideCharToMultiByte(CP_UTF8, 0, line.data(), static_cast<int>(line.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (count <= 0) return;
+    std::string utf8(static_cast<std::size_t>(count), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line.data(), static_cast<int>(line.size()), &utf8[0], count,
+                        nullptr, nullptr);
+    EnsureParent(path);
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{};
+    if (GetFileSizeEx(file, &size) && size.QuadPart == 0) utf8.insert(0, "\xEF\xBB\xBF");
+    WriteAll(file, utf8.data(), static_cast<DWORD>(utf8.size()));
+    CloseHandle(file);
+}
+
 }  // namespace
+
+void diagnostics::WriteLog(const wchar_t* category, const std::wstring& message) {
+    static const std::wstring path = MakeLogPath();
+    WriteLogLine(path, category, message);
+}
 
 struct NetProbe::Impl {
     Impl() {
@@ -349,20 +417,24 @@ struct NetProbe::Impl {
             return;
         }
 
+        proxy_mode_ = L"automatic";
         session_ = WinHttpOpen(L"Pulse/1.0.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
         if (!session_) {
+            AppendLog(L"WinHttpOpen automatic failed error=" + std::to_wstring(GetLastError()) +
+                      L" fallback=default");
+            proxy_mode_ = L"default";
             session_ = WinHttpOpen(L"Pulse/1.0.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
         }
         if (!session_) {
-            AppendLog(L"\u68C0\u6D4B\u51FA\u9519\uFF1AWinHTTP \u4F1A\u8BDD\u521B\u5EFA\u5931\u8D25");
+            AppendLog(L"WinHttpOpen failed error=" + std::to_wstring(GetLastError()));
             CleanupStartFailure();
             return;
         }
         if (!WinHttpSetOption(session_, WINHTTP_OPTION_UNLOAD_NOTIFY_EVENT, &unloaded_event_,
                               sizeof(unloaded_event_))) {
-            AppendLog(L"\u68C0\u6D4B\u51FA\u9519\uFF1AWinHTTP \u521D\u59CB\u5316\u5931\u8D25");
+            AppendLog(L"WinHTTP unload event setup failed error=" + std::to_wstring(GetLastError()));
             CleanupStartFailure();
             return;
         }
@@ -373,14 +445,14 @@ struct NetProbe::Impl {
         // bound their sum. Do not shrink connect to 500 ms by splitting the budget:
         // that could reject otherwise usable (<1000 ms) connections.
         if (!WinHttpSetTimeouts(session_, full_ms, full_ms, full_ms, full_ms)) {
-            AppendLog(L"\u68C0\u6D4B\u51FA\u9519\uFF1AWinHTTP \u521D\u59CB\u5316\u5931\u8D25");
+            AppendLog(L"WinHttpSetTimeouts failed error=" + std::to_wstring(GetLastError()));
             CleanupStartFailure();
             return;
         }
 
         thread_ = CreateThread(nullptr, 0, ThreadProc, this, 0, nullptr);
         if (!thread_) {
-            AppendLog(L"\u68C0\u6D4B\u51FA\u9519\uFF1A\u540E\u53F0\u63A2\u6D4B\u542F\u52A8\u5931\u8D25");
+            AppendLog(L"probe CreateThread failed error=" + std::to_wstring(GetLastError()));
             CleanupStartFailure();
         }
     }
@@ -508,35 +580,20 @@ private:
         if (!session_) return;
         HINTERNET session = session_;
         session_ = nullptr;
-        WinHttpCloseHandle(session);
+        const ULONGLONG start = GetTickCount64();
+        AppendLog(L"WinHTTP session closing");
+        const BOOL closed = WinHttpCloseHandle(session);
+        const DWORD error = closed ? ERROR_SUCCESS : GetLastError();
         // WinHTTP owns this event until the last session callback has returned.
         // Do not close it after a short timeout while WinHTTP may still signal it.
         if (unload_set_ && unloaded_event_) WaitForSingleObject(unloaded_event_, INFINITE);
         unload_set_ = false;
+        AppendLog(L"WinHTTP session closed error=" + std::to_wstring(error) +
+                  L" wait_ms=" + std::to_wstring(GetTickCount64() - start));
     }
 
     void AppendLog(const std::wstring& message) const {
-        SYSTEMTIME now{};
-        GetLocalTime(&now);
-        const std::wstring line = L"[" + LocalTimeText(now, true) + L"] " + message + L"\r\n";
-        const int count = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()),
-                                              nullptr, 0, nullptr, nullptr);
-        if (count <= 0) return;
-        std::string utf8(static_cast<std::size_t>(count), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, line.c_str(), static_cast<int>(line.size()), &utf8[0], count,
-                            nullptr, nullptr);
-        EnsureParent(log_path_);
-        HANDLE file = CreateFileW(log_path_.c_str(), FILE_APPEND_DATA | FILE_READ_DATA,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE) return;
-        LARGE_INTEGER size{};
-        if (GetFileSizeEx(file, &size) && size.QuadPart == 0) {
-            const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
-            WriteAll(file, bom, sizeof(bom));
-        }
-        WriteAll(file, utf8.data(), static_cast<DWORD>(utf8.size()));
-        CloseHandle(file);
+        WriteLogLine(log_path_, L"NET", message);
     }
 
     bool Interrupted() const {
@@ -544,22 +601,26 @@ private:
                (wake_event_ && WaitForSingleObject(wake_event_, 0) == WAIT_OBJECT_0);
     }
 
-    bool PendingOrSuccessful(BOOL result) const {
-        return result || GetLastError() == ERROR_IO_PENDING;
+    bool PendingOrSuccessful(BOOL result, ProbeRequest& item) const {
+        if (result) return true;
+        const DWORD error = GetLastError();
+        return error == ERROR_IO_PENDING || item.Fail(error);
     }
 
     bool BeginRequest(const std::wstring& url, ProbeRequest& item,
                       const std::shared_ptr<ProbeSignal>& signal) {
-        if (url.empty() || Interrupted() || !session_) return false;
+        if (Interrupted()) return item.Fail(ERROR_OPERATION_ABORTED);
+        if (url.empty() || !session_) return item.Fail(ERROR_INVALID_PARAMETER);
+        item.step = L"CrackUrl";
         URL_COMPONENTS parts{};
         parts.dwStructSize = sizeof(parts);
         parts.dwHostNameLength = static_cast<DWORD>(-1);
         parts.dwUrlPathLength = static_cast<DWORD>(-1);
         parts.dwExtraInfoLength = static_cast<DWORD>(-1);
-        if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) ||
-            (parts.nScheme != INTERNET_SCHEME_HTTP && parts.nScheme != INTERNET_SCHEME_HTTPS) ||
+        if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return item.Fail(GetLastError());
+        if ((parts.nScheme != INTERNET_SCHEME_HTTP && parts.nScheme != INTERNET_SCHEME_HTTPS) ||
             !parts.lpszHostName || !parts.dwHostNameLength ||
-            parts.dwHostNameLength == static_cast<DWORD>(-1)) return false;
+            parts.dwHostNameLength == static_cast<DWORD>(-1)) return item.Fail(ERROR_INVALID_PARAMETER);
         const std::wstring host(parts.lpszHostName, parts.dwHostNameLength);
         std::wstring target;
         if (parts.dwUrlPathLength && parts.dwUrlPathLength != static_cast<DWORD>(-1))
@@ -571,61 +632,104 @@ private:
         if (fragment != std::wstring::npos) target.erase(fragment);
 
         item.probe = new ProbeContext(signal);
+        item.step = L"Connect";
         item.connection = WinHttpConnect(session_, host.c_str(), parts.nPort, 0);
-        if (!item.connection) return false;
+        if (!item.connection) return item.Fail(GetLastError());
         const DWORD flags = WINHTTP_FLAG_REFRESH |
             (parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        item.step = L"OpenRequest";
         item.request = WinHttpOpenRequest(item.connection, L"GET", target.c_str(), nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-        if (!item.request) return false;
-        DWORD disabled = WINHTTP_DISABLE_REDIRECTS;
+        if (!item.request) return item.Fail(GetLastError());
+        // Enforce fresh request connections in WinHTTP itself, as well as the
+        // HTTP header. Session/proxy selection is retained across rounds.
+        DWORD disabled = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_KEEP_ALIVE;
+        item.step = L"SetOption";
         DWORD_PTR context = reinterpret_cast<DWORD_PTR>(item.probe);
         if (!WinHttpSetOption(item.request, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled)) ||
             !WinHttpSetOption(item.request, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)) ||
             !WinHttpAddRequestHeaders(item.request, L"Connection: close\r\n", static_cast<DWORD>(-1),
-                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) || Interrupted()) return false;
+                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) return item.Fail(GetLastError());
+        if (Interrupted()) return item.Fail(ERROR_OPERATION_ABORTED);
 
         item.probe->refs.store(2, std::memory_order_relaxed);
         const DWORD callbacks = WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
             WINHTTP_CALLBACK_FLAG_HEADERS_AVAILABLE | WINHTTP_CALLBACK_FLAG_REQUEST_ERROR |
-            WINHTTP_CALLBACK_FLAG_HANDLES;
+            WINHTTP_CALLBACK_FLAG_HANDLES | WINHTTP_CALLBACK_STATUS_DETECTING_PROXY |
+            WINHTTP_CALLBACK_STATUS_RESOLVING_NAME | WINHTTP_CALLBACK_STATUS_NAME_RESOLVED |
+            WINHTTP_CALLBACK_STATUS_CONNECTING_TO_SERVER | WINHTTP_CALLBACK_STATUS_CONNECTED_TO_SERVER |
+            WINHTTP_CALLBACK_STATUS_SENDING_REQUEST;
         if (WinHttpSetStatusCallback(item.request, ProbeCallback, callbacks, 0) ==
             WINHTTP_INVALID_STATUS_CALLBACK) {
+            const DWORD error = GetLastError();
             item.probe->refs.store(1, std::memory_order_relaxed);
-            return false;
+            return item.Fail(error);
         }
+        item.step = L"SendRequest";
         return PendingOrSuccessful(WinHttpSendRequest(item.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-            WINHTTP_NO_REQUEST_DATA, 0, 0, context));
+            WINHTTP_NO_REQUEST_DATA, 0, 0, context), item);
     }
 
     // Each stage has one deadline; the primary and parallel backups also share
     // a 2.5 s round deadline. A late callback can never extend either deadline.
     bool ProbeUrls(std::size_t first, std::size_t last, ULONGLONG& elapsed,
-                   std::int64_t round_start, bool& timed_out) {
+                   std::int64_t round_start, bool& timed_out, std::wstring* trace) {
         diagnostics::ScopedTiming timing(last - first > 1 ? L"Network backups (parallel)" : L"Network primary");
         const std::int64_t start = ProbeClockNow();
         const ULONGLONG round_spent = ProbeElapsedMs(round_start, start);
-        if (round_spent >= kRoundTimeoutMs) { timed_out = true; return false; }
+        if (round_spent >= kRoundTimeoutMs) {
+            timed_out = true;
+            if (trace) *trace += L" round_deadline error=" + std::to_wstring(ERROR_WINHTTP_TIMEOUT);
+            return false;
+        }
         const ULONGLONG remaining = kRoundTimeoutMs - round_spent;
         const ULONGLONG budget = remaining < static_cast<ULONGLONG>(config_.timeout_ms)
                                    ? remaining : static_cast<ULONGLONG>(config_.timeout_ms);
         auto signal = std::make_shared<ProbeSignal>();
-        if (!signal->event) return false;
+        if (!signal->event) {
+            if (trace) *trace += L" CreateEvent error=" + std::to_wstring(GetLastError());
+            return false;
+        }
         std::vector<std::unique_ptr<ProbeRequest>> requests;
         requests.reserve(last - first);
+        // Snapshot requests before RAII cancellation, preserving the real error.
+        // Formatting/file I/O stays off the callbacks and healthy result path.
+        auto finish = [&](bool ok, const wchar_t* reason, DWORD fallback) {
+            if (trace && (!ok || elapsed >= static_cast<ULONGLONG>(config_.unusable_ms))) {
+                for (const auto& item : requests) {
+                    const ProbeContext* p = item->probe;
+                    const bool headers = p && p->headers.load(std::memory_order_acquire);
+                    const bool failed = p && p->failed.load(std::memory_order_acquire);
+                    const DWORD error = headers ? ERROR_SUCCESS : failed ?
+                        p->error.load(std::memory_order_relaxed) : item->setup_error ? item->setup_error : fallback;
+                    const std::int64_t end = p && (headers || failed) ?
+                        p->response_tick.load(std::memory_order_relaxed) : ProbeClockNow();
+                    if (!trace->empty()) *trace += L"; ";
+                    *trace += L"url#" + std::to_wstring(item->url_index + 1) + L"{" + item->step +
+                        L" phase=" + (p ? ProbePhase(p->phase.load(std::memory_order_relaxed)) : L"setup") +
+                        L" error=" + std::to_wstring(error) + L" api=" +
+                        std::to_wstring(p ? static_cast<unsigned long long>(p->error_api.load(std::memory_order_relaxed)) : 0ULL) +
+                        L" elapsed_ms=" + std::to_wstring(ProbeElapsedMs(item->start_tick, end)) +
+                        L" headers=" + (headers ? L"1" : L"0") + L" result=" + reason + L"}";
+                }
+                if (requests.empty()) *trace += L"stage_empty error=" + std::to_wstring(fallback);
+            }
+            return ok;
+        };
         for (std::size_t i = first; i < last; ++i) {
             if (Interrupted() || ProbeElapsedMs(start, ProbeClockNow()) >= budget) break;
             auto item = std::make_unique<ProbeRequest>();
             // Insert first so even an allocation exception leaves no live handle behind.
             requests.push_back(std::move(item));
             auto& current = *requests.back();
-            if (!BeginRequest(config_.urls[i], current, signal) && current.probe)
-                current.probe->failed.store(true, std::memory_order_release);
+            current.url_index = i;
+            current.start_tick = ProbeClockNow();
+            BeginRequest(config_.urls[i], current, signal);
         }
         HANDLE events[] = {stop_event_, wake_event_, network_event_, signal->event};
         for (;;) {
             ResetEvent(signal->event); // Reset BEFORE inspecting flags: no lost wakeups.
-            if (Interrupted()) return false;
+            if (Interrupted()) return finish(false, L"cancelled", ERROR_OPERATION_ABORTED);
             std::int64_t winner = 0;
             bool pending = false;
             for (const auto& item : requests) {
@@ -640,10 +744,8 @@ private:
                     // SendRequest has returned before ReceiveResponse is started.
                     if (!item->receiving && probe->sent.load(std::memory_order_acquire)) {
                         item->receiving = true;
-                        if (!PendingOrSuccessful(WinHttpReceiveResponse(item->request, nullptr))) {
-                            probe->failed.store(true, std::memory_order_release);
-                            SetEvent(signal->event);
-                        }
+                        item->step = L"ReceiveResponse";
+                        PendingOrSuccessful(WinHttpReceiveResponse(item->request, nullptr), *item);
                     }
                 } else if (probe->timed_out.load(std::memory_order_relaxed)) {
                     // failed's acquire above makes the callback's timeout flag visible.
@@ -652,21 +754,27 @@ private:
             }
             if (winner) {
                 elapsed = ProbeElapsedMs(start, winner);
-                if (elapsed > budget) { timed_out = true; return false; }
-                return true; // RAII immediately cancels every losing request.
+                if (elapsed > budget) {
+                    timed_out = true;
+                    return finish(false, L"late_headers", ERROR_WINHTTP_TIMEOUT);
+                }
+                return finish(true, L"headers", ERROR_SUCCESS); // RAII cancels losing requests.
             }
             const ULONGLONG spent = ProbeElapsedMs(start, ProbeClockNow());
             if (!pending || spent >= budget) {
                 if (spent >= budget) timed_out = true;
-                return false;
+                return finish(false, spent >= budget ? L"deadline" : L"failed",
+                              spent >= budget ? ERROR_WINHTTP_TIMEOUT : ERROR_GEN_FAILURE);
             }
             const DWORD waited = WaitForMultipleObjects(4, events, FALSE, static_cast<DWORD>(budget - spent));
             // The flag survives an auto-reset event wait. A late signal for an
             // already consumed notification is just a wakeup, not an HTTP failure.
             if (waited == WAIT_OBJECT_0 + 2 && !network_pending_.load(std::memory_order_acquire)) continue;
             if (waited != WAIT_OBJECT_0 + 3) {
+                const DWORD error = waited == WAIT_FAILED ? GetLastError() :
+                    waited == WAIT_TIMEOUT ? ERROR_WINHTTP_TIMEOUT : ERROR_OPERATION_ABORTED;
                 if (waited == WAIT_TIMEOUT) timed_out = true;
-                return false;
+                return finish(false, waited == WAIT_TIMEOUT ? L"deadline" : L"cancelled", error);
             }
         }
     }
@@ -734,17 +842,17 @@ private:
         return true;
     }
 
-    void ApplyResult(bool ok, ULONGLONG ms, bool timed_out, std::uint64_t epoch) {
+    bool ApplyResult(bool& ok, ULONGLONG& ms, bool timed_out, std::uint64_t epoch) {
         CsLock lock(&status_cs_);
         if (suspended_ || epoch != power_epoch_ ||
-            network_pending_.load(std::memory_order_acquire)) return;
+            network_pending_.load(std::memory_order_acquire)) return false;
         // A local proxy/TUN response cannot recover a confirmed physical outage.
         // This query is confined to recovery attempts after physical disconnection.
         if (ok && status_.link_disconnected && detail::AllPhysicalNicsDisconnected()) {
             ok = false;
             ms = 0;
         }
-        if (network_pending_.load(std::memory_order_acquire)) return;
+        if (network_pending_.load(std::memory_order_acquire)) return false;
         resume_pending_ = false;
         SYSTEMTIME now{};
         GetLocalTime(&now);
@@ -805,10 +913,69 @@ private:
         // Serialize publication with OnSuspend/OnResume: after either returns,
         // the UI can safely drain every notification from the previous epoch.
         PublishEvent(log, std::move(notification), recovered);
+        return true;
+    }
+
+    void LogProbeRound(ULONGLONG round, std::int64_t start, bool ok, ULONGLONG ms,
+                       bool timeout, bool parallel, std::uint64_t epoch,
+                       const wchar_t* result, const std::wstring& trace) {
+        const ULONGLONG tick = GetTickCount64();
+        unsigned failures = 0;
+        bool outage = false, suspended = false, physical_offline = false;
+        std::uint64_t active_epoch = 0;
+        {
+            CsLock lock(&status_cs_);
+            failures = status_.fail_count;
+            outage = status_.outage_active;
+            physical_offline = status_.link_disconnected;
+            suspended = suspended_;
+            active_epoch = power_epoch_;
+        }
+        // This also limits diagnostics during a storm of NIC cancellations.
+        if (last_probe_log_tick_ && tick - last_probe_log_tick_ < kProbeLogIntervalMs &&
+            (outage || std::wcscmp(result, L"applied") != 0)) return;
+        last_probe_log_tick_ = tick;
+        AppendLog(L"probe round=" + std::to_wstring(round) + L" result=" + result +
+            L" ok=" + (ok ? L"1" : L"0") + L" latency_ms=" + std::to_wstring(ms) +
+            L" round_ms=" + std::to_wstring(ProbeElapsedMs(start, ProbeClockNow())) +
+            L" timeout=" + (timeout ? L"1" : L"0") + L" parallel=" + (parallel ? L"1" : L"0") +
+            L" fail_count=" + std::to_wstring(failures) + L" offline=" + (outage ? L"1" : L"0") +
+            L" physical_offline=" + (physical_offline ? L"1" : L"0") +
+            L" proxy=" + proxy_mode_ + L" nic_pending=" +
+            (network_pending_.load(std::memory_order_acquire) ? L"1" : L"0") +
+            L" suspended=" + (suspended ? L"1" : L"0") + L" epoch=" + std::to_wstring(epoch) +
+            L"/" + std::to_wstring(active_epoch) + L" cancelled_total=" + std::to_wstring(cancelled_rounds_) +
+            L" since_success_ms=" + (last_success_tick_ ? std::to_wstring(tick - last_success_tick_) : L"unknown") +
+            L" [" + trace + L"]");
     }
 
     void Run() {
-        AppendLog(L"启动监测");
+        std::wstring targets;
+        for (std::size_t i = 0; i < config_.urls.size(); ++i) {
+            URL_COMPONENTS parts{};
+            parts.dwStructSize = sizeof(parts);
+            parts.dwHostNameLength = static_cast<DWORD>(-1);
+            const bool valid = WinHttpCrackUrl(config_.urls[i].c_str(), 0, 0, &parts) != FALSE;
+            targets += L" url#" + std::to_wstring(i + 1) + L"=" +
+                (valid && parts.lpszHostName ? std::wstring(parts.lpszHostName, parts.dwHostNameLength) : L"invalid");
+        }
+        WINHTTP_CURRENT_USER_IE_PROXY_CONFIG proxy_config{};
+        std::wstring proxy_settings;
+        if (WinHttpGetIEProxyConfigForCurrentUser(&proxy_config)) {
+            proxy_settings = L" user_auto_detect=" + std::to_wstring(proxy_config.fAutoDetect ? 1 : 0) +
+                L" user_pac=" + std::to_wstring(proxy_config.lpszAutoConfigUrl && *proxy_config.lpszAutoConfigUrl ? 1 : 0) +
+                L" user_manual_proxy=" + std::to_wstring(proxy_config.lpszProxy && *proxy_config.lpszProxy ? 1 : 0);
+        } else {
+            proxy_settings = L" user_proxy_config_error=" + std::to_wstring(GetLastError());
+        }
+        if (proxy_config.lpszAutoConfigUrl) GlobalFree(proxy_config.lpszAutoConfigUrl);
+        if (proxy_config.lpszProxy) GlobalFree(proxy_config.lpszProxy);
+        if (proxy_config.lpszProxyBypass) GlobalFree(proxy_config.lpszProxyBypass);
+        AppendLog(L"启动监测 proxy=" + std::wstring(proxy_mode_) + proxy_settings +
+            L" timeout_ms=" + std::to_wstring(config_.timeout_ms) + L" round_limit_ms=" +
+            std::to_wstring(kRoundTimeoutMs) + L" interval_s=" + std::to_wstring(config_.interval_s) +
+            L" fail_threshold=" + std::to_wstring(config_.fail_threshold) + targets);
+        ULONGLONG round = 0;
         std::uint64_t epoch = 0;
         ULONGLONG next_due = 0, last_start = 0, link_check_due = 0;
         bool link_was_disconnected = false;
@@ -821,7 +988,7 @@ private:
         while (!Stopping()) {
             // The flag also survives NIC events consumed inside an HTTP wait.
             const bool network_changed = network_pending_.exchange(false, std::memory_order_acq_rel);
-            bool suspended = false, resuming = false, fast = false;
+            bool suspended = false, resuming = false, fast = false, offline = false;
             {
                 CsLock lock(&status_cs_);
                 // Reset under the same lock as the power handlers, before
@@ -838,6 +1005,7 @@ private:
                 suspended = suspended_;
                 resuming = resume_pending_;
                 fast = status_.fail_count != 0;
+                offline = status_.outage_active;
             }
             ULONGLONG now = GetTickCount64();
             if (!suspended && last_start && now - last_start > gap_limit) {
@@ -887,6 +1055,11 @@ private:
 
             last_start = now;
             const std::int64_t round_start = ProbeClockNow();
+            ++round;
+            const bool trace_round = !offline || !last_probe_log_tick_ ||
+                now - last_probe_log_tick_ >= kProbeLogIntervalMs;
+            std::wstring trace;
+            std::wstring* trace_out = trace_round ? &trace : nullptr;
             ULONGLONG ms = 0;
             bool timed_out = false;
             // Once unavailable or after a NIC change, race all addresses within
@@ -895,18 +1068,32 @@ private:
             const bool parallel = fast || race_next;
             race_next = false;
             bool ok = !config_.urls.empty() &&
-                ProbeUrls(0, parallel ? config_.urls.size() : 1, ms, round_start, timed_out);
+                ProbeUrls(0, parallel ? config_.urls.size() : 1, ms, round_start, timed_out, trace_out);
             if (!parallel && !ok && !Interrupted() && config_.urls.size() > 1)
-                ok = ProbeUrls(1, config_.urls.size(), ms, round_start, timed_out);
+                ok = ProbeUrls(1, config_.urls.size(), ms, round_start, timed_out, trace_out);
             if (Stopping()) break;
             // Includes sleep that occurred inside an async WinHTTP wait, even
             // when WM_POWERBROADCAST was missed. Never apply that stale result.
             if (GetTickCount64() - last_start > kSuspendGapMs) {
+                LogProbeRound(round, round_start, ok, ms, timed_out, parallel, epoch,
+                              L"long_round_or_sleep", trace);
                 ResumeAfterGap(epoch);
                 continue;
             }
-            if (Interrupted()) continue;
-            ApplyResult(ok, ok ? ms : 0, timed_out, epoch);
+            if (Interrupted()) {
+                ++cancelled_rounds_;
+                if (trace_round) LogProbeRound(round, round_start, ok, ms, timed_out, parallel, epoch,
+                                               L"cancelled", trace);
+                continue;
+            }
+            if (!ok) ms = 0;
+            const bool applied = ApplyResult(ok, ms, timed_out, epoch);
+            if (!applied) ++cancelled_rounds_;
+            if (applied && ok && ms < static_cast<ULONGLONG>(config_.unusable_ms))
+                last_success_tick_ = GetTickCount64();
+            else if (trace_round)
+                LogProbeRound(round, round_start, ok, ms, timed_out, parallel, epoch,
+                              applied ? L"applied" : L"invalidated", trace);
             {
                 CsLock lock(&status_cs_);
                 const ULONGLONG interval = status_.outage_active ? kOfflineIntervalMs :
@@ -941,6 +1128,8 @@ private:
     HANDLE thread_ = nullptr;
     HINTERNET session_ = nullptr;
     bool unload_set_ = false;
+    const wchar_t* proxy_mode_ = L"automatic";
+    ULONGLONG last_probe_log_tick_ = 0, last_success_tick_ = 0, cancelled_rounds_ = 0;
 };
 
 NetProbe::NetProbe() : impl_(new Impl) {}

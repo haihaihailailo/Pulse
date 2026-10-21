@@ -12,6 +12,9 @@ namespace pulse {
 // clear after all Metrics/NetProbe instances have stopped. Normal use reads only
 // a null callback; QPC/GetThreadTimes are never called unless enabled.
 namespace diagnostics {
+// UTF-8 pulse_net.log; writes only when explicitly called (no polling/worker).
+// Shared by FPS and network diagnostics. Every line includes the process id.
+void WriteLog(const wchar_t* category, const std::wstring& message);
 using TimingCallback = void (*)(const wchar_t* category, double wall_ms, double cpu_ms, void* user);
 void SetTimingCallback(TimingCallback callback, void* user);
 class ScopedTiming {

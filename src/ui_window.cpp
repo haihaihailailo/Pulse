@@ -1,8 +1,21 @@
 ﻿#include "ui_window.h"
 #include "ui_renderer.h"
 #include "metrics.h"
+#include "netprobe.h"
 #include <windowsx.h>
 #include <shellapi.h>
+#ifndef SEE_MASK_NOCLOSEPROCESS
+#define SEE_MASK_NOCLOSEPROCESS 0x00000040
+#endif
+#ifndef SEE_MASK_NOASYNC
+#define SEE_MASK_NOASYNC 0x00000100
+#endif
+#ifndef SEE_MASK_FLAG_NO_UI
+#define SEE_MASK_FLAG_NO_UI 0x00000400
+#endif
+#ifndef MSGFLT_ALLOW
+#define MSGFLT_ALLOW 1
+#endif
 #include <shlobj.h>
 #include <mmsystem.h>
 #include <algorithm>
@@ -18,6 +31,8 @@
 namespace pulse::ui {
 namespace {
 constexpr wchar_t MainClass[] = L"Pulse.Native.Main.v1";
+constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Native.SingleInstance.v1";
+constexpr wchar_t RestartedArg[] = L"--restarted";
 constexpr wchar_t ToastClass[] = L"Pulse.Native.Notification.v1";
 constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr UINT SampleTimer = 1;
@@ -29,7 +44,7 @@ constexpr UINT ArrangeToastMessage = WM_APP + 5;
 constexpr UINT DpiFitMessage = WM_APP + 6;
 constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
-constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109;
+constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109, CmdRestartAdmin = 110;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
 constexpr UINT CmdRefresh = 400;
 constexpr UINT CmdSlowThreshold = 450;
@@ -39,6 +54,8 @@ constexpr std::array<int, 7> SlowThresholds{{50, 100, 150, 200, 300, 500, 800}};
 constexpr std::array<int, 6> ZoomLevels{{80, 100, 125, 150, 175, 200}};
 constexpr DWORD MainStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
 constexpr DWORD ToastStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
+
+void AllowShowFromLowerIntegrity(HWND window);
 
 void SetSampleTimer(HWND window, bool compact, UINT fullInterval) {
     using CoalescableTimerFn = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
@@ -384,7 +401,7 @@ public:
         if (icon_) DestroyIcon(icon_);
         if (smallIcon_) DestroyIcon(smallIcon_);
     }
-    int Execute(int showCommand) {
+    int Execute(int showCommand, bool restarted) {
         config_.Load();
         notificationState_.store(config_.notify ? 1u : 0u, std::memory_order_release);
         if (FAILED(renderer_.Initialize())) {
@@ -428,13 +445,21 @@ public:
         window_ = CreateWindowExW(WS_EX_APPWINDOW, MainClass, L"Pulse", MainStyle,
             config_.x, config_.y, width, height, nullptr, nullptr, instance_, this);
         if (!window_) return 1;
+        AllowShowFromLowerIntegrity(window_);
         callbackWindow_.store(window_, std::memory_order_release);
         Fit(false);
         SetWindowPos(window_, config_.pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         AddTray();
         metrics_ = std::make_unique<Metrics>();
-        metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
+        const Wants initialWants = CollectionWants(config_.components, config_.compact, powerMode_);
+        metrics_->SetWants(initialWants); // Always before Start and the first Sample, including --restarted.
+        if (initialWants.fps) {
+            diagnostics::WriteLog(L"FPS", L"ui startup wants=1 compact=" +
+                std::to_wstring(config_.compact ? 1 : 0) + L" restarted=" + std::to_wstring(restarted ? 1 : 0) +
+                L" full_fps=" + std::to_wstring(config_.components.Enabled(FullComponent::Fps) ? 1 : 0) +
+                L" compact_fps=" + std::to_wstring(config_.components.Enabled(CompactComponent::Fps) ? 1 : 0));
+        }
         Settings settings;
         settings.slow_ms = config_.slow_ms;
         metrics_->Start(settings, NetworkEvent, this);
@@ -560,6 +585,7 @@ private:
     }
     Snapshot ReadMetrics() {
         auto sample = metrics_->Sample(!config_.compact);
+        fpsStatus_ = sample.fps_status;
         if (powerMode_ != sample.mode) {
             powerMode_ = sample.mode;
             metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
@@ -584,7 +610,12 @@ private:
         if (changed || resetTimer || !active) KillTimer(window_, SampleTimer);
         metrics_->SetPaused(!active);
         active_ = active;
-        if (!active) return;
+        if (!active) {
+            // Pausing stops the timer, so Take would otherwise never get a chance
+            // to release an active FPS session until the window was shown again.
+            if (changed) metrics_->Sample(!config_.compact);
+            return;
+        }
         if (changed) model_.BreakHistory();
         if (changed || resetTimer) SetSampleTimer(window_, config_.compact, config_.refresh_ms);
         if (sampleNow || changed) Refresh();
@@ -718,6 +749,28 @@ private:
         }
         if (result <= 32) MessageBoxW(window_, L"无法打开日志，日志文件可能尚未生成。", L"Pulse", MB_OK | MB_ICONINFORMATION);
     }
+    bool FpsNeedsAdmin() const {
+        if (fpsStatus_ != 2) return false;
+        return config_.compact ? config_.components.Enabled(CompactComponent::Fps)
+                               : config_.components.Enabled(FullComponent::Fps);
+    }
+    void RestartElevated() {
+        const auto path = ExecutablePath();
+        if (path.empty() || !window_) return;
+        SHELLEXECUTEINFOW info{};
+        info.cbSize = sizeof(info);
+        // NOASYNC returns after the new process is created, not after it exits.
+        // Do not wait on hProcess: the new instance waits for this mutex.
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+        info.hwnd = window_;
+        info.lpVerb = L"runas";
+        info.lpFile = path.c_str();
+        info.lpParameters = RestartedArg;
+        info.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&info)) return;
+        if (info.hProcess) CloseHandle(info.hProcess);
+        SendMessageW(window_, WM_CLOSE, 0, 0);
+    }
     void Menu(POINT point) {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
@@ -790,6 +843,8 @@ private:
         AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CmdStartup, L"开机自启");
         AppendMenuW(menu, MF_STRING, CmdLog, L"打开日志");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (FpsNeedsAdmin())
+            AppendMenuW(menu, MF_STRING, CmdRestartAdmin, L"以管理员身份重启（显示帧数需要）");
         AppendMenuW(menu, MF_STRING, CmdExit, L"退出");
         SetForegroundWindow(window_);
         const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
@@ -850,6 +905,7 @@ private:
         case CmdPin: TogglePin(); break;
         case CmdStartup: ToggleStartup(); break;
         case CmdLog: OpenLog(); break;
+        case CmdRestartAdmin: RestartElevated(); break;
         case CmdExit: SendMessageW(window_, WM_CLOSE, 0, 0); break;
         }
     }
@@ -1149,6 +1205,7 @@ private:
     std::vector<std::unique_ptr<Toast>> toasts_;
     UINT dpi_ = 96, taskbarCreated_ = 0;
     PowerMode powerMode_ = PowerMode::Unknown;
+    int fpsStatus_ = 0;
     bool active_ = false, running_ = false, stopping_ = false, fitting_ = false, dpiFitPending_ = false;
     bool zoomFitPending_ = false;
     bool systemSuspended_ = false;
@@ -1165,11 +1222,85 @@ private:
 };
 
 struct HandleCloser { void operator()(void* handle) const { if (handle) CloseHandle(handle); } };
+
+bool CommandHasRestarted(const wchar_t* commandLine) {
+    if (!commandLine) return false;
+    constexpr std::size_t restartedLen = sizeof(RestartedArg) / sizeof(wchar_t) - 1;
+    const wchar_t* p = commandLine;
+    while (*p) {
+        while (*p == L' ' || *p == L'\t') ++p;
+        if (!*p) break;
+        const bool quoted = *p == L'"';
+        if (quoted) ++p;
+        const wchar_t* start = p;
+        if (quoted) while (*p && *p != L'"') ++p;
+        else while (*p && *p != L' ' && *p != L'\t') ++p;
+        if (static_cast<std::size_t>(p - start) == restartedLen &&
+            std::wmemcmp(start, RestartedArg, restartedLen) == 0) {
+            return true;
+        }
+        if (quoted && *p == L'"') ++p;
+    }
+    return false;
+}
+
+void ActivateExistingInstance() {
+    HWND previous = FindWindowW(MainClass, nullptr);
+    if (!previous) return;
+    DWORD process = 0;
+    GetWindowThreadProcessId(previous, &process);
+    AllowSetForegroundWindow(process);
+    PostMessageW(previous, ShowMessage, 0, 0);
+}
+
+void AllowShowFromLowerIntegrity(HWND window) {
+    using FilterFn = BOOL (WINAPI*)(HWND, UINT, DWORD, void*);
+    const auto filter = reinterpret_cast<FilterFn>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx"));
+    if (filter) filter(window, ShowMessage, MSGFLT_ALLOW, nullptr);
+}
 struct ComApartment {
     HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
 };
 } // namespace
+
+void EnableDarkMode() {
+    // Ordinal 135 changed its signature in Windows 10 1903. Get the real
+    // build number without depending on the application's version manifest.
+    using GetVersionNumbersFn = void(WINAPI*)(DWORD*, DWORD*, DWORD*);
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    const auto getVersionNumbers = reinterpret_cast<GetVersionNumbersFn>(
+        GetProcAddress(ntdll, "RtlGetNtVersionNumbers"));
+    if (!getVersionNumbers) return;
+    DWORD major = 0, minor = 0, build = 0;
+    getVersionNumbers(&major, &minor, &build);
+    build &= 0x0fffffffu; // RtlGetNtVersionNumbers includes flags in the high bits.
+    if (major < 10 || build < 17763) return;
+
+    const HMODULE theme = LoadLibraryExW(L"uxtheme.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!theme) return;
+    using FlushMenuThemesFn = void(WINAPI*)();
+    const auto setAppMode = GetProcAddress(theme, MAKEINTRESOURCEA(135));
+    const auto flushMenuThemes = reinterpret_cast<FlushMenuThemesFn>(
+        GetProcAddress(theme, MAKEINTRESOURCEA(136)));
+    if (!setAppMode || !flushMenuThemes) {
+        FreeLibrary(theme);
+        return;
+    }
+    if (build >= 18362) {
+        enum class PreferredAppMode : int { ForceDark = 2 };
+        using SetPreferredAppModeFn = PreferredAppMode(WINAPI*)(PreferredAppMode);
+        reinterpret_cast<SetPreferredAppModeFn>(setAppMode)(PreferredAppMode::ForceDark);
+    } else {
+        using AllowDarkModeForAppFn = bool(WINAPI*)(bool);
+        reinterpret_cast<AllowDarkModeForAppFn>(setAppMode)(true);
+    }
+    flushMenuThemes();
+    // Called once from wWinMain before any windows/menus. Retain the DLL for
+    // the process lifetime so unloading it cannot discard the app's theme state.
+}
 
 void EnableDpiAwareness() {
     using SetContextFn = BOOL(WINAPI*)(HANDLE);
@@ -1186,24 +1317,43 @@ void EnableDpiAwareness() {
     SetProcessDPIAware();
 }
 
-int Run(HINSTANCE instance, int showCommand) {
-    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\Pulse.Native.SingleInstance.v1");
-    const DWORD error = GetLastError();
-    if (!mutex) return 1;
+int Run(HINSTANCE instance, int showCommand, const wchar_t* commandLine) {
+    const bool restarted = CommandHasRestarted(commandLine);
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, SingleInstanceMutex);
+    if (!mutex) {
+        const DWORD openError = GetLastError();
+        // An elevated instance's mutex can refuse a normal launch. Still one instance.
+        if (openError == ERROR_ACCESS_DENIED) ActivateExistingInstance();
+        return openError == ERROR_ACCESS_DENIED ? 0 : 1;
+    }
+    DWORD error = GetLastError();
+    if (restarted && error == ERROR_ALREADY_EXISTS) {
+        const ULONGLONG deadline = GetTickCount64() + 5000;
+        while (error == ERROR_ALREADY_EXISTS) {
+            if (GetTickCount64() >= deadline) {
+                if (mutex) CloseHandle(mutex);
+                ActivateExistingInstance();
+                return 0;
+            }
+            if (mutex) CloseHandle(mutex);
+            mutex = nullptr;
+            Sleep(50);
+            mutex = CreateMutexW(nullptr, FALSE, SingleInstanceMutex);
+            if (!mutex) {
+                error = ERROR_ALREADY_EXISTS;
+                continue;
+            }
+            error = GetLastError();
+        }
+    }
     std::unique_ptr<void, HandleCloser> uniqueInstance(mutex);
     if (error == ERROR_ALREADY_EXISTS) {
-        HWND previous = FindWindowW(MainClass, nullptr);
-        if (previous) {
-            DWORD process = 0;
-            GetWindowThreadProcessId(previous, &process);
-            AllowSetForegroundWindow(process);
-            PostMessageW(previous, ShowMessage, 0, 0);
-        }
+        ActivateExistingInstance();
         return 0;
     }
     ComApartment apartment;
     if (FAILED(apartment.result)) return 1;
     Application app(instance);
-    return app.Execute(showCommand);
+    return app.Execute(showCommand, restarted);
 }
 } // namespace pulse::ui

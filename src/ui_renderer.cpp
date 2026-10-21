@@ -55,16 +55,29 @@ Layout FullLayout(const Components& components) {
 }
 
 void StyleWindow(HWND window) {
+    // Keep the module loaded while these cached function pointers are in use.
+    static const HMODULE dwm = LoadLibraryExW(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!dwm) return;
+    using SetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    using ExtendFrameFn = HRESULT(WINAPI*)(HWND, const MARGINS*);
+    static const auto setWindowAttribute = reinterpret_cast<SetWindowAttributeFn>(
+        GetProcAddress(dwm, "DwmSetWindowAttribute"));
+    static const auto extendFrame = reinterpret_cast<ExtendFrameFn>(
+        GetProcAddress(dwm, "DwmExtendFrameIntoClientArea"));
     const BOOL dark = TRUE;
     const BOOL noTransitions = TRUE;
     const int round = 2; // DWMWCP_ROUND; numeric values also support older MinGW headers.
     const COLORREF border = RGB(0x28, 0x34, 0x45);
-    DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
-    DwmSetWindowAttribute(window, 3, &noTransitions, sizeof(noTransitions));
-    DwmSetWindowAttribute(window, 33, &round, sizeof(round));
-    DwmSetWindowAttribute(window, 34, &border, sizeof(border));
+    if (setWindowAttribute) {
+        // DWMWA_USE_IMMERSIVE_DARK_MODE is 19 on older Windows 10 builds.
+        if (FAILED(setWindowAttribute(window, 20, &dark, sizeof(dark))))
+            setWindowAttribute(window, 19, &dark, sizeof(dark));
+        setWindowAttribute(window, 3, &noTransitions, sizeof(noTransitions));
+        setWindowAttribute(window, 33, &round, sizeof(round));
+        setWindowAttribute(window, 34, &border, sizeof(border));
+    }
     const MARGINS shadow{1, 1, 1, 1};
-    DwmExtendFrameIntoClientArea(window, &shadow);
+    if (extendFrame) extendFrame(window, &shadow);
 }
 UINT WindowDpi(HWND window) {
     using GetDpiFn = UINT(WINAPI*)(HWND);
@@ -641,6 +654,14 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             Text(v.cycles, Rect(165, y + 34, 130, 30), 21, TextColor, true, true);
             break;
         }
+        case FullComponent::Fps: {
+            Panel(card);
+            const float y = card.top;
+            Text(L"帧数", Rect(25, y + 9, 270, 18), 11.5f, Muted);
+            const bool quiet = v.fpsAdmin || v.fps == L"--";
+            Text(v.fps, Rect(25, y + 32, 270, 28), v.fpsAdmin ? 13.0f : 16.0f, quiet ? Faint : Charge, !quiet);
+            break;
+        }
         default: break;
         }
     }
@@ -693,7 +714,10 @@ void Renderer::UpdateCompactLayout() {
             break;
         case CompactComponent::Latency: value(L"延迟", L"9999 ms"); break;
         case CompactComponent::CpuFrequency: value(L"频率", L"99.99 GHz"); break;
-        case CompactComponent::Fps: value(L"FPS", L"9999"); break;
+        case CompactComponent::Fps:
+            value(L"FPS", L"9999");
+            cell.width = std::max(cell.width, cell.labelWidth + Measure(L"需管理员", 10.5f) + 2);
+            break;
         default: break;
         }
         cell.width = std::ceil(cell.width);
@@ -767,7 +791,13 @@ void Renderer::CompactContent(const View& v) {
         }
         case CompactComponent::Latency: value(L"延迟", v.latency, NetworkColor(v.netState)); break;
         case CompactComponent::CpuFrequency: value(L"频率", v.cpuFrequency, TextColor); break;
-        case CompactComponent::Fps: value(L"FPS", v.fps, Charge); break;
+        case CompactComponent::Fps:
+            if (v.fpsAdmin) {
+                const float labelWidth = cell.labelWidth;
+                Text(L"FPS", Rect(x, 11, labelWidth - 4, 18), 10.5f, Muted);
+                Text(v.fps, Rect(x + labelWidth, 11, width - labelWidth, 18), 10.5f, Faint);
+            } else value(L"FPS", v.fps, Charge);
+            break;
         default: break;
         }
         x += width;

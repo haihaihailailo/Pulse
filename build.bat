@@ -16,7 +16,7 @@ rem Select the console CRT entry without constraining the parallel backend imple
 set "SELFTEST_ENTRY="
 findstr /R /C:"wmain[ (]" src\metrics_selftest.cpp >nul
 if not errorlevel 1 set "SELFTEST_ENTRY=-municode"
-g++ -std=c++17 -O2 -s -static -pthread %SELFTEST_ENTRY% -finput-charset=UTF-8 -fexec-charset=UTF-8 -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp -lwinhttp -lpowrprof -lpdh -liphlpapi -lntdll -lwinmm -lshell32 -lgdi32 -luser32 -lole32 -ladvapi32 -luuid -lws2_32 -lsetupapi
+g++ -std=c++17 -O2 -s -static -pthread %SELFTEST_ENTRY% -finput-charset=UTF-8 -fexec-charset=UTF-8 -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp src/fpsmon.cpp -lwinhttp -lpowrprof -lpdh -liphlpapi -lntdll -lwinmm -lshell32 -lgdi32 -luser32 -lole32 -ladvapi32 -luuid -lws2_32 -lsetupapi
 if errorlevel 1 goto :failed
 echo Built Pulse.exe and metrics_selftest.exe.
 popd

@@ -17,6 +17,13 @@ struct ProcUsage {
     double cpu_percent;    // 占全部逻辑核心的百分比（同任务管理器）
 };
 
+// 一个进程在刚结束的采样区间里的 Present 次数。不是多进程合计，也不是帧率。
+struct FpsRank {
+    std::wstring name;          // 去 .exe；没有名字时为十进制 pid
+    std::uint64_t frames = 0;
+    std::uint32_t pid = 0;
+};
+
 struct Snapshot {
     // —— 电池 ——
     PowerMode mode = PowerMode::Unknown;
@@ -64,7 +71,10 @@ struct Snapshot {
     int wifi_signal = -1;                 // 0..100
     double battery_health_percent = NAN;  // 满充容量 / 设计容量 × 100
     int battery_cycles = -1;
-    double fps = NAN;                     // 预留，本轮不实现，保持 NaN
+    double fps = NAN;                     // 前台进程及其子孙中，本区间 Present 最多的那一个进程的帧率（不相加）。未启用、区间未形成或该集合没有 Present 时为 NaN
+    int fps_status = 0;                   // 0 未启用，1 正常（刚切到新目标的首个区间 fps 仍为 NaN），2 需要管理员权限，3 前台没有在渲染的程序，4 其他错误
+    std::wstring fps_process;             // status 1 且已选出进程时是该进程名（去 .exe），否则是前台窗口进程名
+    std::vector<FpsRank> fps_top;         // 本区间全机 Present 最多的前 3 个进程；未形成区间或未启用时为空
 
     // 追加的诊断数据，仅完整模式的有效 package Energy 区间有值。
     // Energy 原始单位为 pWh；pkg_w = delta_pwh * 3.6e-9 / interval_s。
@@ -107,6 +117,7 @@ struct Wants {
     bool gpu_memory = false;
     bool wifi = false;
     bool battery_health = false;
+    bool fps = false;             // 前台帧率（ETW；关闭时不建会话）
 };
 
 class Metrics {

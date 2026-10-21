@@ -1,8 +1,8 @@
 // Console profiler: --samples N (default 60), --compact, --brief, --url URL,
-// --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800.
+// --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800, --fps.
 // Timings are per actual collection, not per cached Sample() call.
 // g++ -std=c++17 -O2 -municode -static -finput-charset=UTF-8 -fexec-charset=UTF-8
-//   -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp
+//   -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp src/fpsmon.cpp
 //   -lwinhttp -lpowrprof -lpdh -liphlpapi -lws2_32 -lsetupapi
 
 #include "metrics.h"
@@ -40,14 +40,14 @@ struct TimingRow {
     unsigned long long count = 0;
     double wall = 0, cpu = 0, max_wall = 0, max_cpu = 0;
 };
-std::array<TimingRow, 23> g_timings{{
+std::array<TimingRow, 24> g_timings{{
     {L"Battery"}, {L"Power scheme"}, {L"PDH Energy Meter"}, {L"PDH GPU Engine"},
     {L"Network throughput"}, {L"NIC discovery (within throughput)"}, {L"CPU"}, {L"Memory"},
     {L"Process scan"}, {L"Network view (no HTTP)"}, {L"Sample total (includes stages)"},
     {L"Network primary"}, {L"Network backups (parallel)"}, {L"Network callback"},
     {L"Memory detail"}, {L"PDH Disk IO"}, {L"System disk"}, {L"PDH CPU frequency"},
     {L"Uptime"}, {L"PDH GPU memory"}, {L"Wi-Fi"}, {L"Battery health"},
-    {L"PDH CPU utility (shared query)"}
+    {L"PDH CPU utility (shared query)"}, {L"FPS"}
 }};
 
 void OnTiming(const wchar_t* name, double wall, double cpu, void*) {
@@ -230,9 +230,53 @@ void PrintSample(int index, const pulse::Snapshot& s) {
     PrintDouble(L"battery_health_percent", s.battery_health_percent);
     PrintInt(L"battery_cycles", s.battery_cycles);
     PrintDouble(L"fps", s.fps);
+    PrintInt(L"fps_status", s.fps_status);
+    PrintText(L"fps_process", s.fps_process);
     LockPrint();
     std::fflush(stdout);
     UnlockPrint();
+}
+
+int RunFpsTest(const pulse::Settings& settings, bool full) {
+    std::wprintf(L"FPS 自测：先启动采集，再每秒打印一次，共 10 次。\n"
+                 L"status：0 未启用，1 正常，2 需要管理员或 Performance Log Users，3 前台没有 Present，4 其他错误。\n"
+                 L"前台若是本进程、桌面或任务栏，沿用上一个程序；本进程首次置前时选后方应用。请在这 10 秒内切到要测的窗口。\n"
+                 L"帧率取前台进程及其子孙里、滞后窗口 [现在-2秒, 现在-1秒) 内 Present 最多的一个进程，不把多个进程相加。\n"
+                 L"会话启动不足 2 秒时 fps 为 nan。top 的 frames 是同一窗口内的 Present 次数，用来确认事件是否到达。\n");
+    pulse::Metrics metrics;
+    pulse::Wants wants;
+    wants.chip_power = false;
+    wants.gpu_usage = false;
+    wants.processes = false;
+    wants.fps = true;
+    metrics.SetWants(wants);
+    metrics.Start(settings, nullptr, nullptr);
+    std::wprintf(L"采样模式：%ls\n", full ? L"完整" : L"迷你");
+    metrics.Sample(full);
+    for (int i = 0; i < 10; ++i) {
+        Sleep(1000);
+        const pulse::Snapshot snapshot = metrics.Sample(full);
+        if (std::isnan(snapshot.fps)) {
+            std::wprintf(L"t=%d fps=nan status=%d process=%ls\n", i, snapshot.fps_status,
+                         snapshot.fps_process.c_str());
+        } else {
+            std::wprintf(L"t=%d fps=%.1f status=%d process=%ls\n", i, snapshot.fps, snapshot.fps_status,
+                         snapshot.fps_process.c_str());
+        }
+        if (snapshot.fps_top.empty()) {
+            std::wprintf(L"  top=(none)\n");
+        } else {
+            for (std::size_t n = 0; n < snapshot.fps_top.size(); ++n) {
+                const auto& rank = snapshot.fps_top[n];
+                std::wprintf(L"  top%llu name=%ls pid=%lu frames=%llu\n",
+                             static_cast<unsigned long long>(n + 1), rank.name.c_str(),
+                             static_cast<unsigned long>(rank.pid),
+                             static_cast<unsigned long long>(rank.frames));
+            }
+        }
+        std::fflush(stdout);
+    }
+    return 0;
 }
 
 void OnNet(const pulse::NetEvent& event, void*) {
@@ -248,7 +292,7 @@ void OnNet(const pulse::NetEvent& event, void*) {
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U16TEXT);
     int samples = 60, interval_ms = 1000, switch_every = 0;
-    bool full = true, brief = false;
+    bool full = true, brief = false, fps_test = false;
     pulse::Settings settings;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--compact") == 0) full = false;
@@ -271,17 +315,19 @@ int wmain(int argc, wchar_t** argv) {
             const long value = std::wcstol(argv[++i], &end, 10);
             if (!end || *end || (value != 500 && value != 1000 && value != 2000)) return 2;
             interval_ms = static_cast<int>(value);
-        } else if (std::wcscmp(argv[i], L"--switch-every") == 0 && i + 1 < argc) {
+        } else if (std::wcscmp(argv[i], L"--fps") == 0) fps_test = true;
+        else if (std::wcscmp(argv[i], L"--switch-every") == 0 && i + 1 < argc) {
             wchar_t* end = nullptr;
             const long value = std::wcstol(argv[++i], &end, 10);
             if (!end || *end || value < 1 || value > 86400) return 2;
             switch_every = static_cast<int>(value);
         } else {
-            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...]\n");
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps]\n");
             return 2;
         }
     }
     if (!CheckDurations()) return 1;
+    if (fps_test) return RunFpsTest(settings, full);
     InitializeCriticalSection(&g_print);
     pulse::diagnostics::SetTimingCallback(OnTiming, nullptr);
     LARGE_INTEGER frequency{}, start{}, finish{};
