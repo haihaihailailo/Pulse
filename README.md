@@ -1,5 +1,7 @@
 # Pulse
 
+[English](README.en.md) | **简体中文**
+
 Pulse 是 Windows 桌面悬浮小组件：一个静态链接的 `Pulse.exe`，用原生 C++17、Win32 和 Direct2D 显示硬件、电池与网络状态。
 
 [下载最新版](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11 64 位 · 免安装
@@ -34,6 +36,7 @@ Pulse 是 Windows 桌面悬浮小组件：一个静态链接的 `Pulse.exe`，�
 - 延迟「较慢」阈值可选 50 / 100 / 150 / 200 / 300 / 500 / 800 ms，默认 500 ms。
 - 断网与恢复提醒卡片，约 8 秒后自动淡出；鼠标悬停时暂停，移开后约 3 秒淡出。提醒和提示音可分别关闭，睡眠不算断网。
 - 界面大小 80%–200%，支持 Ctrl + 滚轮缩放。
+- 界面支持中文 / English，可在右键菜单「语言 / Language」中切换，默认跟随系统语言。
 - 深色右键菜单、托盘图标、窗口置顶、开机自启和恢复默认组件。
 
 ## 截图
@@ -113,6 +116,7 @@ scripts\install.cmd -Quiet
 | --- | --- |
 | 完整模式 / 迷你模式 | 切换显示模式 |
 | 界面大小 | 80% / 100%（默认）/ 125% / 150% / 175% / 200% |
+| 语言 / Language | 切换界面语言（中文 / English），默认跟随系统语言 |
 | 刷新间隔 | 设置完整模式的 0.5 / 1（默认）/ 2 秒刷新间隔 |
 | 延迟较慢阈值 | 50 / 100 / 150 / 200 / 300 / 500（默认）/ 800 ms |
 | 断网提醒 | 开关断网与恢复提醒卡片，默认开启 |
@@ -202,10 +206,4 @@ GitHub Actions 会在推送 `v*` 标签时自动编译并发布 Release。
 
 [MIT 许可证](LICENSE)。版权所有 © 2026 yftx。
 
-## English
-
-Pulse is a native Windows 10/11 x64 desktop widget: one statically linked `Pulse.exe` built with C++17, Win32 and Direct2D. Full mode shows CPU/GPU/memory usage and power, processor package power, battery power and smoothed runtime, physical-adapter throughput, HTTP latency, and the top three processes by CPU. Mini mode is a single line with optional runtime/time-to-full and charging indicators. Both modes have separate component selections; optional collectors run only when needed, while basic sampling and network probes remain active.
-
-Hardware power uses Energy Meter (RAPL, no administrator required): full mode prefers Energy differences with a Power fallback; mini mode reads Power directly. Foreground FPS uses ETW and requires administrator privileges. Full-mode refresh is selectable at 0.5, 1 or 2 seconds. The slow-latency threshold is adjustable from the menu and defaults to 500 ms. A failed round or latency ≥ 1000 ms counts as unavailable; three consecutive unavailable rounds mark the connection offline, and one success below 1000 ms restores it. Confirmed loss of all physical adapters marks it offline directly. Sleep is excluded.
-
-Unzip and run `scripts\install.cmd`, or start `Pulse.exe` directly. Pulse supports 80%–200% zoom (Ctrl + mouse wheel), a tray icon, per-user startup, and optional offline/recovery cards and sounds. For networking, it only requests the three probe URLs listed above via the system proxy, with no telemetry or automatic updates. Settings and logs stay local. The software is provided as is, see [LICENSE](LICENSE). Third-party notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+English documentation: [README.en.md](README.en.md)
