@@ -194,7 +194,7 @@ GUID MakeGuid(unsigned long d1, unsigned short d2, unsigned short d3, unsigned c
     return g;
 }
 
-std::wstring SchemeName(const GUID& guid) {
+PowerSchemeKind SchemeKind(const GUID& guid) {
     const GUID best_eff =
         MakeGuid(0x961cc777, 0x2547, 0x4f9d, 0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a);
     const GUID longer =
@@ -202,11 +202,22 @@ std::wstring SchemeName(const GUID& guid) {
     const GUID balanced = MakeGuid(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     const GUID best_perf =
         MakeGuid(0xded574b5, 0x45a0, 0x4f42, 0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38);
-    if (SameGuid(guid, best_eff)) return L"\u6700\u4F73\u80FD\u6548";
-    if (SameGuid(guid, longer)) return L"\u66F4\u957F\u7EED\u822A";
-    if (SameGuid(guid, balanced)) return L"\u5E73\u8861";
-    if (SameGuid(guid, best_perf)) return L"\u6700\u4F73\u6027\u80FD";
-    return L"";
+    if (SameGuid(guid, best_eff)) return PowerSchemeKind::BestEfficiency;
+    if (SameGuid(guid, longer)) return PowerSchemeKind::LongerBattery;
+    if (SameGuid(guid, balanced)) return PowerSchemeKind::Balanced;
+    if (SameGuid(guid, best_perf)) return PowerSchemeKind::BestPerformance;
+    return PowerSchemeKind::Unknown;
+}
+
+// Keep the legacy Chinese value for diagnostics/self-test consumers.
+std::wstring SchemeName(PowerSchemeKind kind) {
+    switch (kind) {
+    case PowerSchemeKind::BestEfficiency: return L"\u6700\u4F73\u80FD\u6548";
+    case PowerSchemeKind::LongerBattery: return L"\u66F4\u957F\u7EED\u822A";
+    case PowerSchemeKind::Balanced: return L"\u5E73\u8861";
+    case PowerSchemeKind::BestPerformance: return L"\u6700\u4F73\u6027\u80FD";
+    default: return L"";
+    }
 }
 
 wchar_t LowerChar(wchar_t c) {
@@ -1075,6 +1086,7 @@ struct Metrics::Impl {
     double measured_s_ = 0;
 
     std::wstring scheme_;
+    PowerSchemeKind scheme_kind_ = PowerSchemeKind::Unknown;
     bool scheme_ready_ = false;
     unsigned long long scheme_tick_ = 0;
     OverlayFn overlay_fn_ = nullptr;
@@ -1521,7 +1533,8 @@ void Metrics::Impl::UpdateScheme(unsigned long long now) {
     OverlayFn fn = Overlay();
     GUID guid{};
     if (!fn || fn(&guid) != 0) return;
-    scheme_ = SchemeName(guid);
+    scheme_kind_ = SchemeKind(guid);
+    scheme_ = SchemeName(scheme_kind_);
 }
 
 bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
@@ -2557,6 +2570,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     UpdateBattery(s, now, dt, has_dt);
     UpdateScheme(now);
     s.power_scheme = scheme_;
+    s.power_scheme_kind = scheme_kind_;
     if (wants.chip_power) {
         UpdateEnergy(full, now);
         s.pkg_w = pkg_w_;
@@ -2590,6 +2604,8 @@ Snapshot Metrics::Impl::Take(bool full) {
     s.latency_ms = view.latency_ms;
     s.offline_since_unix = view.offline_since_unix;
     s.offline_by_latency = view.offline_by_latency;
+    s.offline_reason = view.offline_reason;
+    s.offline_latency_ms = view.offline_latency_ms;
     last_ = s;
     return s;
 }

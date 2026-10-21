@@ -36,7 +36,7 @@ Pulse 是 Windows 桌面悬浮小组件：一个静态链接的 `Pulse.exe`，�
 - 延迟「较慢」阈值可选 50 / 100 / 150 / 200 / 300 / 500 / 800 ms，默认 500 ms。
 - 断网与恢复提醒卡片，约 8 秒后自动淡出；鼠标悬停时暂停，移开后约 3 秒淡出。提醒和提示音可分别关闭，睡眠不算断网。
 - 界面大小 80%–200%，支持 Ctrl + 滚轮缩放。
-- 界面支持中文 / English，可在右键菜单「语言 / Language」中切换，默认跟随系统语言。
+- 界面支持简体中文 / English，可在右键菜单「语言 / Language」切换，默认跟随系统显示语言。
 - 深色右键菜单、托盘图标、窗口置顶、开机自启和恢复默认组件。
 
 ## 截图
@@ -91,7 +91,7 @@ scripts\install.cmd -Quiet
 
 运行 `scripts\uninstall.cmd`。脚本会仅退出通过窗口类名或版本信息识别为本程序的 Pulse 进程，跳过其他同名程序，删除上述 Run 值，并删除开始菜单和桌面上目标为 `Pulse.exe` 或已失效的 `Pulse.lnk`。
 
-窗口位置、模式、置顶、显示内容、刷新间隔、界面大小、延迟较慢阈值、断网提醒和提示音设置保存在 `%LOCALAPPDATA%\Pulse\settings.ini`。网络探测和帧数诊断等日志在 `%LOCALAPPDATA%\Pulse\pulse_net.log`，与安装目录同属一个文件夹。`%APPDATA%`（漫游目录）下不写配置；卸载脚本仍会检查那里是否存在同名配置或日志。
+窗口位置、模式、置顶、显示内容、刷新间隔、界面大小、界面语言、延迟较慢阈值、断网提醒和提示音设置保存在 `%LOCALAPPDATA%\Pulse\settings.ini`。网络探测和帧数诊断等日志在 `%LOCALAPPDATA%\Pulse\pulse_net.log`，与安装目录同属一个文件夹。`%APPDATA%`（漫游目录）下不写配置；卸载脚本仍会检查那里是否存在同名配置或日志。
 
 发现这些文件时，脚本会询问是否一并删除。选 Y 会删除整个 `%LOCALAPPDATA%\Pulse` 目录，并清理检测到的漫游目录同名文件；选 N 只删除 `Pulse.exe` 和快捷方式，保留配置与日志。未发现配置或日志时，默认删除安装目录。
 
@@ -171,7 +171,7 @@ PowerShell：
 ```bat
 scripts\package.cmd
 scripts\package.cmd -NoBuild
-scripts\package.cmd -Version 1.0.0
+scripts\package.cmd -Version 1.1.0
 ```
 
 `-NoBuild` 仅在仓库根目录已有 `Pulse.exe` 时跳过编译。未指定 `-Version` 时，从 `app.rc` 的 `FileVersion` 读取，读不到则用 `0.1.0`。输出为 `dist\Pulse-<版本>-win-x64.zip`，包含 `Pulse.exe`、本说明、`LICENSE`、`THIRD_PARTY_NOTICES.md` 和 `scripts\` 下的安装、卸载脚本。

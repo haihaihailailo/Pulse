@@ -32,7 +32,7 @@ private:
 };
 } // namespace diagnostics
 
-// Shared by recovery logs, notifications and the offline status in the UI.
+// Chinese legacy formatter for logs and backend self-tests only.
 std::wstring FormatOutageDuration(std::uint64_t seconds);
 
 namespace detail {
@@ -57,6 +57,8 @@ public:
         double latency_ms = NAN;
         std::int64_t offline_since_unix = 0;
         bool offline_by_latency = false;
+        OfflineReason offline_reason = OfflineReason::None;
+        double offline_latency_ms = NAN;
     };
 
     View Get() const;

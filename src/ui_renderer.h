@@ -47,7 +47,7 @@ struct Layout {
     float height = 44;
     D2D1_RECT_F Card(FullComponent c) const { return cards[static_cast<size_t>(c)]; }
 };
-Layout FullLayout(const Components& components);
+Layout FullLayout(const Components& components, float width = 320);
 
 class Renderer {
 public:
@@ -55,6 +55,7 @@ public:
     void SetWindow(HWND window, UINT dpi);
     void SetDpi(UINT dpi);
     void SetZoom(int percent);
+    void LanguageChanged();
     void Resize();
     void SetComponents(const Components& components, bool compact);
     bool SetCompactEtaVisible(bool visible);
@@ -62,11 +63,12 @@ public:
     void DiscardTarget();
     bool CanRender() const;
     float CompactWidth() const { return compactWidth_; }
+    float FullWidth() const { return fullWidth_; }
     float ToastHeight(const std::wstring& message, float width = 300);
     Button HitTest(float x, float y, bool compact, float width) const;
     D2D1_RECT_F ButtonRect(Button button, bool compact, float width) const;
     HRESULT Paint(const View& v, bool compact, bool pinned, Button hover, Button pressed);
-    HRESULT PaintToast(const NetEvent& event);
+    HRESULT PaintToast(const NetEvent& event, const std::wstring& message);
 private:
     using FormatKey = std::tuple<int, int, bool>;
     HRESULT CreateTarget();
@@ -93,6 +95,7 @@ private:
     void Chart(D2D1_RECT_F rect, const float* a, size_t count, D2D1_COLOR_F color, float maximum);
     void ChartGrid(D2D1_RECT_F rect);
     void UpdateCompactLayout();
+    void UpdateFullLayout();
     void CompactContent(const View& v);
     void ValueUnit(const std::wstring& value, const std::wstring& unit, float x, float y,
                    float numberSize, D2D1_COLOR_F color);
@@ -100,7 +103,9 @@ private:
     Components components_;
     struct CompactCell { float width = 0, labelWidth = 0; };
     std::array<CompactCell, CompactComponents.size()> compactCells_{};
-    float compactWidth_ = 51;
+    float compactWidth_ = 51, fullWidth_ = 320;
+    float networkLabelWidth_ = 32, latencyLabelWidth_ = 34, systemLabelWidth_ = 84;
+    float readLabelWidth_ = 20, writeLabelWidth_ = 20;
     bool chartVisible_ = false, compact_ = false;
     bool compactEtaVisible_ = true;
     float scroll_ = 0;

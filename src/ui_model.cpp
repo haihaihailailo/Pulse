@@ -1,5 +1,4 @@
 ﻿#include "ui_model.h"
-#include "netprobe.h"
 #include <algorithm>
 #include <cmath>
 #include <ctime>
@@ -16,28 +15,49 @@ float Fraction(double v) {
 std::vector<TimePart> Parts(double seconds) {
     if (!Known(seconds)) return {};
     const auto minutes = static_cast<long long>(std::round(std::min(seconds, 360000.0) / 60));
-    if (minutes >= 6000) return {{L"99+", L"小时"}};
-    if (minutes >= 60) return {{std::to_wstring(minutes / 60), L"小时"},
-                             {std::to_wstring(minutes % 60), L"分"}};
-    return {{std::to_wstring(minutes), L"分钟"}};
+    if (minutes >= 6000) return {{L"99+", T(Key::Hours)}};
+    if (minutes >= 60) return {{std::to_wstring(minutes / 60), T(Key::Hours)},
+                             {std::to_wstring(minutes % 60), T(Key::MinuteShort)}};
+    return {{std::to_wstring(minutes), T(Key::Minutes)}};
 }
 Speed FormatSpeed(double bps) {
-    if (!Known(bps)) return {L"--", L"KB/s"};
-    const wchar_t* units[] = {L"KB/s", L"MB/s", L"GB/s"};
+    if (!Known(bps)) return {L"--", T(Key::Kbps)};
+    const std::wstring* units[] = {&T(Key::Kbps), &T(Key::Mbps), &T(Key::Gbps)};
     double n = bps / 1024;
     int i = 0;
     while (n >= 1000 && i < 2) { n /= 1024; ++i; }
-    return {Number(n, n >= 100 ? 0 : n >= 10 ? 1 : i ? 2 : 1), units[i]};
+    return {Number(n, n >= 100 ? 0 : n >= 10 ? 1 : i ? 2 : 1), *units[i]};
 }
 std::wstring Bytes(uint64_t bytes) {
-    const wchar_t* units[] = {L"B", L"KB", L"MB", L"GB", L"TB"};
+    const std::wstring* units[] = {&T(Key::Byte), &T(Key::Kb), &T(Key::Mb), &T(Key::Gb), &T(Key::Tb)};
     double n = static_cast<double>(bytes);
     int i = 0;
     while (n >= 1024 && i < 4) { n /= 1024; ++i; }
-    return Number(n, i == 0 || n >= 100 ? 0 : 1) + L" " + units[i];
+    return Number(n, i == 0 || n >= 100 ? 0 : 1) + L" " + *units[i];
 }
 std::wstring Percent(double v, int decimals) {
     return Known(v) ? Number(std::clamp(v, 0.0, 100.0), decimals) + L"%" : L"--";
+}
+std::wstring PowerSchemeText(PowerSchemeKind scheme) {
+    switch (scheme) {
+    case PowerSchemeKind::Balanced: return T(Key::Balanced);
+    case PowerSchemeKind::BestPerformance: return T(Key::BestPerformance);
+    case PowerSchemeKind::BestEfficiency: return T(Key::BestEfficiency);
+    case PowerSchemeKind::LongerBattery: return T(Key::LongerBattery);
+    default: return {};
+    }
+}
+std::wstring Clock(std::int64_t unixTime) {
+    const auto now = static_cast<std::time_t>(unixTime);
+    std::tm local{};
+#if defined(_MSC_VER)
+    localtime_s(&local, &now);
+#else
+    if (const auto* t = std::localtime(&now)) local = *t;
+#endif
+    wchar_t buffer[16]{};
+    std::swprintf(buffer, 16, L"%02d:%02d", local.tm_hour, local.tm_min);
+    return buffer;
 }
 float ChartValue(double v) {
     return Known(v) ? static_cast<float>(std::min(v, 1.0e15)) : -1.0f;
@@ -67,6 +87,29 @@ std::wstring ShortDuration(double seconds) {
     wchar_t buffer[32]{};
     std::swprintf(buffer, 32, L"%d:%02d", m / 60, m % 60);
     return buffer;
+}
+
+std::wstring OutageDuration(std::uint64_t seconds) {
+    if (seconds >= 3600) return std::to_wstring(seconds / 3600) + T(Key::HourJoin) +
+        std::to_wstring(seconds / 60 % 60) + T(Key::MinuteSuffix);
+    if (seconds >= 60) return std::to_wstring(seconds / 60) + T(Key::MinuteJoin) +
+        std::to_wstring(seconds % 60) + T(Key::SecondSuffix);
+    return std::to_wstring(seconds) + T(Key::SecondSuffix);
+}
+std::wstring OfflineReasonText(OfflineReason reason, double latencyMs) {
+    switch (reason) {
+    case OfflineReason::Timeout: return T(Key::Timeout);
+    case OfflineReason::HighLatency: return i18n::Format(Key::HighLatency, {Number(latencyMs, 0)});
+    case OfflineReason::LinkDisconnected: return T(Key::LinkDisconnected);
+    case OfflineReason::NoResponse: return T(Key::NoResponse);
+    default: return T(Key::UnknownReason);
+    }
+}
+std::wstring NetworkEventText(const NetEvent& event) {
+    if (event.recovered) return i18n::Format(Key::OutageEvent,
+        {T(Key::NetworkRestored), Clock(event.event_unix), OutageDuration(event.outage_duration_s)});
+    return i18n::Format(Key::DisconnectedEvent,
+        {Clock(event.offline_start_unix), OfflineReasonText(event.reason, event.latency_ms)});
 }
 
 void Components::Reset() {
@@ -156,8 +199,8 @@ std::wstring CompactEtaDuration(double seconds) {
     if (!Known(seconds)) return L"--";
     // Compare only displayed whole minutes, never the changing raw seconds.
     const auto minutes = static_cast<int>(std::min(seconds, 360000.0) / 60);
-    if (minutes >= 6000) return L"99+ 时";
-    if (minutes < 60) return std::to_wstring(minutes) + L" 分";
+    if (minutes >= 6000) return L"99+" + T(Key::HourSuffix);
+    if (minutes < 60) return std::to_wstring(minutes) + T(Key::MinuteSuffix);
     wchar_t buffer[32]{};
     std::swprintf(buffer, 32, L"%d:%02d", minutes / 60, minutes % 60);
     return buffer;
@@ -166,17 +209,17 @@ std::wstring CompactSpeed(double bps) {
     if (!Known(bps)) return L"--";
     if (bps == 0) return L"0";
     double value = bps / 1024;
-    const wchar_t* suffix = L"K";
-    if (value >= 1024) { value /= 1024; suffix = L"M"; }
-    if (value >= 1024) { value /= 1024; suffix = L"G"; }
-    return Number(value, value < 100 ? 1 : 0) + suffix;
+    const std::wstring* suffix = &T(Key::CompactK);
+    if (value >= 1024) { value /= 1024; suffix = &T(Key::CompactM); }
+    if (value >= 1024) { value /= 1024; suffix = &T(Key::CompactG); }
+    return Number(value, value < 100 ? 1 : 0) + *suffix;
 }
 std::wstring Uptime(double seconds) {
     if (!Known(seconds)) return L"--";
     const auto minutes = static_cast<unsigned long long>(std::min(seconds, 3.0e11) / 60);
     std::wstring value;
-    if (minutes >= 1440) value = std::to_wstring(minutes / 1440) + L" 天 ";
-    return value + std::to_wstring(minutes / 60 % 24) + L" 时 " + std::to_wstring(minutes % 60) + L" 分";
+    if (minutes >= 1440) value = std::to_wstring(minutes / 1440) + T(Key::DayJoin);
+    return value + std::to_wstring(minutes / 60 % 24) + T(Key::HourShortJoin) + std::to_wstring(minutes % 60) + T(Key::MinuteSuffix);
 }
 }
 void Model::BreakHistory() {
@@ -202,7 +245,7 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
     }
     if (power || chart) {
         const double watts = discharging ? s.power_w : s.pkg_w;
-        v.powerLabel = discharging ? L"整机" : L"处理器";
+        v.powerLabel = discharging ? T(Key::System) : compact ? T(Key::CompactProcessor) : T(Key::Processor);
         v.powerValue = Number(watts, watts >= 100 ? 0 : 1);
     }
     if (hardware || (compact && c.Enabled(CompactComponent::Cpu))) v.cpuValue = Percent(s.cpu_percent, 0);
@@ -210,17 +253,17 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
     if (hardware || (compact && c.Enabled(CompactComponent::Gpu))) v.gpuUsage = Percent(s.gpu_percent, 0);
     if (latency) {
         v.netState = s.net_state;
-        v.latency = s.net_state == NetState::Offline ? L"断网" :
-                    s.net_state == NetState::Checking ? L"检测中" :
-                    Known(s.latency_ms) ? Number(s.latency_ms, 0) + L" ms" : L"-- ms";
+        v.latency = s.net_state == NetState::Offline ? T(Key::Offline) :
+                    s.net_state == NetState::Checking ? T(Key::Checking) :
+                    Known(s.latency_ms) ? Number(s.latency_ms, 0) + T(Key::MsSuffix) : T(Key::UnknownLatency);
     }
     if (compact) {
         if (eta && s.mode != PowerMode::NoBattery) {
             v.compactEtaVisible = true;
             if (s.mode == PowerMode::AcIdle) {
-                v.compactEtaValue = s.percent >= 95 ? L"已充满" : L"未充电";
+                v.compactEtaValue = s.percent >= 95 ? T(Key::FullyCharged) : T(Key::NotCharging);
             } else {
-                v.compactEtaLabel = charging ? L"充满" : L"续航";
+                v.compactEtaLabel = charging ? T(Key::FullIn) : T(Key::TimeLeft);
                 v.compactEtaValue = discharging || charging ? CompactEtaDuration(s.eta_s) : L"--";
                 v.compactEtaFromSystem = discharging && Known(s.eta_s) && s.eta_from_system;
             }
@@ -230,13 +273,13 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
             v.compactDown = L"↓ " + CompactSpeed(s.down_bps);
         }
         if (c.Enabled(CompactComponent::DiskIO)) {
-            v.diskRead = L"读 " + CompactSpeed(s.disk_read_bps);
-            v.diskWrite = L"写 " + CompactSpeed(s.disk_write_bps);
+            v.diskRead = T(Key::ReadPrefix) + CompactSpeed(s.disk_read_bps);
+            v.diskWrite = T(Key::WritePrefix) + CompactSpeed(s.disk_write_bps);
         }
-        if (c.Enabled(CompactComponent::CpuFrequency)) v.cpuFrequency = Number(s.cpu_mhz / 1000, 2) + L" GHz";
+        if (c.Enabled(CompactComponent::CpuFrequency)) v.cpuFrequency = Number(s.cpu_mhz / 1000, 2) + T(Key::GhzSuffix);
         if (c.Enabled(CompactComponent::Fps)) {
             v.fpsAdmin = s.fps_status == 2;
-            if (v.fpsAdmin) v.fps = L"需管理员";
+            if (v.fpsAdmin) v.fps = T(Key::RunAsAdmin);
             else if (s.fps_status == 1 && Known(s.fps)) v.fps = Number(s.fps, 0);
             else v.fps = L"--";
         }
@@ -246,27 +289,28 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
             v.packageW = Number(s.pkg_w); v.cpuW = Number(s.cpu_w); v.gpuW = Number(s.gpu_w); v.memW = Number(s.mem_w);
         }
         if (battery) {
-            v.chip = v.low ? L"电量低" : discharging ? L"放电中" : charging ? L"充电中" :
-                     s.mode == PowerMode::AcIdle ? L"外接电源" : s.mode == PowerMode::NoBattery ? L"无电池" : L"读取中…";
-            v.scheme = s.battery_saver ? L"节电模式已开启" : s.power_scheme.empty() ? L"" : L"电源模式 · " + s.power_scheme;
-            v.etaLabel = discharging ? L"预计可用" : charging ? L"预计充满" : L"电池状态";
-            if (s.eta_from_system && discharging) v.etaLabel += L"（系统估计）";
+            v.chip = v.low ? T(Key::LowBattery) : discharging ? T(Key::Discharging) : charging ? T(Key::Charging) :
+                     s.mode == PowerMode::AcIdle ? T(Key::OnAc) : s.mode == PowerMode::NoBattery ? T(Key::NoBattery) : T(Key::Reading);
+            const auto scheme = PowerSchemeText(s.power_scheme_kind);
+            v.scheme = s.battery_saver ? T(Key::BatterySaver) : scheme.empty() ? L"" : T(Key::PowerModePrefix) + scheme;
+            v.etaLabel = discharging ? T(Key::EtaLeft) : charging ? T(Key::EtaFull) : T(Key::BatteryStatus);
+            if (s.eta_from_system && discharging) v.etaLabel += T(Key::SystemEstimate);
             if (discharging || charging) {
                 v.hero = Parts(s.eta_s);
-                if (v.hero.empty()) v.heroWord = L"计算中…";
-            } else if (s.mode == PowerMode::AcIdle) v.heroWord = s.percent >= 99 ? L"已充满" : L"电源供电";
-            else v.heroWord = s.mode == PowerMode::NoBattery ? L"未检测到电池" : L"读取中…";
-            v.wattLabel = charging ? L"充电功率" : discharging ? L"实时功耗" :
-                          s.mode == PowerMode::NoBattery ? L"功耗" : L"电池功率";
+                if (v.hero.empty()) v.heroWord = T(Key::Calculating);
+            } else if (s.mode == PowerMode::AcIdle) v.heroWord = s.percent >= 99 ? T(Key::FullyCharged) : T(Key::AcPower);
+            else v.heroWord = s.mode == PowerMode::NoBattery ? T(Key::NoBatteryDetected) : T(Key::Reading);
+            v.wattLabel = charging ? T(Key::ChargePower) : discharging ? T(Key::LivePower) :
+                          s.mode == PowerMode::NoBattery ? T(Key::Power) : T(Key::BatteryPower);
             v.watt = Number(s.power_w, s.power_w >= 100 ? 0 : 1);
-            v.pphLabel = charging ? L"每小时充入" : discharging ? L"每小时耗电" : L"每小时";
+            v.pphLabel = charging ? T(Key::ChargePerHour) : discharging ? T(Key::DrainPerHour) : T(Key::PerHour);
             v.pph = Number(s.pct_per_hour, s.pct_per_hour >= 10 ? 0 : 1);
             v.eta20 = discharging && Known(s.eta20_s) ? ShortDuration(s.eta20_s) : L"";
             if (discharging && Known(s.on_battery_s)) {
-                v.foot = (s.on_battery_since_start ? L"组件启动后已用 " : L"拔电后已用 ") + Duration(s.on_battery_s);
-                if (Known(s.avg_w)) v.foot += L" · 平均 " + Number(s.avg_w) + L" W";
+                v.foot = (s.on_battery_since_start ? T(Key::SinceLaunch) : T(Key::SinceUnplugged)) + Duration(s.on_battery_s);
+                if (Known(s.avg_w)) v.foot += T(Key::AveragePrefix) + Number(s.avg_w) + T(Key::WattSuffix);
             } else if (Known(s.remaining_wh) && Known(s.full_wh) && s.full_wh > 0)
-                v.foot = L"剩余 " + Number(s.remaining_wh) + L" Wh / 满电 " + Number(s.full_wh) + L" Wh";
+                v.foot = T(Key::RemainingPrefix) + Number(s.remaining_wh) + T(Key::FullCapacityPrefix) + Number(s.full_wh) + T(Key::WhSuffix);
         }
         if (chart) {
             const bool sameSource = (view_.mode == PowerMode::Discharging) == discharging;
@@ -278,20 +322,19 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
         }
         if (network) {
             v.down = FormatSpeed(s.down_bps); v.up = FormatSpeed(s.up_bps);
-            v.totals = L"本次 ↓ " + Bytes(s.rx_total) + L" · ↑ " + Bytes(s.tx_total);
+            v.totals = T(Key::SessionTraffic) + Bytes(s.rx_total) + L" · ↑ " + Bytes(s.tx_total);
             if (s.net_state == NetState::Offline) {
-                v.netHint = s.offline_by_latency ? L"延迟过高，网络不可用" : L"网络连接已断开";
+                v.netHint = OfflineReasonText(s.offline_reason, s.offline_latency_ms);
                 if (s.offline_since_unix > 0) {
                     const auto elapsed = std::max(0.0, std::difftime(std::time(nullptr), static_cast<std::time_t>(s.offline_since_unix)));
-                    v.netHint = L"已断开 " + FormatOutageDuration(static_cast<std::uint64_t>(elapsed));
-                    if (s.offline_by_latency) v.netHint += L" · 延迟过高";
+                    v.netHint = T(Key::DownFor) + OutageDuration(static_cast<std::uint64_t>(elapsed)) + L" · " + v.netHint;
                 }
-            } else if (s.net_state == NetState::Slow) v.netHint = L"网络较慢 · 连接可用";
-            else if (s.net_state == NetState::Online) v.netHint = L"网络正常";
-            else v.netHint = L"正在检测连接…";
+            } else if (s.net_state == NetState::Slow) v.netHint = T(Key::SlowConnected);
+            else if (s.net_state == NetState::Online) v.netHint = T(Key::NetworkOk);
+            else v.netHint = T(Key::CheckingConnection);
         }
         if (c.Enabled(FullComponent::Processes)) {
-            v.selfCpu = Known(s.self_cpu_percent) ? L"本组件 " + Percent(s.self_cpu_percent, 1) : L"";
+            v.selfCpu = Known(s.self_cpu_percent) ? T(Key::SelfCpu) + Percent(s.self_cpu_percent, 1) : L"";
             const double top = !s.top_procs.empty() && Known(s.top_procs.front().cpu_percent)
                                    ? std::max(s.top_procs.front().cpu_percent, 5.0) : 5.0;
             for (size_t i = 0; i < std::min(size_t(3), s.top_procs.size()); ++i) {
@@ -303,17 +346,17 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
         if (c.Enabled(FullComponent::DiskIO)) { v.read = FormatSpeed(s.disk_read_bps); v.write = FormatSpeed(s.disk_write_bps); }
         if (c.Enabled(FullComponent::SystemDisk)) {
             v.disk = Fraction(s.sys_disk_used_percent); v.diskPercent = Percent(s.sys_disk_used_percent, 0);
-            v.diskFree = Number(s.sys_disk_free_gb, 1) + L" GB";
+            v.diskFree = Number(s.sys_disk_free_gb, 1) + T(Key::GbSuffix);
         }
         if (c.Enabled(FullComponent::SystemInfo)) {
-            v.cpuFrequency = Number(s.cpu_mhz / 1000, 2) + L" GHz";
-            v.memoryDetail = Number(s.mem_used_gb, 1) + L" / " + Number(s.mem_total_gb, 1) + L" GB";
+            v.cpuFrequency = Number(s.cpu_mhz / 1000, 2) + T(Key::GhzSuffix);
+            v.memoryDetail = Number(s.mem_used_gb, 1) + L" / " + Number(s.mem_total_gb, 1) + T(Key::GbSuffix);
             v.processCount = s.process_count < 0 ? L"--" : std::to_wstring(s.process_count);
             v.uptime = Uptime(s.uptime_s);
         }
         if (c.Enabled(FullComponent::GpuMemory)) {
-            v.sharedMemory = Number(s.gpu_shared_mem_mb / 1024, 2) + L" GB";
-            v.dedicatedMemory = Number(s.gpu_dedicated_mem_mb / 1024, 2) + L" GB";
+            v.sharedMemory = Number(s.gpu_shared_mem_mb / 1024, 2) + T(Key::GbSuffix);
+            v.dedicatedMemory = Number(s.gpu_dedicated_mem_mb / 1024, 2) + T(Key::GbSuffix);
         }
         if (c.Enabled(FullComponent::Wifi)) {
             v.wifiSsid = s.wifi_ssid.empty() ? L"--" : s.wifi_ssid;
@@ -326,9 +369,9 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
         }
         if (c.Enabled(FullComponent::Fps)) {
             v.fpsAdmin = s.fps_status == 2;
-            if (v.fpsAdmin) v.fps = L"需要管理员权限";
+            if (v.fpsAdmin) v.fps = T(Key::AdminRequired);
             else if (s.fps_status == 1 && Known(s.fps)) {
-                v.fps = Number(s.fps, 0) + L" fps";
+                v.fps = Number(s.fps, 0) + T(Key::FpsSuffix);
                 if (!s.fps_process.empty()) v.fps += L" · " + s.fps_process;
             } else v.fps = L"--";
         }

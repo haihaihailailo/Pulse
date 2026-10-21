@@ -4,8 +4,6 @@
 
 Pulse is a floating desktop widget for Windows. A single statically linked `Pulse.exe`, built with native C++17, Win32, and Direct2D, displays hardware, battery, and network status.
 
-The app UI is currently available in Simplified Chinese only.
-
 [Download the latest release](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11, 64-bit · No installation required
 
 <p align="center"><img src="docs/screenshots/demo-full.webp" alt="Pulse full mode" width="400"></p>
@@ -13,32 +11,33 @@ The app UI is currently available in Simplified Chinese only.
 
 ## Features
 
-By default, Full mode (完整模式) shows the following from top to bottom:
+By default, Full mode shows the following from top to bottom:
 
-- Hardware panel (硬件四格): four tiles showing CPU, GPU (3D engine), and memory usage and power, plus Processor (处理器) power for the entire processor package. Memory power comes from RAPL DRAM.
-- Battery and charging (电池与充电): charging or discharging power, smoothed estimates of remaining runtime or time to full charge, time to reach 20%, and average power since unplugging. If Pulse starts while on battery, the average is measured from startup.
-- Network (网络): upload and download speeds for physical network adapters only, with prominent HTTP latency and offline status.
-- Top three processes (进程前三) by CPU usage, excluding Pulse itself. Pulse's own usage is shown separately.
+- CPU / GPU / Memory / Processor: four tiles showing CPU, GPU (3D engine), and Memory usage and power, plus Processor power for the entire processor package (Whole chip). Memory power comes from RAPL DRAM.
+- Battery: charging or discharging power, smoothed estimates of Time left or Full in, To 20%, and average power since unplugging. If Pulse starts while on battery, the average is measured from startup.
+- Network: upload and download speeds for physical network adapters only, with prominent HTTP Latency and Offline status.
+- Top processes by CPU usage, excluding Pulse itself. Pulse's own usage is shown separately.
 
-Mini mode (迷你模式) is a single line that can show battery level, remaining runtime or time to full charge, a charging lightning indicator, and an external-power indicator. Its Total power (总功耗) component and Full mode's Power history (功耗走势图) show battery discharge power under the label Whole system (整机) while discharging. In all other power states, they show processor package power under the label Processor. The fourth hardware tile is always labeled Processor.
+Mini mode is a single line that can show Battery %, Time left or Full in, a charging lightning indicator, and an external-power indicator. Its Power component and Full mode's Power chart show battery discharge power under the label System while discharging. In other power states they show processor package power, labeled CPU pkg in Mini mode and Processor in Full mode. The fourth hardware tile is always labeled Processor.
 
-Right-click the window or tray icon and open Show content (显示内容) to choose components separately for each mode:
+Right-click the window or tray icon and open Show items to choose components separately for each mode:
 
 | Mode | Available components |
 | --- | --- |
-| Full mode | Hardware panel, Battery and charging, Power history, Network, Top three processes, Disk read/write speed (磁盘读写速度), System drive usage (系统盘占用), System information (系统信息), GPU memory (显存), Wi-Fi, Battery health (电池健康), Frame rate (帧数) |
-| Mini mode | Battery % (电量 %), Runtime/time to full (续航/充满), Total power, CPU %, Memory % (内存 %), GPU %, Network speed (网速), Latency (延迟), Disk read/write (磁盘读写), CPU frequency (CPU 频率), FPS |
+| Full mode | CPU / GPU / Memory / Processor, Battery, Power chart, Network, Top processes, Disk speed, System drive usage, System info, GPU memory, Wi-Fi, Battery health, FPS |
+| Mini mode | Battery %, Time left / Full in, Power, CPU %, Memory %, GPU %, Network speed, Latency, Disk, CPU frequency, FPS |
 
-Optional metrics are collected only while their components are enabled; disabling them stops collection. Basic sampling for CPU, memory, battery, and network speed, along with network probes, remains active. System information includes CPU frequency, used/total memory, process count, and uptime.
+Optional metrics are collected only while their components are enabled; disabling them stops collection. Basic sampling for CPU, memory, battery, and network speed, along with network probes, remains active. System info includes CPU frequency, Memory used / total, Processes, and Uptime.
 
 Other features:
 
-- Foreground app frame rate (FPS), measured through ETW DXGI/D3D9 Present events, requires administrator privileges. If frame rate is enabled without sufficient privileges, the menu offers Restart as administrator for frame rate (以管理员身份重启（显示帧数需要）). Some apps may not expose a readable frame rate.
+- Foreground app FPS, measured through ETW DXGI/D3D9 Present events, requires administrator privileges. If FPS is enabled without sufficient privileges, the menu offers Restart as administrator (for FPS). Some apps may not expose a readable frame rate.
 - Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini mode refreshes about every 2 seconds.
-- The slow-latency threshold can be set to 50 / 100 / 150 / 200 / 300 / 500 / 800 ms, with a default of 500 ms.
-- Offline and recovery notification cards fade out after about 8 seconds. Hovering pauses the timer; moving away starts a roughly 3-second timer before they fade out. Notifications and sounds have separate switches. Sleep does not count as an outage.
-- Interface scaling from 80% to 200%, also adjustable with Ctrl + mouse wheel.
-- Dark context menus, a tray icon, Always on top (窗口置顶), Start with Windows (开机自启), and Restore defaults (恢复默认) for component selections.
+- Slow latency threshold can be set to 50 / 100 / 150 / 200 / 300 / 500 / 800 ms, with a default of 500 ms.
+- Network disconnected and Network restored cards fade out after about 8 seconds. Hovering pauses the timer; moving away starts a roughly 3-second timer before they fade out. Disconnect alerts and Alert sound have separate switches. Sleep does not count as an outage.
+- Size from 80% to 200%, also adjustable with Ctrl + mouse wheel.
+- Interface language: English or Chinese, switchable from the right-click menu (语言 / Language), follows the Windows display language by default.
+- Dark context menus, a tray icon, Always on top, Start with Windows, and Reset to defaults for component selections.
 
 ## Screenshots
 
@@ -53,7 +52,7 @@ Mini mode:
 ## System requirements
 
 - Windows 10 or Windows 11, 64-bit.
-- Runs as a standard user. Only the frame-rate feature requires administrator privileges.
+- Runs as a standard user. Only FPS requires administrator privileges.
 - Hardware power comes from Energy Meter (RAPL) performance counters, without administrator privileges. Full mode prefers differences between `\Energy Meter(*)\Energy` samples and falls back to `\Energy Meter(*)\Power` if unavailable. Mini mode reads Power directly.
 - If the counters or the relevant instances are missing, the corresponding power values appear as unknown (`--`). Memory power requires a DRAM instance. Battery charging and discharging power comes from the Windows battery interface.
 
@@ -67,7 +66,7 @@ Download and extract the zip, then run `scripts\install.cmd`. The script:
 4. Uses the options below to determine whether to create a desktop shortcut and enable startup with Windows.
 5. Starts the installed copy of Pulse.
 
-Installation and normal use do not require administrator privileges; the frame-rate feature does. You can also run `Pulse.exe` directly after extraction. Settings are still saved in `%LOCALAPPDATA%\Pulse`.
+Installation and normal use do not require administrator privileges; FPS does. You can also run `Pulse.exe` directly after extraction. Settings are still saved in `%LOCALAPPDATA%\Pulse`.
 
 `install.ps1` looks for `Pulse.exe` in the script's directory and its parent. When installing from this repository, build `Pulse.exe` in the repository root first.
 
@@ -92,7 +91,7 @@ Startup uses the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\
 
 Run `scripts\uninstall.cmd`. The script exits only Pulse processes identified as this app by window class or version information, skipping other programs with the same name. It removes the Run value described above and removes Start menu and desktop `Pulse.lnk` shortcuts that target `Pulse.exe` or have no target.
 
-Window position, mode, Always on top, component selections, refresh interval, interface size, slow-latency threshold, offline notifications, and sound settings are saved in `%LOCALAPPDATA%\Pulse\settings.ini`. Logs for network probes, frame-rate diagnostics, and other events are stored in `%LOCALAPPDATA%\Pulse\pulse_net.log`, in the same folder as the installed app. No settings are written to `%APPDATA%` (the roaming directory), but the uninstaller still checks it for settings and logs with the same names.
+Window position, mode, Always on top, component selections, Refresh interval, Size, language (`[Window] language=auto|zh|en`), Slow latency threshold, Disconnect alerts, and Alert sound are saved in `%LOCALAPPDATA%\Pulse\settings.ini`. Logs for network probes, frame-rate diagnostics, and other events are stored in `%LOCALAPPDATA%\Pulse\pulse_net.log`, in the same folder as the installed app. No settings are written to `%APPDATA%` (the roaming directory), but the uninstaller still checks it for settings and logs with the same names.
 
 If these files exist, the script asks whether to remove them. Choosing Y deletes the entire `%LOCALAPPDATA%\Pulse` directory and any detected settings and log files in the roaming directory. Choosing N removes only `Pulse.exe` and the shortcuts, keeping settings and logs. If no settings or logs are found, the installation directory is removed by default.
 
@@ -116,18 +115,19 @@ The window and tray icon share this context menu:
 | Menu item | Effect |
 | --- | --- |
 | Full mode / Mini mode | Switches display mode |
-| Interface size (界面大小) | 80% / 100% (default) / 125% / 150% / 175% / 200% |
-| Refresh interval (刷新间隔) | Sets Full mode's refresh interval to 0.5 / 1 (default) / 2 seconds |
-| Slow-latency threshold (延迟较慢阈值) | 50 / 100 / 150 / 200 / 300 / 500 (default) / 800 ms |
-| Offline notifications (断网提醒) | Toggles offline and recovery cards; enabled by default |
-| Notification sound (提醒提示音) | Toggles sound separately; enabled by default and unavailable when offline notifications are disabled |
-| Show content → Full mode / Mini mode | Selects components for each mode |
-| Show content → Restore defaults | Resets only the default component selections for both modes |
+| Size | 80% / 100% (default) / 125% / 150% / 175% / 200% |
+| 语言 / Language | Follow system (default), 中文, or English |
+| Refresh interval | Sets Full mode's refresh interval to 0.5 / 1 (default) / 2 seconds |
+| Slow latency threshold | 50 / 100 / 150 / 200 / 300 / 500 (default) / 800 ms |
+| Disconnect alerts | Toggles Network disconnected and Network restored cards; enabled by default |
+| Alert sound | Toggles sound separately; enabled by default and unavailable when Disconnect alerts are disabled |
+| Show items → Full mode / Mini mode | Selects components for each mode |
+| Show items → Reset to defaults | Resets only the default component selections for both modes |
 | Always on top | Toggles pinning the window above others |
 | Start with Windows | Toggles startup for the current user |
-| Open log (打开日志) | Opens the local log |
-| Restart as administrator for frame rate | Appears when frame rate is enabled in the current mode and administrator privileges are missing |
-| Exit (退出) | Exits the app |
+| Open log | Opens the local log |
+| Restart as administrator (for FPS) | Appears when FPS is enabled in the current mode and administrator privileges are missing |
+| Exit | Exits the app |
 
 ## Network latency
 
@@ -141,14 +141,14 @@ Under normal conditions, Pulse probes the first address about every 5 seconds. I
 
 | Result | Interpretation |
 | --- | --- |
-| Request succeeds with latency < selected threshold | Normal |
+| Request succeeds with latency < selected threshold | Connected |
 | Latency ≥ selected threshold (default 500 ms) and < 1000 ms | Slow |
 | Probe round fails, or latency ≥ 1000 ms | Counts as one unavailable result |
-| 3 consecutive unavailable results | Connection is marked offline |
-| One successful request with latency < 1000 ms | Clears the failure count; restores an offline connection |
-| All physical network adapters are disconnected, confirmed after a short debounce | Connection is marked offline immediately, without waiting for 3 unavailable HTTP results |
+| 3 consecutive unavailable results | Connection is marked Offline |
+| One successful request with latency < 1000 ms | Clears the failure count; restores an Offline connection |
+| All physical network adapters are disconnected, confirmed after a short debounce | Connection is marked Offline immediately, without waiting for 3 unavailable HTTP results |
 
-After an unavailable result, Pulse checks about every 1 second; once offline, it retries about every 1.5 seconds. After physical adapters disconnect, the physical connection must return before Pulse can mark the connection as restored, even if a local proxy returns a successful response. System sleep pauses probing and clears outage timing. Probing resumes about 3 seconds after wake.
+After an unavailable result, Pulse checks about every 1 second; once Offline, it retries about every 1.5 seconds. After physical adapters disconnect, the physical connection must return before Pulse can mark the connection as restored, even if a local proxy returns a successful response. System sleep pauses probing and clears outage timing. Probing resumes about 3 seconds after wake.
 
 ## Building from source
 
@@ -171,7 +171,7 @@ To package a zip (runs `build.bat` first):
 ```bat
 scripts\package.cmd
 scripts\package.cmd -NoBuild
-scripts\package.cmd -Version 1.0.0
+scripts\package.cmd -Version 1.1.0
 ```
 
 `-NoBuild` skips compilation only if `Pulse.exe` already exists in the repository root. Without `-Version`, the script reads `FileVersion` from `app.rc`, falling back to `0.1.0` if it cannot be read. The output is `dist\Pulse-<version>-win-x64.zip`, containing `Pulse.exe`, `README.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the installation and uninstallation scripts from `scripts\`.
@@ -199,7 +199,7 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - Pulse reads system performance counters, battery information, processes, and network status. It changes system settings only when you choose Start with Windows. In a normal environment, runtime settings and logs are written only to `%LOCALAPPDATA%\Pulse`. Toggling Start with Windows writes or deletes the `Pulse` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. The installer also copies the app and creates the shortcuts described above.
 - Network access is used only for latency measurement, by periodically requesting the three probe addresses listed above through the system proxy. Pulse does not collect or upload personal data over the network and has no analytics, telemetry, or automatic updates.
 - Logs are stored locally and are never uploaded.
-- Administrator privileges are used only for the frame-rate feature's ETW session. They are unnecessary if you do not need frame rate.
+- Administrator privileges are used only for the FPS feature's ETW session. They are unnecessary if you do not need FPS.
 - `Pulse.exe` is not code-signed, so Windows SmartScreen may warn on first launch. You can select More info → Run anyway. Download only from this project's GitHub Releases.
 
 ## License

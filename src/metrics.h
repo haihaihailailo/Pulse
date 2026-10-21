@@ -24,6 +24,10 @@ struct FpsRank {
     std::uint32_t pid = 0;
 };
 
+// Language-independent display metadata; legacy Chinese strings remain intact.
+enum class PowerSchemeKind { Unknown, Balanced, BestPerformance, BestEfficiency, LongerBattery };
+enum class OfflineReason { None, Timeout, HighLatency, LinkDisconnected, NoResponse };
+
 struct Snapshot {
     // —— 电池 ——
     PowerMode mode = PowerMode::Unknown;
@@ -87,12 +91,21 @@ struct Snapshot {
     // PDH 预热/失败时 Utility 为 NaN，cpu_percent 沿用旧口径或上一值。
     double cpu_time_percent = NAN, cpu_utility_percent = NAN;
     bool cpu_from_utility = false;
+
+    PowerSchemeKind power_scheme_kind = PowerSchemeKind::Unknown;
+    OfflineReason offline_reason = OfflineReason::None;
+    double offline_latency_ms = NAN;
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。
 struct NetEvent {
     bool recovered;                   // true = 恢复，false = 断开
     std::wstring message;             // 已格式化的中文文案
+
+    OfflineReason reason = OfflineReason::None;
+    double latency_ms = NAN;
+    std::int64_t offline_start_unix = 0, event_unix = 0;
+    std::uint64_t outage_duration_s = 0; // Monotonic elapsed time; independent of wall-clock changes.
 };
 
 struct Settings {

@@ -339,6 +339,8 @@ struct Status {
     bool outage_active = false;
     std::int64_t outage_unix = 0;
     bool link_disconnected = false;
+    OfflineReason outage_reason = OfflineReason::None;
+    double outage_latency_ms = NAN;
 };
 
 class CsLock {
@@ -800,14 +802,15 @@ private:
         else view.latency_ms = NAN;
         view.offline_by_latency = state.display == Display::Unusable;
         view.offline_since_unix = state.outage_active ? state.outage_unix : 0;
+        view.offline_reason = state.outage_active ? state.outage_reason : OfflineReason::None;
+        view.offline_latency_ms = state.outage_active ? state.outage_latency_ms : NAN;
         return view;
     }
 
     // Caller holds status_cs_: power transitions and event publication stay ordered.
-    void PublishEvent(const std::wstring& log, std::wstring notification, bool recovered) {
+    void PublishEvent(const std::wstring& log, std::wstring notification, bool recovered, NetEvent& event) {
         if (!log.empty()) AppendLog(log);
         if (!notification.empty() && !Stopping() && cb_) {
-            NetEvent event;
             event.recovered = recovered;
             event.message = std::move(notification);
             try { cb_(event, user_); } catch (...) {}
@@ -824,6 +827,8 @@ private:
         state.latest_ms = 0;
         state.display = Display::Offline;
         state.link_disconnected = true;
+        state.outage_reason = OfflineReason::LinkDisconnected;
+        state.outage_latency_ms = NAN;
         state.fail_count = static_cast<unsigned>(config_.fail_threshold);
         if (state.outage_active) {
             view_ = MakeView(state);
@@ -837,8 +842,12 @@ private:
         state.outage_active = true;
         state.outage_unix = state.first_failure_unix;
         view_ = MakeView(state);
+        NetEvent event{};
+        event.reason = state.outage_reason;
+        event.offline_start_unix = state.outage_unix;
+        event.event_unix = state.first_failure_unix;
         PublishEvent(L"网络断开：网络连接已断开",
-                     LocalTimeText(now, false) + L" 起网络连接已断开", false);
+                     LocalTimeText(now, false) + L" 起网络连接已断开", false, event);
         return true;
     }
 
@@ -860,6 +869,7 @@ private:
         std::wstring log;
         std::wstring notification;
         bool recovered = false;
+        NetEvent event{};
         {
             Status& state = status_;
             state.has_result = true;
@@ -868,6 +878,11 @@ private:
             if (ok && ms < static_cast<ULONGLONG>(config_.unusable_ms)) {
                 if (state.outage_active) {
                     const ULONGLONG duration = tick - state.first_failure_tick;
+                    event.reason = state.outage_reason;
+                    event.latency_ms = state.outage_latency_ms;
+                    event.offline_start_unix = state.outage_unix;
+                    event.event_unix = LocalSystemTimeToUnix(now);
+                    event.outage_duration_s = duration / 1000;
                     log = L"\u7F51\u7EDC\u5DF2\u6062\u590D\uFF0C\u65AD\u7F51\u65F6\u957F " + FormatOutageDuration(duration / 1000);
                     notification = L"\u7F51\u7EDC\u5DF2\u6062\u590D \u00B7 " + LocalTimeText(now, false) +
                                    L" \u00B7 \u672C\u6B21\u65AD\u7F51 " + FormatOutageDuration(duration / 1000);
@@ -893,6 +908,13 @@ private:
                 if (state.fail_count == static_cast<unsigned>(config_.fail_threshold)) {
                     state.outage_active = true;
                     state.outage_unix = state.first_failure_unix;
+                    state.outage_reason = state.link_disconnected ? OfflineReason::LinkDisconnected :
+                        ok ? OfflineReason::HighLatency : timed_out ? OfflineReason::Timeout : OfflineReason::NoResponse;
+                    state.outage_latency_ms = ok ? static_cast<double>(ms) : NAN;
+                    event.reason = state.outage_reason;
+                    event.latency_ms = state.outage_latency_ms;
+                    event.offline_start_unix = state.outage_unix;
+                    event.event_unix = LocalSystemTimeToUnix(now);
                     notification = LocalTimeText(state.first_failure_time, false) + L" 起无法访问网络";
                     if (ok) {
                         log = L"网络断开：延迟过高（" + std::to_wstring(ms) + L" ms）";
@@ -912,7 +934,7 @@ private:
         }
         // Serialize publication with OnSuspend/OnResume: after either returns,
         // the UI can safely drain every notification from the previous epoch.
-        PublishEvent(log, std::move(notification), recovered);
+        PublishEvent(log, std::move(notification), recovered, event);
         return true;
     }
 

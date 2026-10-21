@@ -17,6 +17,9 @@
 #define MSGFLT_ALLOW 1
 #endif
 #include <shlobj.h>
+#include <shobjidl.h>
+#include <knownfolders.h>
+#include <objbase.h>
 #include <mmsystem.h>
 #include <algorithm>
 #include <array>
@@ -46,10 +49,14 @@ constexpr UINT DpiFitMessage = WM_APP + 6;
 constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
 constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109, CmdRestartAdmin = 110;
+constexpr UINT CmdShortcutDesktop = 111, CmdShortcutStartMenu = 112;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
 constexpr UINT CmdRefresh = 400;
 constexpr UINT CmdSlowThreshold = 450;
 constexpr UINT CmdZoom = 500;
+constexpr UINT CmdLanguage = 600;
+constexpr std::array<i18n::Preference, 3> Languages{{
+    i18n::Preference::Auto, i18n::Preference::Chinese, i18n::Preference::English}};
 constexpr std::array<UINT, 3> RefreshIntervals{{500u, 1000u, 2000u}};
 constexpr std::array<int, 7> SlowThresholds{{50, 100, 150, 200, 300, 500, 800}};
 constexpr std::array<int, 6> ZoomLevels{{80, 100, 125, 150, 175, 200}};
@@ -99,6 +106,151 @@ std::wstring ExecutablePath() {
         buffer.resize(std::min(size_t(32768), buffer.size() * 2));
     }
 }
+struct ComApartment {
+    HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    // S_FALSE also increments COM's initialization count; failures do not.
+    ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
+};
+struct ShellShortcut {
+    IShellLinkW* link = nullptr;
+    IPersistFile* file = nullptr;
+    ShellShortcut() = default;
+    ShellShortcut(const ShellShortcut&) = delete;
+    ShellShortcut& operator=(const ShellShortcut&) = delete;
+    ~ShellShortcut() {
+        if (file) file->Release();
+        if (link) link->Release();
+    }
+    HRESULT Initialize() {
+        HRESULT result = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+            IID_IShellLinkW, reinterpret_cast<void**>(&link));
+        if (SUCCEEDED(result))
+            result = link->QueryInterface(IID_IPersistFile, reinterpret_cast<void**>(&file));
+        return result;
+    }
+};
+struct ShellPathDeleter {
+    void operator()(wchar_t* path) const { CoTaskMemFree(path); }
+};
+HRESULT KnownFolderPath(REFKNOWNFOLDERID folder, DWORD flags, std::wstring& path) {
+    PWSTR raw = nullptr;
+    const HRESULT result = SHGetKnownFolderPath(folder, flags, nullptr, &raw);
+    const std::unique_ptr<wchar_t, ShellPathDeleter> memory(raw);
+    if (FAILED(result)) return result;
+    if (!raw || !*raw) return E_UNEXPECTED;
+    path = raw;
+    return S_OK;
+}
+std::wstring NormalizeShortcutPath(std::wstring path) {
+    if (path.empty()) return path;
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    if (_wcsnicmp(path.c_str(), L"\\\\?\\UNC\\", 8) == 0) path = L"\\\\" + path.substr(8);
+    else if (path.compare(0, 4, L"\\\\?\\") == 0) path.erase(0, 4);
+    const DWORD fullSize = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (fullSize) {
+        std::vector<wchar_t> full(fullSize);
+        const DWORD length = GetFullPathNameW(path.c_str(), fullSize, full.data(), nullptr);
+        if (length && length < fullSize) path.assign(full.data(), length);
+    }
+    // Compare short (8.3) and long spellings as the same executable when possible.
+    const DWORD longSize = GetLongPathNameW(path.c_str(), nullptr, 0);
+    if (longSize) {
+        std::vector<wchar_t> expanded(longSize);
+        const DWORD length = GetLongPathNameW(path.c_str(), expanded.data(), longSize);
+        if (length && length < longSize) path.assign(expanded.data(), length);
+    }
+    return path;
+}
+HRESULT ShortcutLocationIsTemporary(const std::wstring& executable, bool& temporary) {
+    const auto path = NormalizeShortcutPath(executable);
+    auto lower = path;
+    CharLowerBuffW(lower.data(), static_cast<DWORD>(lower.size()));
+    temporary = lower.find(L"\\temp\\") != std::wstring::npos;
+    if (temporary) return S_OK;
+    std::wstring downloads;
+    const HRESULT result = KnownFolderPath(FOLDERID_Downloads, KF_FLAG_DONT_VERIFY, downloads);
+    if (FAILED(result)) return result;
+    downloads = NormalizeShortcutPath(std::move(downloads));
+    if (downloads.back() != L'\\') downloads += L'\\';
+    temporary = path.size() > downloads.size() &&
+        CompareStringOrdinal(path.c_str(), static_cast<int>(downloads.size()),
+            downloads.c_str(), static_cast<int>(downloads.size()), TRUE) == CSTR_EQUAL;
+    return S_OK;
+}
+HRESULT ReadShortcutTarget(const std::wstring& path, std::wstring& target) {
+    ShellShortcut shortcut;
+    HRESULT result = shortcut.Initialize();
+    if (SUCCEEDED(result)) result = shortcut.file->Load(path.c_str(), STGM_READ);
+    if (FAILED(result)) return result;
+    std::vector<wchar_t> buffer(32768, 0);
+    // Do not Resolve: inspecting an old target must not launch a search or repair it.
+    result = shortcut.link->GetPath(buffer.data(), static_cast<int>(buffer.size()), nullptr, 0);
+    if (SUCCEEDED(result)) target = NormalizeShortcutPath(buffer.data());
+    return result;
+}
+void CreateShortcut(HWND owner, REFKNOWNFOLDERID destination) {
+    const auto fail = [owner](HRESULT result) {
+        wchar_t code[16]{};
+        std::swprintf(code, sizeof(code) / sizeof(code[0]), L"0x%08lX", static_cast<unsigned long>(result));
+        const auto message = i18n::Format(Key::ShortcutFailed, {code});
+        MessageBoxW(owner, message.c_str(), T(Key::AppName).c_str(), MB_OK | MB_ICONERROR);
+    };
+    ComApartment apartment;
+    // A different apartment model means COM is already usable on this thread.
+    if (FAILED(apartment.result) && apartment.result != RPC_E_CHANGED_MODE) {
+        fail(apartment.result);
+        return;
+    }
+    const auto executable = ExecutablePath();
+    if (executable.empty()) {
+        const DWORD error = GetLastError();
+        fail(HRESULT_FROM_WIN32(error ? error : ERROR_BAD_PATHNAME));
+        return;
+    }
+    const auto slash = executable.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) { fail(HRESULT_FROM_WIN32(ERROR_BAD_PATHNAME)); return; }
+    std::wstring folder;
+    HRESULT result = KnownFolderPath(destination, 0, folder);
+    if (FAILED(result)) { fail(result); return; }
+    if (folder.back() != L'\\') folder += L'\\';
+    const auto shortcutPath = folder + L"Pulse.lnk";
+    const DWORD attributes = GetFileAttributesW(shortcutPath.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        if (attributes & FILE_ATTRIBUTE_DIRECTORY) { fail(HRESULT_FROM_WIN32(ERROR_DIRECTORY)); return; }
+        std::wstring target;
+        result = ReadShortcutTarget(shortcutPath, target);
+        if (FAILED(result)) { fail(result); return; }
+        const auto current = NormalizeShortcutPath(executable);
+        if (!target.empty() && CompareStringOrdinal(target.c_str(), -1, current.c_str(), -1, TRUE) == CSTR_EQUAL) {
+            MessageBoxW(owner, T(Key::ShortcutExists).c_str(), T(Key::AppName).c_str(), MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        if (MessageBoxW(owner, T(Key::ShortcutReplace).c_str(), T(Key::AppName).c_str(),
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    } else {
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+            fail(HRESULT_FROM_WIN32(error));
+            return;
+        }
+    }
+    bool temporary = false;
+    result = ShortcutLocationIsTemporary(executable, temporary);
+    if (FAILED(result)) { fail(result); return; }
+    if (temporary && MessageBoxW(owner, T(Key::ShortcutLocationWarning).c_str(), T(Key::AppName).c_str(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    // Use a fresh object so replacing a link cannot inherit old arguments or flags.
+    ShellShortcut shortcut;
+    result = shortcut.Initialize();
+    if (SUCCEEDED(result)) result = shortcut.link->SetPath(executable.c_str());
+    const auto directory = executable.substr(0, slash + 1); // Keep the backslash for a drive root.
+    if (SUCCEEDED(result)) result = shortcut.link->SetWorkingDirectory(directory.c_str());
+    if (SUCCEEDED(result)) result = shortcut.link->SetIconLocation(executable.c_str(), 0);
+    if (SUCCEEDED(result)) result = shortcut.link->SetDescription(T(Key::AppName).c_str());
+    if (SUCCEEDED(result)) result = shortcut.file->Save(shortcutPath.c_str(), TRUE);
+    if (FAILED(result)) { fail(result); return; }
+    MessageBoxW(owner, T(Key::ShortcutCreated).c_str(), T(Key::AppName).c_str(), MB_OK | MB_ICONINFORMATION);
+}
 HICON LoadPulseIcon(int xMetric, int yMetric, UINT dpi) {
     using MetricsForDpiFn = int(WINAPI*)(int, UINT);
     static const auto metricsForDpi = reinterpret_cast<MetricsForDpiFn>(
@@ -118,6 +270,7 @@ struct Config {
     UINT refresh_ms = 1000;
     int slow_ms = 500;
     int zoom = 100;
+    i18n::Preference language = i18n::Preference::Auto;
     bool compact = false, pinned = true;
     bool notify = true, notify_sound = true;
     std::wstring file;
@@ -137,6 +290,9 @@ struct Config {
         file = folder + L"\\settings.ini";
         x = static_cast<int>(GetPrivateProfileIntW(L"Window", L"X", INT_MIN, file.c_str()));
         y = static_cast<int>(GetPrivateProfileIntW(L"Window", L"Y", INT_MIN, file.c_str()));
+        wchar_t languageValue[32]{};
+        GetPrivateProfileStringW(L"Window", L"language", L"auto", languageValue, 32, file.c_str());
+        language = i18n::ParsePreference(languageValue);
         compact = GetPrivateProfileIntW(L"Window", L"Compact", 0, file.c_str()) != 0;
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
         wchar_t zoomValue[32]{};
@@ -167,6 +323,7 @@ struct Config {
         WritePrivateProfileStringW(L"Window", L"Y", sy.c_str(), file.c_str());
         WritePrivateProfileStringW(L"Window", L"Compact", compact ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
+        WritePrivateProfileStringW(L"Window", L"language", i18n::PreferenceValue(language), file.c_str());
         const auto zoomValue = std::to_wstring(zoom);
         WritePrivateProfileStringW(L"Window", L"zoom", zoomValue.c_str(), file.c_str());
         const auto interval = std::to_wstring(refresh_ms);
@@ -184,18 +341,27 @@ struct Config {
 
 class Toast {
 public:
-    explicit Toast(NetEvent event, HWND notify) : event_(std::move(event)), notify_(notify) {}
+    explicit Toast(NetEvent event, HWND notify) : event_(std::move(event)), message_(NetworkEventText(event_)), notify_(notify) {}
     ~Toast() { if (window_) DestroyWindow(window_); }
     bool Open(HINSTANCE instance, UINT dpi, int zoom) {
         if (FAILED(renderer_.Initialize())) return false;
         dpi_ = dpi;
         zoom_ = zoom;
         renderer_.SetZoom(zoom_);
-        height_ = renderer_.ToastHeight(event_.message);
+        height_ = renderer_.ToastHeight(message_);
         window_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-            ToastClass, L"Pulse · 网络提醒", ToastStyle, 0, 0, Width(dpi_), Height(dpi_),
+            ToastClass, T(Key::ToastCaption).c_str(), ToastStyle, 0, 0, Width(dpi_), Height(dpi_),
             nullptr, nullptr, instance, this);
         return window_ != nullptr;
+    }
+    void LanguageChanged() {
+        renderer_.LanguageChanged();
+        message_ = NetworkEventText(event_);
+        height_ = renderer_.ToastHeight(message_, width_);
+        if (window_) {
+            SetWindowTextW(window_, T(Key::ToastCaption).c_str());
+            InvalidateRect(window_, nullptr, FALSE);
+        }
     }
     HWND Window() const { return window_; }
     int Width(UINT dpi) const { return Pixels(width_, dpi, zoom_); }
@@ -209,7 +375,7 @@ public:
         renderer_.SetDpi(dpi_);
         renderer_.SetZoom(zoom_);
         width_ = width;
-        height_ = renderer_.ToastHeight(event_.message, width_);
+        height_ = renderer_.ToastHeight(message_, width_);
         if (window_) InvalidateRect(window_, nullptr, FALSE);
     }
     void Place(int x, int y, int height, UINT dpi) {
@@ -249,7 +415,7 @@ public:
         case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE;
         case WM_PAINT: {
             PaintSession paint(window);
-            self->renderer_.PaintToast(self->event_);
+            self->renderer_.PaintToast(self->event_, self->message_);
             return 0;
         }
         case WM_SIZE: self->renderer_.Resize(); return 0;
@@ -350,6 +516,7 @@ private:
     }
 
     NetEvent event_;
+    std::wstring message_; // Localized once on arrival or language change, never during paint.
     HWND window_ = nullptr, notify_ = nullptr;
     Renderer renderer_;
     UINT dpi_ = 96;
@@ -377,9 +544,10 @@ public:
     }
     int Execute(int showCommand, bool restarted) {
         config_.Load();
+        i18n::SetLanguage(config_.language);
         notificationState_.store(config_.notify ? 1u : 0u, std::memory_order_release);
         if (FAILED(renderer_.Initialize())) {
-            MessageBoxW(nullptr, L"无法初始化 Direct2D / DirectWrite。", L"Pulse", MB_OK | MB_ICONERROR);
+            MessageBoxW(nullptr, T(Key::GraphicsFailed).c_str(), L"Pulse", MB_OK | MB_ICONERROR);
             return 1;
         }
         POINT initial{config_.x == INT_MIN ? 0 : config_.x, config_.y == INT_MIN ? 0 : config_.y};
@@ -416,7 +584,7 @@ public:
         }
         config_.x = ClampCoordinate(config_.x, work.left, work.right, width);
         config_.y = ClampCoordinate(config_.y, work.top, work.bottom, height);
-        window_ = CreateWindowExW(WS_EX_APPWINDOW, MainClass, L"Pulse", MainStyle,
+        window_ = CreateWindowExW(WS_EX_APPWINDOW, MainClass, T(Key::AppName).c_str(), MainStyle,
             config_.x, config_.y, width, height, nullptr, nullptr, instance_, this);
         if (!window_) return 1;
         AllowShowFromLowerIntegrity(window_);
@@ -479,8 +647,8 @@ private:
             if (PostMessageW(window, NetMessage, notificationState, reinterpret_cast<LPARAM>(copy.get()))) copy.release();
         } catch (...) {}
     }
-    float ContentWidth() const { return config_.compact ? renderer_.CompactWidth() : 320; }
-    float ContentHeight() const { return config_.compact ? 40 : FullLayout(config_.components).height; }
+    float ContentWidth() const { return config_.compact ? renderer_.CompactWidth() : renderer_.FullWidth(); }
+    float ContentHeight() const { return config_.compact ? 40 : FullLayout(config_.components, renderer_.FullWidth()).height; }
     float Scale() const { return dpi_ / 96.0f * config_.zoom / 100.0f; }
     SIZE FittedSize(const RECT& work) const {
         return {std::min(Pixels(ContentWidth(), dpi_, config_.zoom), std::max(1, static_cast<int>(work.right - work.left))),
@@ -611,6 +779,27 @@ private:
         Save();
         if (active_) InvalidateRect(window_, nullptr, FALSE);
     }
+    void SetLanguage(i18n::Preference preference) {
+        const bool preferenceChanged = config_.language != preference;
+        config_.language = preference;
+        if (!i18n::SetLanguage(preference)) {
+            if (preferenceChanged) Save();
+            return;
+        }
+        renderer_.LanguageChanged();
+        Reconfigure(false); // Rebuild view, fixed widths, HWND size and text layouts once.
+        for (auto& toast : toasts_) toast->LanguageChanged();
+        ArrangeToasts();
+        if (tray_) {
+            NOTIFYICONDATAW data{};
+            data.cbSize = sizeof(data);
+            data.hWnd = window_;
+            data.uID = TrayId;
+            data.uFlags = NIF_TIP | NIF_SHOWTIP;
+            std::swprintf(data.szTip, sizeof(data.szTip) / sizeof(data.szTip[0]), L"%ls", T(Key::TrayTip).c_str());
+            Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
     void SetCompact(bool compact) {
         if (config_.compact == compact) return;
         config_.compact = compact;
@@ -675,7 +864,7 @@ private:
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TrayMessage;
         data.hIcon = IconOrDefault(smallIcon_);
-        std::swprintf(data.szTip, sizeof(data.szTip) / sizeof(data.szTip[0]), L"%ls", L"Pulse · 双击窗口切换模式");
+        std::swprintf(data.szTip, sizeof(data.szTip) / sizeof(data.szTip[0]), L"%ls", T(Key::TrayTip).c_str());
         tray_ = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
         if (tray_) {
             data.uVersion = NOTIFYICON_VERSION_4;
@@ -724,13 +913,13 @@ private:
             }
             RegCloseKey(key);
         }
-        if (status != ERROR_SUCCESS) MessageBoxW(window_, L"无法更新当前用户的开机自启设置。", L"Pulse", MB_OK | MB_ICONWARNING);
+        if (status != ERROR_SUCCESS) MessageBoxW(window_, T(Key::StartupSettingFailed).c_str(), L"Pulse", MB_OK | MB_ICONWARNING);
     }
     void OpenLog() {
         if (!metrics_) return;
         const auto log = metrics_->LogPath();
         if (log.empty()) {
-            MessageBoxW(window_, L"日志路径尚未就绪。", L"Pulse", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(window_, T(Key::LogNotReady).c_str(), L"Pulse", MB_OK | MB_ICONINFORMATION);
             return;
         }
         auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(window_, L"open", log.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
@@ -738,7 +927,7 @@ private:
             const auto parameter = L"\"" + log + L"\"";
             result = reinterpret_cast<INT_PTR>(ShellExecuteW(window_, L"open", L"notepad.exe", parameter.c_str(), nullptr, SW_SHOWNORMAL));
         }
-        if (result <= 32) MessageBoxW(window_, L"无法打开日志，日志文件可能尚未生成。", L"Pulse", MB_OK | MB_ICONINFORMATION);
+        if (result <= 32) MessageBoxW(window_, T(Key::LogOpenFailed).c_str(), L"Pulse", MB_OK | MB_ICONINFORMATION);
     }
     bool FpsNeedsAdmin() const {
         if (fpsStatus_ != 2) return false;
@@ -765,13 +954,25 @@ private:
     void Menu(POINT point) {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
-        AppendMenuW(menu, MF_STRING | (!config_.compact ? MF_CHECKED : 0), CmdFull, L"完整模式");
-        AppendMenuW(menu, MF_STRING | (config_.compact ? MF_CHECKED : 0), CmdCompact, L"迷你模式");
+        AppendMenuW(menu, MF_STRING | (!config_.compact ? MF_CHECKED : 0), CmdFull, T(Key::FullMode).c_str());
+        AppendMenuW(menu, MF_STRING | (config_.compact ? MF_CHECKED : 0), CmdCompact, T(Key::MiniMode).c_str());
+        HMENU language = CreatePopupMenu();
+        if (language) {
+            const Key labels[] = {Key::LanguageAuto, Key::LanguageZh, Key::LanguageEn};
+            UINT selected = CmdLanguage;
+            for (size_t i = 0; i < Languages.size(); ++i) {
+                const UINT id = CmdLanguage + static_cast<UINT>(i);
+                AppendMenuW(language, MF_STRING, id, T(labels[i]).c_str());
+                if (config_.language == Languages[i]) selected = id;
+            }
+            CheckMenuRadioItem(language, CmdLanguage, CmdLanguage + 2, selected, MF_BYCOMMAND);
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(language), T(Key::LanguageMenu).c_str());
+        }
         HMENU zoom = CreatePopupMenu();
         if (zoom) {
             for (size_t i = 0; i < ZoomLevels.size(); ++i) {
                 auto label = std::to_wstring(ZoomLevels[i]) + L"%";
-                if (ZoomLevels[i] == 100) label += L"（默认）";
+                if (ZoomLevels[i] == 100) label += T(Key::DefaultSuffix);
                 AppendMenuW(zoom, MF_STRING, CmdZoom + static_cast<UINT>(i), label.c_str());
             }
             const auto selected = std::find(ZoomLevels.begin(), ZoomLevels.end(), config_.zoom);
@@ -779,64 +980,70 @@ private:
                 CheckMenuRadioItem(zoom, CmdZoom, CmdZoom + static_cast<UINT>(ZoomLevels.size()) - 1,
                                    CmdZoom + static_cast<UINT>(selected - ZoomLevels.begin()), MF_BYCOMMAND);
             const auto label = selected == ZoomLevels.end() ?
-                L"界面大小（自定义 " + std::to_wstring(config_.zoom) + L"%）" : std::wstring(L"界面大小");
+                i18n::Format(Key::CustomSize, {std::to_wstring(config_.zoom)}) : T(Key::Size);
             AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(zoom), label.c_str());
         }
         HMENU refresh = CreatePopupMenu();
         if (refresh) {
-            const wchar_t* labels[] = {L"0.5 秒", L"1 秒（默认）", L"2 秒"};
+            const wchar_t* labels[] = {T(Key::RefreshHalf).c_str(), T(Key::RefreshOne).c_str(), T(Key::RefreshTwo).c_str()};
             for (size_t i = 0; i < RefreshIntervals.size(); ++i)
                 AppendMenuW(refresh, MF_STRING | (config_.refresh_ms == RefreshIntervals[i] ? MF_CHECKED : 0),
                             CmdRefresh + static_cast<UINT>(i), labels[i]);
-            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(refresh), L"刷新间隔");
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(refresh), T(Key::RefreshInterval).c_str());
         }
         HMENU slow = CreatePopupMenu();
         if (slow) {
-            const wchar_t* labels[] = {L"50 ms", L"100 ms", L"150 ms", L"200 ms",
-                                       L"300 ms", L"500 ms（默认）", L"800 ms"};
-            static_assert(sizeof(labels) / sizeof(labels[0]) == SlowThresholds.size(), "labels");
             UINT selected = CmdSlowThreshold + 5;
             for (size_t i = 0; i < SlowThresholds.size(); ++i) {
                 const UINT id = CmdSlowThreshold + static_cast<UINT>(i);
-                AppendMenuW(slow, MF_STRING, id, labels[i]);
+                auto label = std::to_wstring(SlowThresholds[i]) + T(Key::MsSuffix);
+                if (SlowThresholds[i] == 500) label += T(Key::DefaultSuffix);
+                AppendMenuW(slow, MF_STRING, id, label.c_str());
                 if (config_.slow_ms == SlowThresholds[i]) selected = id;
             }
             CheckMenuRadioItem(slow, CmdSlowThreshold,
                               CmdSlowThreshold + static_cast<UINT>(SlowThresholds.size()) - 1,
                               selected, MF_BYCOMMAND);
-            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(slow), L"延迟较慢阈值");
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(slow), T(Key::SlowThreshold).c_str());
         }
-        AppendMenuW(menu, MF_STRING | (config_.notify ? MF_CHECKED : 0), CmdNetworkNotify, L"断网提醒");
+        AppendMenuW(menu, MF_STRING | (config_.notify ? MF_CHECKED : 0), CmdNetworkNotify, T(Key::DisconnectAlerts).c_str());
         AppendMenuW(menu, MF_STRING | (config_.notify_sound ? MF_CHECKED : 0) |
-                    (config_.notify ? 0 : MF_GRAYED), CmdNotifySound, L"提醒提示音");
+                    (config_.notify ? 0 : MF_GRAYED), CmdNotifySound, T(Key::AlertSound).c_str());
         HMENU contents = CreatePopupMenu();
         HMENU full = CreatePopupMenu();
         HMENU compact = CreatePopupMenu();
         if (contents && full && compact) {
             for (size_t i = 0; i < FullComponents.size(); ++i)
                 AppendMenuW(full, MF_STRING | (config_.components.full[i] ? MF_CHECKED : 0),
-                            CmdFullComponent + static_cast<UINT>(i), FullComponents[i].label);
+                            CmdFullComponent + static_cast<UINT>(i), T(FullComponents[i].label).c_str());
             for (size_t i = 0; i < CompactComponents.size(); ++i)
                 AppendMenuW(compact, MF_STRING | (config_.components.compact[i] ? MF_CHECKED : 0),
-                            CmdCompactComponent + static_cast<UINT>(i), CompactComponents[i].label);
-            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(full), L"完整模式");
-            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(compact), L"迷你模式");
+                            CmdCompactComponent + static_cast<UINT>(i), T(CompactComponents[i].label).c_str());
+            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(full), T(Key::FullMode).c_str());
+            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(compact), T(Key::MiniMode).c_str());
             AppendMenuW(contents, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(contents, MF_STRING, CmdDefaults, L"恢复默认");
-            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(contents), L"显示内容");
+            AppendMenuW(contents, MF_STRING, CmdDefaults, T(Key::ResetDefaults).c_str());
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(contents), T(Key::ShowItems).c_str());
         } else {
             if (contents) DestroyMenu(contents);
             if (full) DestroyMenu(full);
             if (compact) DestroyMenu(compact);
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING | (config_.pinned ? MF_CHECKED : 0), CmdPin, L"窗口置顶");
-        AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CmdStartup, L"开机自启");
-        AppendMenuW(menu, MF_STRING, CmdLog, L"打开日志");
+        AppendMenuW(menu, MF_STRING | (config_.pinned ? MF_CHECKED : 0), CmdPin, T(Key::AlwaysOnTop).c_str());
+        AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CmdStartup, T(Key::StartWithWindows).c_str());
+        HMENU shortcuts = CreatePopupMenu();
+        if (shortcuts) {
+            AppendMenuW(shortcuts, MF_STRING, CmdShortcutDesktop, T(Key::ShortcutDesktop).c_str());
+            AppendMenuW(shortcuts, MF_STRING, CmdShortcutStartMenu, T(Key::ShortcutStartMenu).c_str());
+            if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(shortcuts), T(Key::CreateShortcut).c_str()))
+                DestroyMenu(shortcuts);
+        }
+        AppendMenuW(menu, MF_STRING, CmdLog, T(Key::OpenLog).c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         if (FpsNeedsAdmin())
-            AppendMenuW(menu, MF_STRING, CmdRestartAdmin, L"以管理员身份重启（显示帧数需要）");
-        AppendMenuW(menu, MF_STRING, CmdExit, L"退出");
+            AppendMenuW(menu, MF_STRING, CmdRestartAdmin, T(Key::RestartAdmin).c_str());
+        AppendMenuW(menu, MF_STRING, CmdExit, T(Key::Exit).c_str());
         SetForegroundWindow(window_);
         const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                                               point.x, point.y, window_, nullptr);
@@ -845,6 +1052,10 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (command >= CmdLanguage && command < CmdLanguage + static_cast<UINT>(Languages.size())) {
+            SetLanguage(Languages[command - CmdLanguage]);
+            return;
+        }
         if (command >= CmdZoom && command < CmdZoom + static_cast<UINT>(ZoomLevels.size())) {
             zoomWheelDelta_ = 0;
             SetZoom(ZoomLevels[command - CmdZoom]);
@@ -895,6 +1106,8 @@ private:
         case CmdCompact: SetCompact(true); break;
         case CmdPin: TogglePin(); break;
         case CmdStartup: ToggleStartup(); break;
+        case CmdShortcutDesktop: CreateShortcut(window_, FOLDERID_Desktop); break;
+        case CmdShortcutStartMenu: CreateShortcut(window_, FOLDERID_Programs); break;
         case CmdLog: OpenLog(); break;
         case CmdRestartAdmin: RestartElevated(); break;
         case CmdExit: SendMessageW(window_, WM_CLOSE, 0, 0); break;
@@ -1043,6 +1256,7 @@ private:
             return 0;
         case WM_SETTINGCHANGE:
             if (w == SPI_SETWORKAREA) { Fit(false); ArrangeToasts(); }
+            if (config_.language == i18n::Preference::Auto) SetLanguage(config_.language);
             return 0;
         case WM_EXITSIZEMOVE: Fit(false); Save(); return 0;
         case WM_DWMCOMPOSITIONCHANGED: StyleWindow(window_); return 0;
@@ -1254,10 +1468,6 @@ void AllowShowFromLowerIntegrity(HWND window) {
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx"));
     if (filter) filter(window, ShowMessage, MSGFLT_ALLOW, nullptr);
 }
-struct ComApartment {
-    HRESULT result = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    ~ComApartment() { if (SUCCEEDED(result)) CoUninitialize(); }
-};
 } // namespace
 
 void EnableDarkMode() {
