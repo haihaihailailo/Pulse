@@ -120,7 +120,24 @@ HRESULT Renderer::Initialize() {
 void Renderer::SetWindow(HWND window, UINT dpi) { window_ = window; SetDpi(dpi); }
 void Renderer::SetDpi(UINT dpi) {
     dpi_ = dpi ? dpi : 96;
-    if (target_) target_->SetDpi(static_cast<float>(dpi_), static_cast<float>(dpi_));
+    if (target_) target_->SetDpi(RenderDpi(), RenderDpi());
+}
+void Renderer::SetZoom(int percent) {
+    percent = std::clamp(percent, 80, 200);
+    if (zoom_ == percent) return;
+    zoom_ = percent;
+    // Keep all layout coordinates in logical DIPs. The target's effective DPI
+    // scales text, strokes, geometry and brushes together without a bitmap pass.
+    DiscardTarget();
+    layouts_.clear();
+    formats_.clear();
+    layoutSerial_ = 0;
+    ellipsis_.Reset();
+    if (write_) {
+        if (auto* format = Format(12, false, false))
+            write_->CreateEllipsisTrimmingSign(format, ellipsis_.Put());
+        if (compact_) UpdateCompactLayout();
+    }
 }
 void Renderer::SetComponents(const Components& components, bool compact) {
     const bool chart = !compact && components.Enabled(FullComponent::PowerChart);
@@ -129,8 +146,16 @@ void Renderer::SetComponents(const Components& components, bool compact) {
         layouts_.clear(); // Release chart brushes/layouts; rebuild visible text through the same LRU cache.
     }
     chartVisible_ = chart;
+    compact_ = compact;
     components_ = components;
     if (compact) UpdateCompactLayout();
+}
+bool Renderer::SetCompactEtaVisible(bool visible) {
+    if (compactEtaVisible_ == visible) return false;
+    compactEtaVisible_ = visible;
+    if (!compact_ || !components_.Enabled(CompactComponent::Eta)) return false;
+    UpdateCompactLayout();
+    return true;
 }
 void Renderer::Resize() {
     if (!target_) return;
@@ -153,7 +178,7 @@ HRESULT Renderer::CreateTarget() {
     GetClientRect(window_, &r);
     if (r.right <= 0 || r.bottom <= 0) return E_FAIL;
     auto properties = D2D1::RenderTargetProperties();
-    properties.dpiX = properties.dpiY = static_cast<float>(dpi_);
+    properties.dpiX = properties.dpiY = RenderDpi();
     HRESULT hr = factory_->CreateHwndRenderTarget(properties,
         D2D1::HwndRenderTargetProperties(window_, D2D1::SizeU(r.right, r.bottom)), target_.Put());
     if (FAILED(hr)) return hr;
@@ -288,15 +313,24 @@ void Renderer::Bar(D2D1_RECT_F r, float fraction, D2D1_COLOR_F from, D2D1_COLOR_
     Gradient(r, from, to, false, 2);
 }
 void Renderer::Bolt(float x, float y, float size, D2D1_COLOR_F color) {
-    ComPtr<ID2D1PathGeometry> path;
-    ComPtr<ID2D1GeometrySink> sink;
-    if (FAILED(factory_->CreatePathGeometry(path.Put())) || FAILED(path->Open(sink.Put()))) return;
-    auto p = [&](float a, float b) { return D2D1::Point2F(x + a / 24 * size, y + b / 24 * size); };
-    sink->BeginFigure(p(13, 2), D2D1_FIGURE_BEGIN_FILLED);
-    const D2D1_POINT_2F pts[] = {p(4,14), p(11,14), p(10,22), p(19,10), p(12,10)};
-    sink->AddLines(pts, 5);
-    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
-    if (SUCCEEDED(sink->Close())) { brush_->SetColor(color); target_->FillGeometry(path.Get(), brush_.Get()); }
+    if (!bolt_) {
+        ComPtr<ID2D1PathGeometry> path;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(factory_->CreatePathGeometry(path.Put())) || FAILED(path->Open(sink.Put()))) return;
+        sink->BeginFigure(D2D1::Point2F(13, 2), D2D1_FIGURE_BEGIN_FILLED);
+        const D2D1_POINT_2F pts[] = {{4,14}, {11,14}, {10,22}, {19,10}, {12,10}};
+        sink->AddLines(pts, 5);
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        if (FAILED(sink->Close())) return;
+        bolt_ = std::move(path); // Device-independent; no geometry allocation on later frames.
+    }
+    D2D1::Matrix3x2F previous;
+    target_->GetTransform(&previous);
+    target_->SetTransform(D2D1::Matrix3x2F::Scale(size / 24, size / 24) *
+                          D2D1::Matrix3x2F::Translation(x, y) * previous);
+    brush_->SetColor(color);
+    target_->FillGeometry(bolt_.Get(), brush_.Get());
+    target_->SetTransform(previous);
 }
 void Renderer::Ring(const View& v, float x, float y) {
     const auto center = D2D1::Point2F(x + 37, y + 37);
@@ -427,7 +461,7 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
     target_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(17.5f, 23), 3.5f, 3.5f), brush_.Get());
     Text(L"Pulse", Rect(28, 10, 55, 26), 13.5f, TextColor, true);
     Text(v.clock, Rect(143, 10, 54, 26), 12.5f, Muted, false, true, true);
-    Buttons(false, pinned, hover, pressed, 320, accent);
+    Buttons(false, pinned, hover, pressed, target_->GetSize().width, accent);
 
     const float viewport = target_->GetSize().height;
     target_->PushAxisAlignedClip(Rect(0, 44, 320, std::max(0.0f, viewport - 44)), D2D1_ANTIALIAS_MODE_ALIASED);
@@ -628,6 +662,7 @@ void Renderer::UpdateCompactLayout() {
     bool any = false;
     for (size_t i = 0; i < CompactComponents.size(); ++i) {
         if (!components_.compact[i]) continue;
+        if (static_cast<CompactComponent>(i) == CompactComponent::Eta && !compactEtaVisible_) continue;
         auto& cell = compactCells_[i];
         cell.width = CompactComponents[i].extent;
         auto value = [&](const wchar_t* label, const wchar_t* sample) {
@@ -637,6 +672,11 @@ void Renderer::UpdateCompactLayout() {
         switch (static_cast<CompactComponent>(i)) {
         case CompactComponent::Battery:
             cell.width = std::max(cell.width, 28 + Measure(L"100%", 13, true, true));
+            break;
+        case CompactComponent::Eta:
+            value(L"续航", L"99:59"); value(L"充满", L"59 分"); value(L"续航", L"99+ 时");
+            cell.width = std::max(cell.width, std::max(Measure(L"已充满", 13, true, true),
+                                                     Measure(L"未充电", 13, true, true)) + 2);
             break;
         case CompactComponent::Power:
             value(L"整机", L"999.9 W"); value(L"处理器", L"999.9 W"); break;
@@ -667,6 +707,7 @@ void Renderer::CompactContent(const View& v) {
     bool any = false;
     for (size_t i = 0; i < CompactComponents.size(); ++i) {
         if (!components_.compact[i]) continue;
+        if (static_cast<CompactComponent>(i) == CompactComponent::Eta && !v.compactEtaVisible) continue;
         if (any) {
             Line(x + 4.5f, 12, x + 4.5f, 28, Border);
             x += 9;
@@ -683,11 +724,32 @@ void Renderer::CompactContent(const View& v) {
         switch (component) {
         case CompactComponent::Battery: {
             const std::wstring text = v.percent + L"%";
-            brush_->SetColor(Muted);
+            const bool charging = v.mode == PowerMode::Charging;
+            const bool plugged = v.mode == PowerMode::AcIdle;
+            const bool ac = charging || plugged;
+            brush_->SetColor(ac ? Charge : Muted);
             target_->DrawRoundedRectangle(D2D1::RoundedRect(Rect(x, 15, 18, 10), 2.5f, 2.5f), brush_.Get(), 1.5f);
-            Rounded(Rect(x + 20, 18, 2, 4), 1, Muted);
-            if (v.battery > 0) Rounded(Rect(x + 1.5f, 16.5f, 15 * v.battery, 7), 1, BatteryColor(v));
-            Text(text, Rect(x + 26, 8, width - 26, 24), 13, TextColor, true, true);
+            Rounded(Rect(x + 20, 18, 2, 4), 1, ac ? Charge : Muted);
+            if (v.battery > 0)
+                Rounded(Rect(x + 1.5f, 16.5f, 15 * v.battery, 7), 1,
+                        ac ? Alpha(Charge, .20f) : BatteryColor(v));
+            if (charging) Bolt(x + 4, 14, 12, Charge);
+            else if (plugged) {
+                Line(x + 6.5f, 17, x + 6.5f, 20, Charge, 1.2f);
+                Line(x + 11.5f, 17, x + 11.5f, 20, Charge, 1.2f);
+                Line(x + 6.5f, 20, x + 11.5f, 20, Charge, 1.5f);
+                Line(x + 9, 20, x + 9, 23, Charge, 1.5f);
+            }
+            Text(text, Rect(x + 26, 8, width - 26, 24), 13, ac ? Charge : TextColor, true, true);
+            break;
+        }
+        case CompactComponent::Eta: {
+            auto color = v.mode == PowerMode::Discharging ? Drain :
+                         v.mode == PowerMode::Charging ? Charge : TextColor;
+            if (v.compactEtaFromSystem) color = Alpha(color, .65f);
+            if (v.compactEtaLabel.empty())
+                Text(v.compactEtaValue, Rect(x, 8, width, 24), 13, color, true, true);
+            else value(v.compactEtaLabel.c_str(), v.compactEtaValue, color);
             break;
         }
         case CompactComponent::Power: value(v.powerLabel.c_str(), v.powerValue + L" W", Accent(v)); break;
@@ -712,8 +774,20 @@ void Renderer::CompactContent(const View& v) {
     }
 }
 void Renderer::Compact(const View& v, bool pinned, Button hover, Button pressed) {
+    const float width = target_->GetSize().width;
+    // A very large zoom can exceed a narrow monitor. Keep the mode button
+    // visible and let the ordinary wheel scroll the clipped row horizontally.
+    const bool clipped = compactWidth_ > width + .01f;
+    if (clipped) {
+        target_->PushAxisAlignedClip(Rect(0, 0, std::max(0.0f, width - 36), 40), D2D1_ANTIALIAS_MODE_ALIASED);
+        target_->SetTransform(D2D1::Matrix3x2F::Translation(-scroll_, 0));
+    }
     CompactContent(v);
-    Buttons(true, pinned, hover, pressed, compactWidth_, Ac);
+    if (clipped) {
+        target_->SetTransform(D2D1::Matrix3x2F::Identity());
+        target_->PopAxisAlignedClip();
+    }
+    Buttons(true, pinned, hover, pressed, width, Ac);
 }
 HRESULT Renderer::Paint(const View& v, bool compact, bool pinned, Button hover, Button pressed) {
     if (!CanRender()) return S_FALSE;
@@ -732,11 +806,11 @@ HRESULT Renderer::Paint(const View& v, bool compact, bool pinned, Button hover, 
     }
     return D2DERR_RECREATE_TARGET;
 }
-float Renderer::ToastHeight(const std::wstring& message) {
+float Renderer::ToastHeight(const std::wstring& message, float width) {
     auto* format = Format(12, false, false);
     ComPtr<IDWriteTextLayout> layout;
     if (!format || FAILED(write_->CreateTextLayout(message.c_str(), static_cast<UINT32>(message.size()),
-                         format, 250, 10000, layout.Put()))) return 112;
+                         format, std::max(1.0f, width - 50), 10000, layout.Put()))) return 112;
     layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     DWRITE_TEXT_METRICS metrics{};
     layout->GetMetrics(&metrics);
@@ -756,7 +830,7 @@ HRESULT Renderer::PaintToast(const NetEvent& event) {
         Rounded(Rect(14, 16, 3, size.height - 32), 1.5f, color);
         Text(event.recovered ? L"网络已恢复" : L"网络连接断开", Rect(25, 12, size.width - 48, 24), 13.5f, color, true);
         Text(event.message, Rect(25, 41, size.width - 50, size.height - 65), 12, TextColor, false, false, false, true);
-        Text(L"Pulse · 点击关闭", Rect(25, size.height - 24, size.width - 50, 16), 10, Faint, false, false, true);
+        Text(L"Pulse", Rect(25, size.height - 24, size.width - 50, 16), 10, Faint, false, false, true);
         hr = Finish();
         if (hr != D2DERR_RECREATE_TARGET) return hr;
     }

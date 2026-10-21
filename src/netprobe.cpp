@@ -108,6 +108,13 @@ const wchar_t* kDefaultUrls[] = {
 
 enum class Display { Checking, Online, Slow, Offline, Unusable };
 
+constexpr ULONGLONG kRoundTimeoutMs = 2500;
+constexpr ULONGLONG kConfirmIntervalMs = 1000;
+constexpr ULONGLONG kOfflineIntervalMs = 1500;
+constexpr ULONGLONG kNicDebounceMs = 300;
+constexpr ULONGLONG kResumeDelayMs = 3000;
+constexpr ULONGLONG kSuspendGapMs = 60000;
+
 std::int64_t ProbeClockNow() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -201,6 +208,7 @@ struct ProbeContext {
     std::atomic<bool> sent{false};
     std::atomic<bool> headers{false};
     std::atomic<bool> failed{false};
+    std::atomic<bool> timed_out{false};
     std::atomic<std::int64_t> response_tick{0};
     std::atomic<int> refs{1};
     explicit ProbeContext(std::shared_ptr<ProbeSignal> value) : signal(std::move(value)) {}
@@ -221,7 +229,7 @@ struct ProbeRequest {
     }
 };
 
-void CALLBACK ProbeCallback(HINTERNET, DWORD_PTR context, DWORD status, void*, DWORD) {
+void CALLBACK ProbeCallback(HINTERNET, DWORD_PTR context, DWORD status, void* info, DWORD info_size) {
     if (!context) return;
     diagnostics::ScopedTiming timing(L"Network callback");
     auto* probe = reinterpret_cast<ProbeContext*>(context);
@@ -236,6 +244,9 @@ void CALLBACK ProbeCallback(HINTERNET, DWORD_PTR context, DWORD status, void*, D
         SetEvent(probe->signal->event);
         break;
     case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+        if (info && info_size >= sizeof(WINHTTP_ASYNC_RESULT) &&
+            static_cast<const WINHTTP_ASYNC_RESULT*>(info)->dwError == ERROR_WINHTTP_TIMEOUT)
+            probe->timed_out.store(true, std::memory_order_relaxed);
         probe->failed.store(true, std::memory_order_release);
         SetEvent(probe->signal->event);
         break;
@@ -249,7 +260,7 @@ void CALLBACK ProbeCallback(HINTERNET, DWORD_PTR context, DWORD status, void*, D
 
 struct Config {
     int interval_s = 5;
-    int timeout_s = 4;
+    int timeout_ms = 1500;
     int fail_threshold = 3;
     int slow_ms = 500;
     int unusable_ms = 1000;
@@ -259,7 +270,9 @@ struct Config {
 Config Normalize(const Settings& settings) {
     Config config;
     config.interval_s = ClampInt(settings.probe_interval_s, 1, 86400, 5);
-    config.timeout_s = ClampInt(settings.probe_timeout_s, 1, 3600, 4);
+    // Keep the append-only Settings interface; its legacy seconds value may
+    // request 1 s, but no request is allowed to retain the old 4 s timeout.
+    config.timeout_ms = settings.probe_timeout_s == 1 ? 1000 : 1500;
     config.fail_threshold = ClampInt(settings.fail_threshold, 1, 1000000, 3);
     config.slow_ms = ClampInt(settings.slow_ms, 1, 999, 500);
     config.unusable_ms = ClampInt(settings.unusable_ms, 2, 2147483647, 1000);
@@ -283,8 +296,10 @@ struct Status {
     unsigned fail_count = 0;
     ULONGLONG first_failure_tick = 0;
     std::int64_t first_failure_unix = 0;
+    SYSTEMTIME first_failure_time{};
     bool outage_active = false;
     std::int64_t outage_unix = 0;
+    bool link_disconnected = false;
 };
 
 class CsLock {
@@ -309,6 +324,8 @@ struct NetProbe::Impl {
 
     ~Impl() {
         Stop();
+        if (wake_event_) CloseHandle(wake_event_);
+        if (network_event_) CloseHandle(network_event_);
         if (cs_ready_) {
             DeleteCriticalSection(&status_cs_);
             cs_ready_ = false;
@@ -327,7 +344,7 @@ struct NetProbe::Impl {
 
         stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         unloaded_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!stop_event_ || !unloaded_event_) {
+        if (!stop_event_ || !unloaded_event_ || !wake_event_ || !network_event_) {
             CleanupStartFailure();
             return;
         }
@@ -351,14 +368,11 @@ struct NetProbe::Impl {
         }
         unload_set_ = true;
 
-        const int full_ms = config_.timeout_s * 1000;
-        int resolve_ms = full_ms < 1000 ? full_ms : 1000;
-        int connect_ms = full_ms - resolve_ms;
-        if (connect_ms > 2000) connect_ms = 2000;
-        if (resolve_ms < 1) resolve_ms = 1;
-        if (connect_ms < 1) connect_ms = 1;
-        // Bound WinHTTP internal timeouts as well as the stage deadline below.
-        if (!WinHttpSetTimeouts(session_, resolve_ms, connect_ms, full_ms, full_ms)) {
+        const int full_ms = config_.timeout_ms;
+        // Each internal timeout is bounded too; the outer stage/round deadlines
+        // bound their sum. Do not shrink connect to 500 ms by splitting the budget:
+        // that could reject otherwise usable (<1000 ms) connections.
+        if (!WinHttpSetTimeouts(session_, full_ms, full_ms, full_ms, full_ms)) {
             AppendLog(L"\u68C0\u6D4B\u51FA\u9519\uFF1AWinHTTP \u521D\u59CB\u5316\u5931\u8D25");
             CleanupStartFailure();
             return;
@@ -411,7 +425,55 @@ struct NetProbe::Impl {
         view_ = MakeView(status_);
     }
 
+    void OnSuspend() {
+        CsLock lock(&status_cs_);
+        if (suspended_) return;
+        suspended_ = true;
+        resume_pending_ = false;
+        ++power_epoch_; // Invalidate an in-flight result before cancelling its I/O.
+        if (status_.outage_active)
+            AppendLog(L"进入睡眠，结束本次断网计时（已持续 " +
+                      FormatOutageDuration((GetTickCount64() - status_.first_failure_tick) / 1000) + L"）");
+        else
+            AppendLog(L"进入睡眠，暂停网络探测");
+        status_ = Status{};
+        view_ = MakeView(status_);
+        if (wake_event_) SetEvent(wake_event_);
+    }
+
+    void OnResume() {
+        CsLock lock(&status_cs_);
+        // Windows may send AUTOMATIC and RESUMESUSPEND for the same resume.
+        if (!suspended_ && resume_pending_) return;
+        ResetAfterResumeLocked(false);
+    }
+
+    void RequestProbe() {
+        // This handle lives until Impl destruction, including before Start and
+        // after Stop. Metrics deregisters its NIC callback before destroying us.
+        network_pending_.store(true, std::memory_order_release);
+        if (network_event_) SetEvent(network_event_);
+    }
+
 private:
+    void ResetAfterResumeLocked(bool detected_gap) {
+        if (detected_gap && status_.outage_active)
+            AppendLog(L"检测到系统挂起：进入睡眠，结束本次断网计时");
+        suspended_ = false;
+        resume_pending_ = true;
+        resume_not_before_ = GetTickCount64() + kResumeDelayMs;
+        ++power_epoch_;
+        status_ = Status{};
+        view_ = MakeView(status_);
+        AppendLog(detected_gap ? L"检测到系统挂起，3 秒后重新探测" : L"系统恢复，3 秒后重新探测");
+        if (wake_event_) SetEvent(wake_event_);
+    }
+
+    void ResumeAfterGap(std::uint64_t epoch) {
+        CsLock lock(&status_cs_);
+        if (!suspended_ && epoch == power_epoch_) ResetAfterResumeLocked(true);
+    }
+
     static DWORD WINAPI ThreadProc(LPVOID param) {
         auto* self = static_cast<Impl*>(param);
         try {
@@ -477,13 +539,18 @@ private:
         CloseHandle(file);
     }
 
+    bool Interrupted() const {
+        return network_pending_.load(std::memory_order_acquire) || Stopping() ||
+               (wake_event_ && WaitForSingleObject(wake_event_, 0) == WAIT_OBJECT_0);
+    }
+
     bool PendingOrSuccessful(BOOL result) const {
         return result || GetLastError() == ERROR_IO_PENDING;
     }
 
     bool BeginRequest(const std::wstring& url, ProbeRequest& item,
                       const std::shared_ptr<ProbeSignal>& signal) {
-        if (url.empty() || Stopping() || !session_) return false;
+        if (url.empty() || Interrupted() || !session_) return false;
         URL_COMPONENTS parts{};
         parts.dwStructSize = sizeof(parts);
         parts.dwHostNameLength = static_cast<DWORD>(-1);
@@ -516,7 +583,7 @@ private:
         if (!WinHttpSetOption(item.request, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled)) ||
             !WinHttpSetOption(item.request, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)) ||
             !WinHttpAddRequestHeaders(item.request, L"Connection: close\r\n", static_cast<DWORD>(-1),
-                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) || Stopping()) return false;
+                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE) || Interrupted()) return false;
 
         item.probe->refs.store(2, std::memory_order_relaxed);
         const DWORD callbacks = WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
@@ -531,18 +598,23 @@ private:
             WINHTTP_NO_REQUEST_DATA, 0, 0, context));
     }
 
-    // [first,last) is one stage with ONE shared timeout and stopwatch. The
-    // primary has its own stage; all backups are started before waiting.
-    bool ProbeUrls(std::size_t first, std::size_t last, ULONGLONG& elapsed) {
-        diagnostics::ScopedTiming timing(first == 0 ? L"Network primary" : L"Network backups (parallel)");
+    // Each stage has one deadline; the primary and parallel backups also share
+    // a 2.5 s round deadline. A late callback can never extend either deadline.
+    bool ProbeUrls(std::size_t first, std::size_t last, ULONGLONG& elapsed,
+                   std::int64_t round_start, bool& timed_out) {
+        diagnostics::ScopedTiming timing(last - first > 1 ? L"Network backups (parallel)" : L"Network primary");
         const std::int64_t start = ProbeClockNow();
-        const ULONGLONG budget = static_cast<ULONGLONG>(config_.timeout_s) * 1000ULL;
+        const ULONGLONG round_spent = ProbeElapsedMs(round_start, start);
+        if (round_spent >= kRoundTimeoutMs) { timed_out = true; return false; }
+        const ULONGLONG remaining = kRoundTimeoutMs - round_spent;
+        const ULONGLONG budget = remaining < static_cast<ULONGLONG>(config_.timeout_ms)
+                                   ? remaining : static_cast<ULONGLONG>(config_.timeout_ms);
         auto signal = std::make_shared<ProbeSignal>();
         if (!signal->event) return false;
         std::vector<std::unique_ptr<ProbeRequest>> requests;
         requests.reserve(last - first);
         for (std::size_t i = first; i < last; ++i) {
-            if (Stopping() || ProbeElapsedMs(start, ProbeClockNow()) >= budget) break;
+            if (Interrupted() || ProbeElapsedMs(start, ProbeClockNow()) >= budget) break;
             auto item = std::make_unique<ProbeRequest>();
             // Insert first so even an allocation exception leaves no live handle behind.
             requests.push_back(std::move(item));
@@ -550,10 +622,10 @@ private:
             if (!BeginRequest(config_.urls[i], current, signal) && current.probe)
                 current.probe->failed.store(true, std::memory_order_release);
         }
-        HANDLE events[] = {stop_event_, signal->event};
+        HANDLE events[] = {stop_event_, wake_event_, network_event_, signal->event};
         for (;;) {
             ResetEvent(signal->event); // Reset BEFORE inspecting flags: no lost wakeups.
-            if (Stopping()) return false;
+            if (Interrupted()) return false;
             std::int64_t winner = 0;
             bool pending = false;
             for (const auto& item : requests) {
@@ -573,16 +645,29 @@ private:
                             SetEvent(signal->event);
                         }
                     }
+                } else if (probe->timed_out.load(std::memory_order_relaxed)) {
+                    // failed's acquire above makes the callback's timeout flag visible.
+                    timed_out = true;
                 }
             }
             if (winner) {
                 elapsed = ProbeElapsedMs(start, winner);
-                return elapsed <= budget; // RAII immediately cancels every losing request.
+                if (elapsed > budget) { timed_out = true; return false; }
+                return true; // RAII immediately cancels every losing request.
             }
             const ULONGLONG spent = ProbeElapsedMs(start, ProbeClockNow());
-            if (!pending || spent >= budget) return false;
-            if (WaitForMultipleObjects(2, events, FALSE, static_cast<DWORD>(budget - spent)) !=
-                WAIT_OBJECT_0 + 1) return false;
+            if (!pending || spent >= budget) {
+                if (spent >= budget) timed_out = true;
+                return false;
+            }
+            const DWORD waited = WaitForMultipleObjects(4, events, FALSE, static_cast<DWORD>(budget - spent));
+            // The flag survives an auto-reset event wait. A late signal for an
+            // already consumed notification is just a wakeup, not an HTTP failure.
+            if (waited == WAIT_OBJECT_0 + 2 && !network_pending_.load(std::memory_order_acquire)) continue;
+            if (waited != WAIT_OBJECT_0 + 3) {
+                if (waited == WAIT_TIMEOUT) timed_out = true;
+                return false;
+            }
         }
     }
 
@@ -610,7 +695,57 @@ private:
         return view;
     }
 
-    void ApplyResult(bool ok, ULONGLONG ms) {
+    // Caller holds status_cs_: power transitions and event publication stay ordered.
+    void PublishEvent(const std::wstring& log, std::wstring notification, bool recovered) {
+        if (!log.empty()) AppendLog(log);
+        if (!notification.empty() && !Stopping() && cb_) {
+            NetEvent event;
+            event.recovered = recovered;
+            event.message = std::move(notification);
+            try { cb_(event, user_); } catch (...) {}
+        }
+    }
+
+    bool ApplyLinkDisconnected(std::uint64_t epoch) {
+        CsLock lock(&status_cs_);
+        if (suspended_ || resume_pending_ || epoch != power_epoch_ ||
+            network_pending_.load(std::memory_order_acquire)) return false;
+        Status& state = status_;
+        state.has_result = true;
+        state.latest_ok = false;
+        state.latest_ms = 0;
+        state.display = Display::Offline;
+        state.link_disconnected = true;
+        state.fail_count = static_cast<unsigned>(config_.fail_threshold);
+        if (state.outage_active) {
+            view_ = MakeView(state);
+            return false; // Preserve an existing outage's start and avoid duplicate cards.
+        }
+        SYSTEMTIME now{};
+        GetLocalTime(&now);
+        state.first_failure_tick = GetTickCount64();
+        state.first_failure_unix = LocalSystemTimeToUnix(now);
+        state.first_failure_time = now;
+        state.outage_active = true;
+        state.outage_unix = state.first_failure_unix;
+        view_ = MakeView(state);
+        PublishEvent(L"网络断开：网络连接已断开",
+                     LocalTimeText(now, false) + L" 起网络连接已断开", false);
+        return true;
+    }
+
+    void ApplyResult(bool ok, ULONGLONG ms, bool timed_out, std::uint64_t epoch) {
+        CsLock lock(&status_cs_);
+        if (suspended_ || epoch != power_epoch_ ||
+            network_pending_.load(std::memory_order_acquire)) return;
+        // A local proxy/TUN response cannot recover a confirmed physical outage.
+        // This query is confined to recovery attempts after physical disconnection.
+        if (ok && status_.link_disconnected && detail::AllPhysicalNicsDisconnected()) {
+            ok = false;
+            ms = 0;
+        }
+        if (network_pending_.load(std::memory_order_acquire)) return;
+        resume_pending_ = false;
         SYSTEMTIME now{};
         GetLocalTime(&now);
         const ULONGLONG tick = GetTickCount64();
@@ -618,7 +753,6 @@ private:
         std::wstring notification;
         bool recovered = false;
         {
-            CsLock lock(&status_cs_);
             Status& state = status_;
             state.has_result = true;
             state.latest_ok = ok;
@@ -638,6 +772,7 @@ private:
                 state.fail_count = 0;
                 state.first_failure_tick = 0;
                 state.first_failure_unix = 0;
+                state.link_disconnected = false;
                 state.display = ms >= static_cast<ULONGLONG>(config_.slow_ms) ? Display::Slow
                                                                                : Display::Online;
             } else {
@@ -645,56 +780,144 @@ private:
                 if (state.fail_count == 1) {
                     state.first_failure_tick = tick;
                     state.first_failure_unix = LocalSystemTimeToUnix(now);
+                    state.first_failure_time = now;
                 }
                 if (state.fail_count == static_cast<unsigned>(config_.fail_threshold)) {
                     state.outage_active = true;
                     state.outage_unix = state.first_failure_unix;
+                    notification = LocalTimeText(state.first_failure_time, false) + L" 起无法访问网络";
                     if (ok) {
-                        log = L"\u7F51\u7EDC\u65AD\u5F00\uFF1A\u5EF6\u8FDF\u8FC7\u9AD8\uFF08" + std::to_wstring(ms) +
-                              L" ms\uFF09";
-                        notification = L"\u7F51\u7EDC\u65AD\u5F00\uFF08\u5EF6\u8FDF\u8FC7\u9AD8 " + std::to_wstring(ms) +
-                                       L" ms\uFF09";
+                        log = L"网络断开：延迟过高（" + std::to_wstring(ms) + L" ms）";
+                        notification += L"（延迟 " + std::to_wstring(ms) + L" ms）";
                     } else {
-                        log = L"\u7F51\u7EDC\u65AD\u5F00\uFF1A\u65E0\u54CD\u5E94";
-                        notification = L"\u7F51\u7EDC\u65AD\u5F00\uFF08\u65E0\u54CD\u5E94\uFF09";
+                        log = timed_out ? L"网络断开：连接超时" : L"网络断开：无响应";
+                        if (timed_out) notification += L"（连接超时）";
                     }
                 }
                 if (state.fail_count >= static_cast<unsigned>(config_.fail_threshold)) {
-                    state.display = ok ? Display::Unusable : Display::Offline;
+                    state.display = ok && !state.link_disconnected ? Display::Unusable : Display::Offline;
                 } else if (ok) {
                     state.display = Display::Slow;
                 }
             }
             view_ = MakeView(state);
         }
-        if (!log.empty()) AppendLog(log);
-        if (!notification.empty() && !Stopping() && cb_) {
-            NetEvent event;
-            event.recovered = recovered;
-            event.message = std::move(notification);
-            try {
-                cb_(event, user_);
-            } catch (...) {
-            }
-        }
+        // Serialize publication with OnSuspend/OnResume: after either returns,
+        // the UI can safely drain every notification from the previous epoch.
+        PublishEvent(log, std::move(notification), recovered);
     }
 
     void Run() {
-        AppendLog(L"\u542F\u52A8\u76D1\u6D4B");
+        AppendLog(L"启动监测");
+        std::uint64_t epoch = 0;
+        ULONGLONG next_due = 0, last_start = 0, link_check_due = 0;
+        bool link_was_disconnected = false;
+        bool race_next = false;
+        const ULONGLONG normal_interval = static_cast<ULONGLONG>(config_.interval_s) * 1000ULL;
+        // Respect custom long intervals as well as the default 5 s cadence.
+        const ULONGLONG gap_limit = normal_interval * 2 > kSuspendGapMs
+            ? normal_interval * 2 : kSuspendGapMs;
+        HANDLE events[] = {stop_event_, wake_event_, network_event_};
         while (!Stopping()) {
-            const ULONGLONG start = GetTickCount64();
+            // The flag also survives NIC events consumed inside an HTTP wait.
+            const bool network_changed = network_pending_.exchange(false, std::memory_order_acq_rel);
+            bool suspended = false, resuming = false, fast = false;
+            {
+                CsLock lock(&status_cs_);
+                // Reset under the same lock as the power handlers, before
+                // taking a snapshot, so a suspend/resume wakeup cannot be lost.
+                ResetEvent(wake_event_);
+                if (epoch != power_epoch_) {
+                    epoch = power_epoch_;
+                    next_due = resume_not_before_;
+                    last_start = 0;
+                    race_next = false;
+                    link_check_due = 0;
+                    link_was_disconnected = false;
+                }
+                suspended = suspended_;
+                resuming = resume_pending_;
+                fast = status_.fail_count != 0;
+            }
+            ULONGLONG now = GetTickCount64();
+            if (!suspended && last_start && now - last_start > gap_limit) {
+                ResumeAfterGap(epoch);
+                continue;
+            }
+            if (network_changed && !suspended && !resuming) {
+                race_next = true;
+                link_was_disconnected = detail::AllPhysicalNicsDisconnected();
+                link_check_due = GetTickCount64() + kNicDebounceMs;
+                // Coalesce IPv4/IPv6 notification bursts; never start two rounds
+                // less than 1 s apart. Changes do not reset failure counts.
+                const ULONGLONG earliest = last_start && now - last_start < kConfirmIntervalMs
+                    ? last_start + kConfirmIntervalMs : now;
+                if (next_due > earliest) next_due = earliest;
+                now = GetTickCount64();
+            }
+            if (!suspended && link_check_due && now >= link_check_due) {
+                link_check_due = 0;
+                const bool disconnected = detail::AllPhysicalNicsDisconnected();
+                if (disconnected) {
+                    if (link_was_disconnected) {
+                        if (ApplyLinkDisconnected(epoch)) {
+                            // The outage is published; resume HTTP at the existing
+                            // offline cadence without three confirmations.
+                            next_due = GetTickCount64() + kOfflineIntervalMs;
+                        }
+                    } else {
+                        // Some drivers publish the IP notification before updating
+                        // media state. Confirm that newly observed loss once more.
+                        link_check_due = GetTickCount64() + kNicDebounceMs;
+                    }
+                }
+                link_was_disconnected = disconnected;
+                now = GetTickCount64();
+            }
+            if (suspended || link_check_due || now < next_due) {
+                // A one-shot debounce shares this worker's existing event wait;
+                // it does not add a timer, a thread or healthy-network polling.
+                const ULONGLONG due = link_check_due ? link_check_due : next_due;
+                const DWORD delay = suspended ? INFINITE :
+                    due > now ? static_cast<DWORD>(due - now) : 0;
+                const DWORD waited = WaitForMultipleObjects(3, events, FALSE, delay);
+                if (waited == WAIT_OBJECT_0 || waited == WAIT_FAILED) break;
+                continue;
+            }
+
+            last_start = now;
+            const std::int64_t round_start = ProbeClockNow();
             ULONGLONG ms = 0;
-            bool ok = !config_.urls.empty() && ProbeUrls(0, 1, ms);
-            if (!ok && !Stopping() && config_.urls.size() > 1)
-                ok = ProbeUrls(1, config_.urls.size(), ms);
+            bool timed_out = false;
+            // Once unavailable or after a NIC change, race all addresses within
+            // one 1.5 s deadline. Steady healthy operation still uses only the
+            // primary (and falls back only on failure), preserving its power use.
+            const bool parallel = fast || race_next;
+            race_next = false;
+            bool ok = !config_.urls.empty() &&
+                ProbeUrls(0, parallel ? config_.urls.size() : 1, ms, round_start, timed_out);
+            if (!parallel && !ok && !Interrupted() && config_.urls.size() > 1)
+                ok = ProbeUrls(1, config_.urls.size(), ms, round_start, timed_out);
             if (Stopping()) break;
-            ApplyResult(ok, ok ? ms : 0);
-            const ULONGLONG elapsed = GetTickCount64() - start;
-            const ULONGLONG interval = static_cast<ULONGLONG>(config_.interval_s) * 1000ULL;
-            const DWORD remaining = elapsed >= interval ? 0 : static_cast<DWORD>(interval - elapsed);
-            if (WaitForSingleObject(stop_event_, remaining) != WAIT_TIMEOUT) break;
+            // Includes sleep that occurred inside an async WinHTTP wait, even
+            // when WM_POWERBROADCAST was missed. Never apply that stale result.
+            if (GetTickCount64() - last_start > kSuspendGapMs) {
+                ResumeAfterGap(epoch);
+                continue;
+            }
+            if (Interrupted()) continue;
+            ApplyResult(ok, ok ? ms : 0, timed_out, epoch);
+            {
+                CsLock lock(&status_cs_);
+                const ULONGLONG interval = status_.outage_active ? kOfflineIntervalMs :
+                    status_.fail_count ? kConfirmIntervalMs :
+                    static_cast<ULONGLONG>(config_.interval_s) * 1000ULL;
+                // Cadence is measured start-to-start. If a round consumes its
+                // interval, retry immediately instead of adding another delay.
+                next_due = last_start + interval;
+            }
         }
-        AppendLog(L"\u9000\u51FA\u76D1\u6D4B");
+        AppendLog(L"退出监测");
         CloseSession();
     }
 
@@ -706,6 +929,13 @@ private:
     std::wstring log_path_;
     Metrics::EventCallback cb_ = nullptr;
     void* user_ = nullptr;
+    // Unlike stop_event_, these remain valid through Start/Stop and NIC callbacks.
+    HANDLE wake_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE network_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    std::atomic<bool> network_pending_{false};
+    bool suspended_ = false, resume_pending_ = false; // Protected by status_cs_.
+    std::uint64_t power_epoch_ = 1;
+    ULONGLONG resume_not_before_ = 0;
     HANDLE stop_event_ = nullptr;
     HANDLE unloaded_event_ = nullptr;
     HANDLE thread_ = nullptr;
@@ -728,5 +958,11 @@ std::wstring NetProbe::LogPath() const { return impl_->LogPath(); }
 NetProbe::View NetProbe::Get() const { return impl_->Get(); }
 
 void NetProbe::SetSlowThreshold(int slow_ms) { impl_->SetSlowThreshold(slow_ms); }
+
+void NetProbe::OnSuspend() { impl_->OnSuspend(); }
+
+void NetProbe::OnResume() { impl_->OnResume(); }
+
+void NetProbe::RequestProbe() { impl_->RequestProbe(); }
 
 }  // namespace pulse

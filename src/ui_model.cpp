@@ -93,7 +93,13 @@ Wants CollectionWants(const Components& c, bool compact, PowerMode mode) {
 bool View::Equals(const View& r, bool compact, const Components& c) const {
     if (compact) {
         if (c.Enabled(CompactComponent::Battery) &&
-            std::tie(battery, percent) != std::tie(r.battery, r.percent)) return false;
+            std::tie(mode, battery, percent) != std::tie(r.mode, r.battery, r.percent)) return false;
+        if (c.Enabled(CompactComponent::Eta)) {
+            if (compactEtaVisible != r.compactEtaVisible) return false;
+            if (compactEtaVisible &&
+                std::tie(mode, compactEtaLabel, compactEtaValue, compactEtaFromSystem) !=
+                std::tie(r.mode, r.compactEtaLabel, r.compactEtaValue, r.compactEtaFromSystem)) return false;
+        }
         if (c.Enabled(CompactComponent::Power) &&
             std::tie(mode, low, powerLabel, powerValue) !=
             std::tie(r.mode, r.low, r.powerLabel, r.powerValue)) return false;
@@ -143,6 +149,16 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
 }
 
 namespace {
+std::wstring CompactEtaDuration(double seconds) {
+    if (!Known(seconds)) return L"--";
+    // Compare only displayed whole minutes, never the changing raw seconds.
+    const auto minutes = static_cast<int>(std::min(seconds, 360000.0) / 60);
+    if (minutes >= 6000) return L"99+ 时";
+    if (minutes < 60) return std::to_wstring(minutes) + L" 分";
+    wchar_t buffer[32]{};
+    std::swprintf(buffer, 32, L"%d:%02d", minutes / 60, minutes % 60);
+    return buffer;
+}
 std::wstring CompactSpeed(double bps) {
     if (!Known(bps)) return L"--";
     if (bps == 0) return L"0";
@@ -167,6 +183,7 @@ void Model::BreakHistory() {
 bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
     View v;
     const bool battery = compact ? c.Enabled(CompactComponent::Battery) : c.Enabled(FullComponent::Battery);
+    const bool eta = compact && c.Enabled(CompactComponent::Eta);
     const bool power = compact && c.Enabled(CompactComponent::Power);
     const bool chart = !compact && c.Enabled(FullComponent::PowerChart);
     const bool hardware = !compact && c.Enabled(FullComponent::Hardware);
@@ -174,7 +191,7 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
     const bool latency = network || (compact && c.Enabled(CompactComponent::Latency));
     const bool discharging = s.mode == PowerMode::Discharging;
     const bool charging = s.mode == PowerMode::Charging;
-    if (battery || power || chart) v.mode = s.mode;
+    if (battery || eta || power || chart) v.mode = s.mode;
     if (battery || power) v.low = discharging && s.percent >= 0 && s.percent <= 20;
     if (battery) {
         v.battery = s.percent < 0 || s.mode == PowerMode::NoBattery ? -1 : Fraction(s.percent);
@@ -195,6 +212,16 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
                     Known(s.latency_ms) ? Number(s.latency_ms, 0) + L" ms" : L"-- ms";
     }
     if (compact) {
+        if (eta && s.mode != PowerMode::NoBattery) {
+            v.compactEtaVisible = true;
+            if (s.mode == PowerMode::AcIdle) {
+                v.compactEtaValue = s.percent >= 95 ? L"已充满" : L"未充电";
+            } else {
+                v.compactEtaLabel = charging ? L"充满" : L"续航";
+                v.compactEtaValue = discharging || charging ? CompactEtaDuration(s.eta_s) : L"--";
+                v.compactEtaFromSystem = discharging && Known(s.eta_s) && s.eta_from_system;
+            }
+        }
         if (c.Enabled(CompactComponent::Network)) {
             v.compactUp = L"↑ " + CompactSpeed(s.up_bps);
             v.compactDown = L"↓ " + CompactSpeed(s.down_bps);

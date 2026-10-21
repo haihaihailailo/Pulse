@@ -132,6 +132,10 @@ public:
     // 线程安全，立即按新阈值重算最近的可用结果；不重启探测或改变断网计数。
     void SetSlowThreshold(int slow_ms);
 
+    // System sleep is separate from SetPaused (which only pauses UI sampling).
+    void OnSuspend();
+    void OnResume();
+
 private:
     struct Impl;
     Impl* impl_;

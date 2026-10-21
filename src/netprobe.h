@@ -32,6 +32,12 @@ private:
 // Shared by recovery logs, notifications and the offline status in the UI.
 std::wstring FormatOutageDuration(std::uint64_t seconds);
 
+namespace detail {
+// Uses the throughput collector's physical-NIC filter. Query errors are unknown,
+// not proof of disconnection. Called by the probe worker, never the NIC callback.
+bool AllPhysicalNicsDisconnected();
+}
+
 class NetProbe {
 public:
     NetProbe();
@@ -53,6 +59,9 @@ public:
     View Get() const;
 
     void SetSlowThreshold(int slow_ms); // Uses the same lock as result classification.
+    void OnSuspend();
+    void OnResume();
+    void RequestProbe(); // Reuses Metrics' passive NIC notifications; no polling.
 
 private:
     struct Impl;

@@ -54,13 +54,15 @@ public:
     HRESULT Initialize();
     void SetWindow(HWND window, UINT dpi);
     void SetDpi(UINT dpi);
+    void SetZoom(int percent);
     void Resize();
     void SetComponents(const Components& components, bool compact);
+    bool SetCompactEtaVisible(bool visible);
     void SetScroll(float offset) { scroll_ = offset; }
     void DiscardTarget();
     bool CanRender() const;
     float CompactWidth() const { return compactWidth_; }
-    float ToastHeight(const std::wstring& message);
+    float ToastHeight(const std::wstring& message, float width = 300);
     Button HitTest(float x, float y, bool compact, float width) const;
     D2D1_RECT_F ButtonRect(Button button, bool compact, float width) const;
     HRESULT Paint(const View& v, bool compact, bool pinned, Button hover, Button pressed);
@@ -69,6 +71,7 @@ private:
     using FormatKey = std::tuple<int, int, bool>;
     HRESULT CreateTarget();
     HRESULT Finish();
+    float RenderDpi() const { return static_cast<float>(dpi_) * zoom_ / 100.0f; }
     IDWriteTextFormat* Format(float size, bool bold, bool numeric);
     IDWriteTextLayout* TextLayout(const std::wstring& text, float size, bool bold, bool numeric,
                                  float width, float height, bool right, bool wrap);
@@ -98,10 +101,12 @@ private:
     struct CompactCell { float width = 0, labelWidth = 0; };
     std::array<CompactCell, CompactComponents.size()> compactCells_{};
     float compactWidth_ = 51;
-    bool chartVisible_ = false;
+    bool chartVisible_ = false, compact_ = false;
+    bool compactEtaVisible_ = true;
     float scroll_ = 0;
     HWND window_ = nullptr;
     UINT dpi_ = 96;
+    int zoom_ = 100;
     ComPtr<ID2D1Factory> factory_;
     ComPtr<IDWriteFactory> write_;
     ComPtr<IDWriteTypography> tabular_;
@@ -109,6 +114,7 @@ private:
     ComPtr<ID2D1HwndRenderTarget> target_;
     ComPtr<ID2D1SolidColorBrush> brush_;
     ComPtr<ID2D1StrokeStyle> roundStroke_;
+    ComPtr<ID2D1PathGeometry> bolt_;
     std::map<FormatKey, ComPtr<IDWriteTextFormat>> formats_;
     using LayoutKey = std::tuple<std::wstring, FormatKey, float, float, bool, bool>;
     struct CachedLayout {

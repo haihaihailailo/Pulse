@@ -12,7 +12,7 @@ enum class FullComponent : std::size_t {
     SystemInfo, GpuMemory, Wifi, BatteryHealth, Count
 };
 enum class CompactComponent : std::size_t {
-    Battery, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, Count
+    Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, Count
 };
 struct ComponentInfo {
     const wchar_t* key;
@@ -35,6 +35,7 @@ inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(FullComponen
 }};
 inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(CompactComponent::Count)> CompactComponents{{
     {L"battery", L"电量 %", true, 68},
+    {L"eta", L"续航/充满", true, 0},
     {L"power", L"总功耗", true, 89},
     {L"cpu", L"CPU %", true, 64},
     {L"memory", L"内存 %", true, 64},
@@ -82,11 +83,13 @@ struct View {
     PowerMode mode = PowerMode::Unknown;
     NetState netState = NetState::Checking;
     bool low = false;
+    bool compactEtaVisible = false, compactEtaFromSystem = false;
     float battery = -1, cpu = -1, gpu = -1, memory = -1, disk = -1, wifi = -1;
     std::wstring clock, chip, scheme, percent, etaLabel, heroWord;
     std::vector<TimePart> hero;
     std::wstring wattLabel, watt, pphLabel, pph, eta20, foot;
     std::wstring totals, selfCpu, powerLabel, powerValue; // Shared by compact power and the chart.
+    std::wstring compactEtaLabel, compactEtaValue;
     std::wstring cpuValue, memoryValue, packageW, cpuW, gpuW, memW, gpuUsage;
     std::wstring latency, netHint, compactUp, compactDown, diskRead, diskWrite;
     std::wstring diskPercent, diskFree, cpuFrequency, memoryDetail, processCount, uptime;

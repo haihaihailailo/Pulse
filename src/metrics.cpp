@@ -31,6 +31,7 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <iphlpapi.h>
+#include <ipifcons.h>
 #include <netioapi.h>
 #include <winioctl.h>
 #include <setupapi.h>
@@ -84,6 +85,12 @@ constexpr unsigned long long kBatteryHealthEveryMs = 600000;
 constexpr long kRateUnknownAbs = 500000;
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr double kMiB = 1024.0 * 1024.0;
+bool IsPhysicalNic(const MIB_IF_ROW2& row) {
+    const auto& flags = row.InterfaceAndOperStatusFlags;
+    return flags.HardwareInterface && !flags.FilterInterface &&
+           row.Type != IF_TYPE_SOFTWARE_LOOPBACK && row.Type != IF_TYPE_TUNNEL;
+}
+
 constexpr unsigned kWantChip = 1u << 0;
 constexpr unsigned kWantGpu = 1u << 1;
 constexpr unsigned kWantProc = 1u << 2;
@@ -770,6 +777,27 @@ bool ReadBatteryHealth(double& health, int& cycles) {
 
 }  // namespace
 
+bool detail::AllPhysicalNicsDisconnected() {
+    PMIB_IF_TABLE2 table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || !table) return false;
+    bool disconnected = true;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        if (!IsPhysicalNic(table->Table[i])) continue;
+        MIB_IF_ROW2 row{};
+        row.InterfaceLuid = table->Table[i].InterfaceLuid;
+        // Re-read current link state, including media disconnects on an Up row.
+        // A vanished/unreadable NIC is uncertain; let HTTP confirmation handle it.
+        if (GetIfEntry2(&row) != NO_ERROR ||
+            (row.OperStatus == IfOperStatusUp &&
+             row.MediaConnectState != MediaConnectStateDisconnected)) {
+            disconnected = false;
+            break;
+        }
+    }
+    FreeMibTable(table);
+    return disconnected;
+}
+
 struct Metrics::Impl {
     Impl() {
         last_.cpu_percent = NAN; // No fabricated zero while both CPU sources warm up.
@@ -777,8 +805,8 @@ struct Metrics::Impl {
             nic_notify_ = nullptr;
     }
     ~Impl() {
-        probe.Stop();
         if (nic_notify_) CancelMibChangeNotify2(nic_notify_);
+        probe.Stop();
         CloseQueries();
     }
     Impl(const Impl&) = delete;
@@ -815,7 +843,9 @@ struct Metrics::Impl {
     bool overlay_tried_ = false;
 
     static void CALLBACK NicChanged(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
-        static_cast<Impl*>(context)->nics_dirty_.store(true, std::memory_order_relaxed);
+        auto* self = static_cast<Impl*>(context);
+        self->nics_dirty_.store(true, std::memory_order_relaxed);
+        self->probe.RequestProbe();
     }
     HANDLE nic_notify_ = nullptr;
     std::atomic<bool> nics_dirty_{true};
@@ -999,8 +1029,7 @@ bool Metrics::Impl::DiscoverNics(std::vector<ULONG>& out) const {
     out.clear();
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IF_ROW2& row = table->Table[i];
-        const auto& flags = row.InterfaceAndOperStatusFlags;
-        if (flags.HardwareInterface && !flags.FilterInterface && row.OperStatus == IfOperStatusUp) {
+        if (IsPhysicalNic(row) && row.OperStatus == IfOperStatusUp) {
             out.push_back(row.InterfaceIndex);
         }
     }
@@ -2224,5 +2253,12 @@ void Metrics::SetPaused(bool paused) {
 std::wstring Metrics::LogPath() const { return impl_->probe.LogPath(); }
 
 void Metrics::SetSlowThreshold(int slow_ms) { impl_->probe.SetSlowThreshold(slow_ms); }
+
+void Metrics::OnSuspend() { impl_->probe.OnSuspend(); }
+
+void Metrics::OnResume() {
+    impl_->reset_intervals_.store(true, std::memory_order_release);
+    impl_->probe.OnResume();
+}
 
 }  // namespace pulse

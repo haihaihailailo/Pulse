@@ -29,11 +29,14 @@ constexpr UINT ArrangeToastMessage = WM_APP + 5;
 constexpr UINT DpiFitMessage = WM_APP + 6;
 constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
+constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
 constexpr UINT CmdRefresh = 400;
 constexpr UINT CmdSlowThreshold = 450;
+constexpr UINT CmdZoom = 500;
 constexpr std::array<UINT, 3> RefreshIntervals{{500u, 1000u, 2000u}};
 constexpr std::array<int, 7> SlowThresholds{{50, 100, 150, 200, 300, 500, 800}};
+constexpr std::array<int, 6> ZoomLevels{{80, 100, 125, 150, 175, 200}};
 constexpr DWORD MainStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
 constexpr DWORD ToastStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
 
@@ -48,7 +51,9 @@ void SetSampleTimer(HWND window, bool compact, UINT fullInterval) {
         SetTimer(window, SampleTimer, interval, nullptr);
 }
 
-int Pixels(float dip, UINT dpi) { return static_cast<int>(std::ceil(dip * dpi / 96.0f)); }
+int Pixels(float dip, UINT dpi, int zoom = 100) {
+    return static_cast<int>(std::ceil(dip * dpi / 96.0f * zoom / 100.0f));
+}
 int ClampCoordinate(int value, int start, int end, int size) {
     return std::max(start, std::min(value, std::max(start, end - size)));
 }
@@ -123,7 +128,9 @@ struct Config {
     int x = INT_MIN, y = INT_MIN;
     UINT refresh_ms = 1000;
     int slow_ms = 500;
+    int zoom = 100;
     bool compact = false, pinned = true;
+    bool notify = true, notify_sound = true;
     std::wstring file;
     Components components;
     bool ReadComponent(const wchar_t* section, const ComponentInfo& info) const {
@@ -143,6 +150,12 @@ struct Config {
         y = static_cast<int>(GetPrivateProfileIntW(L"Window", L"Y", INT_MIN, file.c_str()));
         compact = GetPrivateProfileIntW(L"Window", L"Compact", 0, file.c_str()) != 0;
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
+        wchar_t zoomValue[32]{};
+        GetPrivateProfileStringW(L"Window", L"zoom", L"100", zoomValue, 32, file.c_str());
+        wchar_t* zoomEnd = nullptr;
+        const long zoomPercent = std::wcstol(zoomValue, &zoomEnd, 10);
+        zoom = zoomEnd != zoomValue && *zoomEnd == L'\0' && zoomPercent >= 80 && zoomPercent <= 200 ?
+            static_cast<int>(zoomPercent) : 100;
         const UINT interval = GetPrivateProfileIntW(L"Window", L"refresh_ms", 1000, file.c_str());
         refresh_ms = std::find(RefreshIntervals.begin(), RefreshIntervals.end(), interval) != RefreshIntervals.end() ? interval : 1000u;
         wchar_t slow[32]{};
@@ -150,6 +163,8 @@ struct Config {
         slow_ms = 500;
         for (const int threshold : SlowThresholds)
             if (std::to_wstring(threshold) == slow) slow_ms = threshold;
+        notify = GetPrivateProfileIntW(L"Network", L"notify", 1, file.c_str()) != 0;
+        notify_sound = GetPrivateProfileIntW(L"Network", L"notify_sound", 1, file.c_str()) != 0;
         for (size_t i = 0; i < FullComponents.size(); ++i)
             components.full[i] = ReadComponent(L"Full", FullComponents[i]);
         for (size_t i = 0; i < CompactComponents.size(); ++i)
@@ -163,10 +178,14 @@ struct Config {
         WritePrivateProfileStringW(L"Window", L"Y", sy.c_str(), file.c_str());
         WritePrivateProfileStringW(L"Window", L"Compact", compact ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
+        const auto zoomValue = std::to_wstring(zoom);
+        WritePrivateProfileStringW(L"Window", L"zoom", zoomValue.c_str(), file.c_str());
         const auto interval = std::to_wstring(refresh_ms);
         WritePrivateProfileStringW(L"Window", L"refresh_ms", interval.c_str(), file.c_str());
         const auto slow = std::to_wstring(slow_ms);
         WritePrivateProfileStringW(L"Network", L"slow_ms", slow.c_str(), file.c_str());
+        WritePrivateProfileStringW(L"Network", L"notify", notify ? L"1" : L"0", file.c_str());
+        WritePrivateProfileStringW(L"Network", L"notify_sound", notify_sound ? L"1" : L"0", file.c_str());
         for (size_t i = 0; i < FullComponents.size(); ++i)
             WritePrivateProfileStringW(L"Full", FullComponents[i].key, components.full[i] ? L"1" : L"0", file.c_str());
         for (size_t i = 0; i < CompactComponents.size(); ++i)
@@ -178,22 +197,45 @@ class Toast {
 public:
     explicit Toast(NetEvent event, HWND notify) : event_(std::move(event)), notify_(notify) {}
     ~Toast() { if (window_) DestroyWindow(window_); }
-    bool Open(HINSTANCE instance, UINT dpi) {
+    bool Open(HINSTANCE instance, UINT dpi, int zoom) {
         if (FAILED(renderer_.Initialize())) return false;
         dpi_ = dpi;
+        zoom_ = zoom;
+        renderer_.SetZoom(zoom_);
         height_ = renderer_.ToastHeight(event_.message);
-        window_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            ToastClass, L"Pulse · 网络提醒", ToastStyle, 0, 0, Pixels(300, dpi_), Pixels(height_, dpi_),
+        window_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+            ToastClass, L"Pulse · 网络提醒", ToastStyle, 0, 0, Width(dpi_), Height(dpi_),
             nullptr, nullptr, instance, this);
         return window_ != nullptr;
     }
     HWND Window() const { return window_; }
-    int Width(UINT dpi) const { return Pixels(300, dpi); }
-    int Height(UINT dpi) const { return Pixels(height_, dpi); }
+    int Width(UINT dpi) const { return Pixels(width_, dpi, zoom_); }
+    int Height(UINT dpi) const { return Pixels(height_, dpi, zoom_); }
+    void SetScale(UINT dpi, int zoom, int maxWidth) {
+        const float scale = dpi / 96.0f * zoom / 100.0f;
+        const float width = std::min(300.0f, std::max(1.0f, maxWidth / scale));
+        if (dpi_ == dpi && zoom_ == zoom && width_ == width) return;
+        dpi_ = dpi;
+        zoom_ = zoom;
+        renderer_.SetDpi(dpi_);
+        renderer_.SetZoom(zoom_);
+        width_ = width;
+        height_ = renderer_.ToastHeight(event_.message, width_);
+        if (window_) InvalidateRect(window_, nullptr, FALSE);
+    }
     void Place(int x, int y, int height, UINT dpi) {
         dpi_ = dpi;
         renderer_.SetDpi(dpi);
         SetWindowPos(window_, HWND_TOPMOST, x, y, Width(dpi), height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!shown_) {
+            shown_ = true;
+            ArmExpiry(8000);
+        }
+        if (CursorInside()) PauseExpiry();
+        else if (hovered_) {
+            hovered_ = false;
+            ArmExpiry(3000); // Arrangement/DPI changes may move the card away.
+        }
     }
     static LRESULT CALLBACK Procedure(HWND window, UINT message, WPARAM w, LPARAM l) {
         auto* self = reinterpret_cast<Toast*>(GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -209,6 +251,7 @@ public:
             self->dpi_ = WindowDpi(window);
             self->renderer_.SetWindow(window, self->dpi_);
             StyleWindow(window);
+            SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
             return 0;
         case WM_NCCALCSIZE: return 0;
         case WM_NCHITTEST: return HTCLIENT;
@@ -230,9 +273,23 @@ public:
             PostMessageW(self->notify_, ArrangeToastMessage, 0, 0);
             return 0;
         }
+        case WM_MOUSEMOVE:
+            self->PauseExpiry();
+            return 0;
+        case WM_MOUSELEAVE:
+            if (self->hovered_) {
+                self->hovered_ = false;
+                self->ArmExpiry(3000);
+            }
+            return 0;
+        case WM_TIMER:
+            self->OnTimer(w);
+            return 0;
         case WM_DWMCOMPOSITIONCHANGED: StyleWindow(window); return 0;
         case WM_LBUTTONUP: case WM_CLOSE: DestroyWindow(window); return 0;
         case WM_NCDESTROY:
+            KillTimer(window, ExpireTimer);
+            KillTimer(window, FadeTimer);
             SetWindowLongPtrW(window, GWLP_USERDATA, 0);
             self->window_ = nullptr;
             self->renderer_.DiscardTarget();
@@ -248,11 +305,69 @@ public:
         }
     }
 private:
+    static constexpr UINT_PTR ExpireTimer = 1, FadeTimer = 2;
+    static constexpr ULONGLONG FadeDurationMs = 240;
+
+    bool CursorInside() const {
+        POINT cursor{};
+        RECT rect{};
+        return GetCursorPos(&cursor) && GetWindowRect(window_, &rect) &&
+            PtInRect(&rect, cursor) && WindowFromPoint(cursor) == window_;
+    }
+    void ArmExpiry(UINT delay) {
+        KillTimer(window_, ExpireTimer);
+        KillTimer(window_, FadeTimer);
+        fading_ = false;
+        SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA);
+        expires_at_ = GetTickCount64() + delay;
+        if (!SetTimer(window_, ExpireTimer, delay, nullptr)) DestroyWindow(window_);
+    }
+    void PauseExpiry() {
+        if (hovered_) return;
+        hovered_ = true;
+        KillTimer(window_, ExpireTimer);
+        KillTimer(window_, FadeTimer);
+        fading_ = false;
+        SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA);
+        TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window_, 0};
+        TrackMouseEvent(&track);
+    }
+    void OnTimer(UINT_PTR timer) {
+        if (timer != ExpireTimer && timer != FadeTimer) return;
+        // Check the actual cursor too: a card may appear under a stationary
+        // pointer, or a queued WM_TIMER may arrive before WM_MOUSEMOVE.
+        if (CursorInside()) { PauseExpiry(); return; }
+        if (hovered_) return;
+        const ULONGLONG now = GetTickCount64();
+        if (timer == ExpireTimer) {
+            KillTimer(window_, ExpireTimer); // Idle cards use one deadline, no polling.
+            if (now < expires_at_) {
+                SetTimer(window_, ExpireTimer, static_cast<UINT>(expires_at_ - now), nullptr);
+                return;
+            }
+            fading_ = true;
+            fade_started_ = now;
+            if (!SetTimer(window_, FadeTimer, 30, nullptr)) DestroyWindow(window_);
+            return;
+        }
+        if (!fading_) return; // Ignore a queued timer cancelled by a hover.
+        const ULONGLONG elapsed = now - fade_started_;
+        if (elapsed >= FadeDurationMs) {
+            DestroyWindow(window_);
+            return;
+        }
+        const BYTE alpha = static_cast<BYTE>(255 * (FadeDurationMs - elapsed) / FadeDurationMs);
+        if (!SetLayeredWindowAttributes(window_, 0, alpha, LWA_ALPHA)) DestroyWindow(window_);
+    }
+
     NetEvent event_;
     HWND window_ = nullptr, notify_ = nullptr;
     Renderer renderer_;
     UINT dpi_ = 96;
-    float height_ = 96;
+    int zoom_ = 100;
+    float width_ = 300, height_ = 96;
+    bool shown_ = false, hovered_ = false, fading_ = false;
+    ULONGLONG expires_at_ = 0, fade_started_ = 0;
 };
 
 class Application {
@@ -271,6 +386,7 @@ public:
     }
     int Execute(int showCommand) {
         config_.Load();
+        notificationState_.store(config_.notify ? 1u : 0u, std::memory_order_release);
         if (FAILED(renderer_.Initialize())) {
             MessageBoxW(nullptr, L"无法初始化 Direct2D / DirectWrite。", L"Pulse", MB_OK | MB_ICONERROR);
             return 1;
@@ -297,14 +413,15 @@ public:
         const auto monitor = MonitorFromPoint(initial, config_.x == INT_MIN ? MONITOR_DEFAULTTOPRIMARY : MONITOR_DEFAULTTONEAREST);
         const RECT work = WorkArea(monitor);
         dpi_ = MonitorDpi(monitor);
+        renderer_.SetZoom(config_.zoom);
         renderer_.SetComponents(config_.components, config_.compact);
         model_.Update(Snapshot{}, config_.compact, config_.components);
-        const int width = Pixels(ContentWidth(), dpi_);
-        const int height = config_.compact ? Pixels(ContentHeight(), dpi_) :
-            std::min(Pixels(ContentHeight(), dpi_), std::max(1, static_cast<int>(work.bottom - work.top)));
+        renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
+        const auto size = FittedSize(work);
+        const int width = static_cast<int>(size.cx), height = static_cast<int>(size.cy);
         if (config_.x == INT_MIN || config_.y == INT_MIN) {
-            config_.x = work.right - width - Pixels(24, dpi_);
-            config_.y = work.top + Pixels(24, dpi_);
+            config_.x = work.right - width - Pixels(24, dpi_, config_.zoom);
+            config_.y = work.top + Pixels(24, dpi_, config_.zoom);
         }
         config_.x = ClampCoordinate(config_.x, work.left, work.right, width);
         config_.y = ClampCoordinate(config_.y, work.top, work.bottom, height);
@@ -354,22 +471,29 @@ public:
 private:
     static void NetworkEvent(const NetEvent& event, void* user) noexcept {
         auto* app = static_cast<Application*>(user);
+        const UINT_PTR notificationState = app->notificationState_.load(std::memory_order_acquire);
+        if (!(notificationState & 1u)) return;
         const HWND window = app->callbackWindow_.load(std::memory_order_acquire);
         if (!window) return;
         try {
             auto copy = std::make_unique<NetEvent>(event);
-            if (PostMessageW(window, NetMessage, 0, reinterpret_cast<LPARAM>(copy.get()))) copy.release();
+            if (PostMessageW(window, NetMessage, notificationState, reinterpret_cast<LPARAM>(copy.get()))) copy.release();
         } catch (...) {}
     }
     float ContentWidth() const { return config_.compact ? renderer_.CompactWidth() : 320; }
     float ContentHeight() const { return config_.compact ? 40 : FullLayout(config_.components).height; }
+    float Scale() const { return dpi_ / 96.0f * config_.zoom / 100.0f; }
+    SIZE FittedSize(const RECT& work) const {
+        return {std::min(Pixels(ContentWidth(), dpi_, config_.zoom), std::max(1, static_cast<int>(work.right - work.left))),
+                std::min(Pixels(ContentHeight(), dpi_, config_.zoom), std::max(1, static_cast<int>(work.bottom - work.top)))};
+    }
     float CurrentWidth() const {
         RECT r{};
         GetClientRect(window_, &r);
-        return static_cast<float>(r.right) * 96 / dpi_;
+        return r.right / Scale();
     }
     Button Hit(LPARAM l) const {
-        return renderer_.HitTest(GET_X_LPARAM(l) * 96.0f / dpi_, GET_Y_LPARAM(l) * 96.0f / dpi_, config_.compact, CurrentWidth());
+        return renderer_.HitTest(GET_X_LPARAM(l) / Scale(), GET_Y_LPARAM(l) / Scale(), config_.compact, CurrentWidth());
     }
     void CapturePosition() {
         if (!window_ || IsIconic(window_)) return;
@@ -377,18 +501,38 @@ private:
         if (GetWindowRect(window_, &r)) { config_.x = r.left; config_.y = r.top; }
     }
     void Save() { CapturePosition(); config_.Save(); }
-    void Fit(bool anchor, const RECT* suggestion = nullptr) {
-        if (!window_ || fitting_ || IsIconic(window_)) return;
+    void Fit(bool anchor, const RECT* suggestion = nullptr, bool topRight = false) {
+        if (!window_ || fitting_) return;
+        if (IsIconic(window_)) {
+            if (topRight && !zoomFitPending_) {
+                WINDOWPLACEMENT placement{};
+                placement.length = sizeof(placement);
+                if (GetWindowPlacement(window_, &placement)) {
+                    zoomAnchor_ = placement.rcNormalPosition;
+                    // Main windows use workspace coordinates in WINDOWPLACEMENT.
+                    const auto monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+                    MONITORINFO info{};
+                    info.cbSize = sizeof(info);
+                    if (GetMonitorInfoW(monitor, &info))
+                        OffsetRect(&zoomAnchor_, info.rcWork.left - info.rcMonitor.left,
+                                   info.rcWork.top - info.rcMonitor.top);
+                    zoomFitPending_ = true;
+                }
+            }
+            return;
+        }
+        topRight = topRight || zoomFitPending_;
         RECT old{};
         GetWindowRect(window_, &old);
-        RECT base = suggestion ? *suggestion : old;
+        RECT base = zoomFitPending_ ? zoomAnchor_ : suggestion ? *suggestion : old;
+        zoomFitPending_ = false;
         const auto monitor = MonitorFromRect(&base, MONITOR_DEFAULTTONEAREST);
         const RECT work = WorkArea(monitor);
-        const int width = Pixels(ContentWidth(), dpi_);
-        const int height = config_.compact ? Pixels(ContentHeight(), dpi_) :
-            std::min(Pixels(ContentHeight(), dpi_), std::max(1, static_cast<int>(work.bottom - work.top)));
+        const auto size = FittedSize(work);
+        const int width = static_cast<int>(size.cx), height = static_cast<int>(size.cy);
         int x = base.left, y = base.top;
-        if (anchor && !suggestion) {
+        if (topRight) x = base.right - width;
+        else if (anchor && !suggestion) {
             MONITORINFO info{};
             info.cbSize = sizeof(info);
             const RECT screen = GetMonitorInfoW(monitor, &info) ? info.rcMonitor : work;
@@ -397,7 +541,7 @@ private:
         }
         x = ClampCoordinate(x, work.left, work.right, width);
         y = ClampCoordinate(y, work.top, work.bottom, height);
-        ClampScroll(height * 96.0f / dpi_);
+        ClampScroll((config_.compact ? width : height) / Scale());
         if (old.left == x && old.top == y && old.right - old.left == width && old.bottom - old.top == height) return;
         fitting_ = true;
         SetWindowPos(window_, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -408,9 +552,10 @@ private:
         if (viewport <= 0) {
             RECT client{};
             GetClientRect(window_, &client);
-            viewport = client.bottom * 96.0f / dpi_;
+            viewport = (config_.compact ? client.right : client.bottom) / Scale();
         }
-        scroll_ = config_.compact ? 0 : std::clamp(scroll_, 0.0f, std::max(0.0f, ContentHeight() - viewport));
+        const float extent = config_.compact ? ContentWidth() : ContentHeight();
+        scroll_ = std::clamp(scroll_, 0.0f, std::max(0.0f, extent - viewport));
         renderer_.SetScroll(scroll_);
     }
     Snapshot ReadMetrics() {
@@ -425,6 +570,7 @@ private:
         if (!running_ || !active_ || !metrics_) return;
         const auto sample = ReadMetrics();
         if (model_.Update(sample, config_.compact, config_.components) || renderLost_) repaintPending_ = true;
+        if (renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible)) Fit(true);
         // Keep sampling while covered, then draw the newest view when exposed.
         // Checking once per sample also recovers if no exposure WM_PAINT arrives.
         if (repaintPending_ && renderer_.CanRender()) {
@@ -433,7 +579,7 @@ private:
     }
     void Sampling(bool sampleNow, bool resetTimer = false) {
         if (!running_ || !metrics_) return;
-        const bool active = IsWindowVisible(window_) && !IsIconic(window_);
+        const bool active = !systemSuspended_ && IsWindowVisible(window_) && !IsIconic(window_);
         const bool changed = active_ != active;
         if (changed || resetTimer || !active) KillTimer(window_, SampleTimer);
         metrics_->SetPaused(!active);
@@ -453,6 +599,7 @@ private:
         if (resetHistory) model_.BreakHistory();
         const Snapshot sample = metrics_ ? ReadMetrics() : Snapshot{};
         model_.Update(sample, config_.compact, config_.components);
+        renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
         repaintPending_ = true;
         Fit(true);
         Sampling(false, true);
@@ -463,6 +610,20 @@ private:
         if (config_.compact == compact) return;
         config_.compact = compact;
         Reconfigure(true);
+    }
+    void SetZoom(int percent) {
+        percent = std::clamp(percent, 80, 200);
+        if (config_.zoom == percent) return;
+        config_.zoom = percent;
+        renderer_.SetZoom(percent);
+        hover_ = pressed_ = Button::None;
+        dragging_ = dragCandidate_ = false;
+        if (GetCapture() == window_) ReleaseCapture();
+        repaintPending_ = true;
+        Fit(false, nullptr, true); // Preserve the right/top edges, then clamp to this monitor.
+        ArrangeToasts();
+        Save();
+        if (!IsIconic(window_)) InvalidateRect(window_, nullptr, FALSE);
     }
     void TogglePin() {
         config_.pinned = !config_.pinned;
@@ -562,6 +723,21 @@ private:
         if (!menu) return;
         AppendMenuW(menu, MF_STRING | (!config_.compact ? MF_CHECKED : 0), CmdFull, L"完整模式");
         AppendMenuW(menu, MF_STRING | (config_.compact ? MF_CHECKED : 0), CmdCompact, L"迷你模式");
+        HMENU zoom = CreatePopupMenu();
+        if (zoom) {
+            for (size_t i = 0; i < ZoomLevels.size(); ++i) {
+                auto label = std::to_wstring(ZoomLevels[i]) + L"%";
+                if (ZoomLevels[i] == 100) label += L"（默认）";
+                AppendMenuW(zoom, MF_STRING, CmdZoom + static_cast<UINT>(i), label.c_str());
+            }
+            const auto selected = std::find(ZoomLevels.begin(), ZoomLevels.end(), config_.zoom);
+            if (selected != ZoomLevels.end())
+                CheckMenuRadioItem(zoom, CmdZoom, CmdZoom + static_cast<UINT>(ZoomLevels.size()) - 1,
+                                   CmdZoom + static_cast<UINT>(selected - ZoomLevels.begin()), MF_BYCOMMAND);
+            const auto label = selected == ZoomLevels.end() ?
+                L"界面大小（自定义 " + std::to_wstring(config_.zoom) + L"%）" : std::wstring(L"界面大小");
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(zoom), label.c_str());
+        }
         HMENU refresh = CreatePopupMenu();
         if (refresh) {
             const wchar_t* labels[] = {L"0.5 秒", L"1 秒（默认）", L"2 秒"};
@@ -586,6 +762,9 @@ private:
                               selected, MF_BYCOMMAND);
             AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(slow), L"延迟较慢阈值");
         }
+        AppendMenuW(menu, MF_STRING | (config_.notify ? MF_CHECKED : 0), CmdNetworkNotify, L"断网提醒");
+        AppendMenuW(menu, MF_STRING | (config_.notify_sound ? MF_CHECKED : 0) |
+                    (config_.notify ? 0 : MF_GRAYED), CmdNotifySound, L"提醒提示音");
         HMENU contents = CreatePopupMenu();
         HMENU full = CreatePopupMenu();
         HMENU compact = CreatePopupMenu();
@@ -620,6 +799,11 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (command >= CmdZoom && command < CmdZoom + static_cast<UINT>(ZoomLevels.size())) {
+            zoomWheelDelta_ = 0;
+            SetZoom(ZoomLevels[command - CmdZoom]);
+            return;
+        }
         if (command >= CmdSlowThreshold && command < CmdSlowThreshold + static_cast<UINT>(SlowThresholds.size())) {
             config_.slow_ms = SlowThresholds[command - CmdSlowThreshold];
             if (metrics_) metrics_->SetSlowThreshold(config_.slow_ms);
@@ -646,6 +830,20 @@ private:
             return;
         }
         switch (command) {
+        case CmdNetworkNotify:
+            config_.notify = !config_.notify;
+            notificationState_.fetch_add(1u, std::memory_order_acq_rel);
+            ClearNetworkNotifications(); // Dismiss cards and discard queued events on either toggle.
+            if (!config_.notify) PlaySoundW(nullptr, nullptr, 0);
+            Save();
+            break;
+        case CmdNotifySound:
+            if (config_.notify) {
+                config_.notify_sound = !config_.notify_sound;
+                if (!config_.notify_sound) PlaySoundW(nullptr, nullptr, 0);
+                Save();
+            }
+            break;
         case CmdDefaults: config_.components.Reset(); Reconfigure(true); break;
         case CmdFull: SetCompact(false); break;
         case CmdCompact: SetCompact(true); break;
@@ -668,11 +866,12 @@ private:
         const auto monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
         const RECT work = WorkArea(monitor);
         const UINT dpi = MonitorDpi(monitor);
-        const int margin = Pixels(16, dpi), gap = Pixels(10, dpi);
+        const int margin = Pixels(16, dpi, config_.zoom), gap = Pixels(10, dpi, config_.zoom);
         int bottom = work.bottom - margin, column = 0;
         for (auto i = toasts_.rbegin(); i != toasts_.rend(); ++i) {
             auto& toast = *i;
             if (!toast->Window()) continue;
+            toast->SetScale(dpi, config_.zoom, std::max(1, static_cast<int>(work.right - work.left) - 2 * margin));
             const int width = toast->Width(dpi);
             const int availableHeight = static_cast<int>(work.bottom - work.top) - 2 * margin;
             const int height = std::min(toast->Height(dpi), std::max(1, availableHeight));
@@ -687,13 +886,21 @@ private:
         }
     }
     void Notify(const NetEvent& event) {
-        PlaySoundW(L"C:\\Windows\\Media\\Windows Notify System Generic.wav", nullptr,
-                   SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+        if (!config_.notify) return;
+        if (config_.notify_sound)
+            PlaySoundW(L"C:\\Windows\\Media\\Windows Notify System Generic.wav", nullptr,
+                       SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
         auto toast = std::make_unique<Toast>(event, window_);
-        if (toast->Open(instance_, dpi_)) {
+        if (toast->Open(instance_, dpi_, config_.zoom)) {
             toasts_.push_back(std::move(toast));
             ArrangeToasts();
         }
+    }
+    void ClearNetworkNotifications() {
+        MSG message{};
+        while (PeekMessageW(&message, window_, NetMessage, NetMessage, PM_REMOVE))
+            delete reinterpret_cast<NetEvent*>(message.lParam);
+        toasts_.clear();
     }
     void Shutdown() {
         if (stopping_) return;
@@ -704,10 +911,7 @@ private:
         callbackWindow_.store(nullptr, std::memory_order_release);
         if (metrics_) metrics_->SetPaused(true);
         metrics_.reset(); // Joins callbacks while HWND and Application are still alive.
-        MSG message{};
-        while (PeekMessageW(&message, window_, NetMessage, NetMessage, PM_REMOVE))
-            delete reinterpret_cast<NetEvent*>(message.lParam);
-        toasts_.clear();
+        ClearNetworkNotifications();
         RemoveTray();
         PostQuitMessage(0);
     }
@@ -742,12 +946,30 @@ private:
         case WM_GETMINMAXINFO: {
             auto* limits = reinterpret_cast<MINMAXINFO*>(l);
             const RECT work = WorkArea(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST));
-            const int height = config_.compact ? Pixels(ContentHeight(), dpi_) :
-                std::min(Pixels(ContentHeight(), dpi_), std::max(1, static_cast<int>(work.bottom - work.top)));
-            limits->ptMinTrackSize = {Pixels(ContentWidth(), dpi_), height};
+            const auto size = FittedSize(work);
+            limits->ptMinTrackSize = {size.cx, size.cy};
             limits->ptMaxTrackSize = limits->ptMinTrackSize;
             return 0;
         }
+        case WM_POWERBROADCAST:
+            if (w == PBT_APMSUSPEND) {
+                systemSuspended_ = true;
+                if (metrics_) metrics_->OnSuspend();
+                // Publication is serialized with OnSuspend, so this also removes
+                // notifications queued immediately before the power broadcast.
+                ClearNetworkNotifications();
+                Sampling(false);
+                return TRUE;
+            }
+            if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
+                if (metrics_) metrics_->OnResume();
+                ClearNetworkNotifications();
+                systemSuspended_ = false;
+                model_.BreakHistory();
+                Sampling(true, true); // Show Checking; HTTP remains delayed by 3 s.
+                return TRUE;
+            }
+            break;
         case WM_SHOWWINDOW: Sampling(w != 0); break;
         case WM_TIMER: if (w == SampleTimer) Refresh(); return 0;
         case WM_DPICHANGED: {
@@ -760,6 +982,7 @@ private:
                     PostMessageW(window_, DpiFitMessage, 0, 0);
                 }
             } else Fit(false, reinterpret_cast<RECT*>(l));
+            ArrangeToasts();
             Save();
             if (!IsIconic(window_)) InvalidateRect(window_, nullptr, FALSE);
             return 0;
@@ -778,12 +1001,23 @@ private:
             if ((w & 0xfff0) == SC_MAXIMIZE || (w & 0xfff0) == SC_SIZE) return 0;
             break;
         case WM_MOUSEWHEEL: {
-            if (!config_.compact) {
-                const float previous = scroll_;
-                scroll_ -= static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA * 66;
-                ClampScroll();
-                if (scroll_ != previous) InvalidateRect(window_, nullptr, FALSE);
+            POINT cursor{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ScreenToClient(window_, &cursor);
+            RECT client{};
+            GetClientRect(window_, &client);
+            if (!PtInRect(&client, cursor)) { zoomWheelDelta_ = 0; return 0; }
+            if (GET_KEYSTATE_WPARAM(w) & MK_CONTROL) {
+                zoomWheelDelta_ += GET_WHEEL_DELTA_WPARAM(w);
+                const int steps = zoomWheelDelta_ / WHEEL_DELTA;
+                zoomWheelDelta_ %= WHEEL_DELTA;
+                if (steps) SetZoom(config_.zoom + steps * 10);
+                return 0;
             }
+            zoomWheelDelta_ = 0;
+            const float previous = scroll_;
+            scroll_ -= static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA * 66;
+            ClampScroll();
+            if (scroll_ != previous) InvalidateRect(window_, nullptr, FALSE);
             return 0;
         }
         case WM_LBUTTONDOWN: {
@@ -831,6 +1065,7 @@ private:
             if (Hit(l) == Button::None) SetCompact(!config_.compact);
             return 0;
         case WM_MOUSELEAVE:
+            zoomWheelDelta_ = 0;
             if (hover_ != Button::None) { hover_ = Button::None; InvalidateRect(window_, nullptr, FALSE); }
             return 0;
         case WM_CAPTURECHANGED:
@@ -847,7 +1082,7 @@ private:
                 POINT p{};
                 GetCursorPos(&p);
                 ScreenToClient(window_, &p);
-                const auto button = renderer_.HitTest(p.x * 96.0f / dpi_, p.y * 96.0f / dpi_, config_.compact, CurrentWidth());
+                const auto button = renderer_.HitTest(p.x / Scale(), p.y / Scale(), config_.compact, CurrentWidth());
                 SetCursor(LoadCursorW(nullptr, button == Button::None ? IDC_ARROW : IDC_HAND));
                 return TRUE;
             }
@@ -870,7 +1105,8 @@ private:
             return 0;
         case NetMessage: {
             std::unique_ptr<NetEvent> event(reinterpret_cast<NetEvent*>(l));
-            if (event && !stopping_) Notify(*event);
+            if (event && !stopping_ && !systemSuspended_ &&
+                w == notificationState_.load(std::memory_order_acquire)) Notify(*event);
             return 0;
         }
         case ShowMessage: Show(); return 0;
@@ -903,6 +1139,9 @@ private:
     HWND window_ = nullptr;
     HICON icon_ = nullptr, smallIcon_ = nullptr;
     std::atomic<HWND> callbackWindow_{nullptr};
+    // Low bit enables reminders; every toggle advances the value so an old
+    // callback cannot replay its card after reminders have been re-enabled.
+    std::atomic<UINT_PTR> notificationState_{1};
     Renderer renderer_;
     Model model_;
     Config config_;
@@ -911,13 +1150,17 @@ private:
     UINT dpi_ = 96, taskbarCreated_ = 0;
     PowerMode powerMode_ = PowerMode::Unknown;
     bool active_ = false, running_ = false, stopping_ = false, fitting_ = false, dpiFitPending_ = false;
+    bool zoomFitPending_ = false;
+    bool systemSuspended_ = false;
     bool tray_ = false, trayVersion4_ = false;
     bool registeredMain_ = false, registeredToast_ = false, renderLost_ = false;
     float scroll_ = 0;
+    int zoomWheelDelta_ = 0;
     bool repaintPending_ = true;
     bool dragCandidate_ = false, dragging_ = false;
     POINT dragOrigin_{};
     RECT dragRect_{};
+    RECT zoomAnchor_{};
     Button hover_ = Button::None, pressed_ = Button::None;
 };
 
