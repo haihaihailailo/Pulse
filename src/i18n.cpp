@@ -205,8 +205,8 @@ const Entry strings[] = {
     {L"帧数", L"FPS"}, {L"读", L"Rd"}, {L"写", L"Wr"},
     {L"任务栏位置", L"Taskbar position"},
     {L"自动", L"Automatic"},
-    {L"通知区左侧", L"Left of notification area"},
-    {L"开始按钮左侧", L"Left of Start button"},
+    {L"右侧", L"Right"},
+    {L"左侧", L"Left"},
     {L"充满", L"Full"}, // TaskbarFull
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");

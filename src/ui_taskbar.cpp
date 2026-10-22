@@ -72,6 +72,8 @@ struct TaskbarStrip::Impl {
     bool widgets = true, centered = true, reserved = false, registered = false, resizePending = false;
     bool reserveAgain = false, themeRead = false;
     TaskbarPosition position = TaskbarPosition::Auto;
+    // Auto is the uninitialized state; afterwards remember Left or Right.
+    TaskbarPosition autoSide = TaskbarPosition::Auto;
     int widgetsWidth = 120;
     std::vector<DWORD> loggedErrors;
     HWND restoredTasks = nullptr;
@@ -379,6 +381,8 @@ struct TaskbarStrip::Impl {
         if (nextDpi != dpi) { dpi = nextDpi; layoutDirty = true; }
         if (layoutHeight != client.bottom) layoutDirty = true;
         if (layoutDirty && !Layout(static_cast<int>(client.bottom))) return false;
+        const int clientWidth = static_cast<int>(client.right);
+        if (width > clientWidth) return Failure(L"TaskbarSpace", ERROR_INSUFFICIENT_BUFFER);
         int x = 0;
         if (classic) {
             if (!IsWindow(tasks) || !IsWindow(bar)) return Failure(L"TaskButtonsWindow", ERROR_INVALID_WINDOW_HANDLE);
@@ -416,7 +420,8 @@ struct TaskbarStrip::Impl {
             if (widgets && !centered) right -= static_cast<int>(std::ceil(160 * dpi / 96.0f));
             const int rightX = right - width - 2;
             x = rightX;
-            if (centered) {
+            // A fixed Left position follows Start regardless of taskbar alignment.
+            if (centered || position == TaskbarPosition::Left) {
                 const HWND start = FindWindowExW(shell, nullptr, L"Start", nullptr);
                 RECT button{};
                 if (start && GetWindowRect(start, &button)) {
@@ -424,7 +429,6 @@ struct TaskbarStrip::Impl {
                     // nonzero/negative desktop origin. Win11's task-list/rebar
                     // rectangles do not describe the actual centered icons.
                     MapWindowPoints(nullptr, shell, reinterpret_cast<POINT*>(&button), 2);
-                    const int clientWidth = static_cast<int>(client.right - client.left);
                     const int startLeft = static_cast<int>(button.left);
                     if (startLeft >= 0 && button.right > button.left && button.right <= clientWidth) {
                         const int gap = static_cast<int>(std::ceil(4 * dpi / 96.0f));
@@ -434,16 +438,27 @@ struct TaskbarStrip::Impl {
                         const bool rightFits = rightX >= iconsRight + gap && rightX + width <= clientWidth;
                         const bool leftFits = leftX >= leftLimit && leftX + width <= clientWidth;
                         if (position == TaskbarPosition::Left) {
-                            if (leftFits) x = leftX;
-                            else if (rightFits) x = rightX;
-                        } else if (!rightFits && leftFits) x = leftX;
-                        // If neither fits (or Start is unavailable), retain the
-                        // notification-side position, accepting icon overlap.
+                            // Widgets reserve is only an estimate, not a limit
+                            // for a fixed side or Auto's no-space fallback.
+                            x = leftX;
+                        } else if (position == TaskbarPosition::Auto) {
+                            const auto previousSide = autoSide;
+                            if (autoSide == TaskbarPosition::Auto) {
+                                autoSide = !rightFits && leftFits ? TaskbarPosition::Left : TaskbarPosition::Right;
+                            } else if (autoSide == TaskbarPosition::Left) {
+                                if (!leftFits && rightFits) autoSide = TaskbarPosition::Right;
+                            } else if (!rightFits && leftFits) autoSide = TaskbarPosition::Left;
+                            // Switch only when the other side fits and this one
+                            // does not. If neither fits, keep the current side.
+                            x = autoSide == TaskbarPosition::Left ? leftX : rightX;
+                            if (autoSide != previousSide) dirty = true;
+                        }
                     }
                 }
+                // If Start is unavailable, x stays beside the notification area.
             }
         }
-        if (x < 0 || x + width > client.right) return Failure(L"TaskbarSpace", ERROR_INSUFFICIENT_BUFFER);
+        x = std::clamp(x, 0, clientWidth - width);
         const int y = (static_cast<int>(client.bottom) - height) / 2;
         const RECT next{x, y, x + width, y + height};
         if (!SameRect(next, placed)) {
@@ -570,6 +585,10 @@ bool TaskbarStrip::Open(HINSTANCE instance, HWND owner) {
 void TaskbarStrip::Close() { impl_->Close(); }
 void TaskbarStrip::Configure(const Components& c, int zoom, TaskbarPosition position, int widgetsWidth) {
     if (impl_->components.taskbar != c.taskbar || impl_->zoom != zoom) impl_->layoutDirty = true;
+    if (impl_->position != position) {
+        impl_->autoSide = TaskbarPosition::Auto;
+        impl_->dirty = true;
+    }
     impl_->components = c; impl_->zoom = zoom;
     impl_->position = position; impl_->widgetsWidth = std::clamp(widgetsWidth, 0, 300);
 }

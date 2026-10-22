@@ -22,7 +22,7 @@ Mini mode is a single line that can show Battery %, Time left or Full in, a char
 
 Taskbar mode embeds two rows of data in the taskbar, so it takes no desktop space. By default it shows Network speed, Time left / Full in, Power, CPU, Memory, and Latency:
 
-- It sits to the left of the notification area by default. On Windows 11 with centered taskbar icons, when many open apps would put icons under it, it moves to the left of the Start button and leaves room for Widgets on the left. Taskbar position in the right-click menu can fix it to one side.
+- By default (Automatic), it sits on the right side of the taskbar next to the clock. On Windows 11 with centered taskbar icons, when many open apps would put icons under it, it moves to the left of the Start button and leaves room for Widgets on the left. If neither side has room, it stays where it is instead of jumping back and forth. Taskbar position in the right-click menu can fix it to the left or right.
 - Text colors follow the light or dark taskbar. The battery estimate shows time left while discharging and time to full while charging.
 - Left-click shows or hides the Full mode panel; right-click opens the menu. It re-embeds itself automatically after Explorer restarts.
 - Vertical or side taskbars are not supported yet. If embedding fails, Pulse temporarily shows the Mini mode window and retries about every 30 seconds. The Windows 10 taskbar has not been tested.
@@ -128,7 +128,7 @@ The window, the taskbar data, and the tray icon share this context menu:
 | Menu item | Effect |
 | --- | --- |
 | Full mode / Mini mode / Taskbar mode | Switches display mode |
-| Taskbar position | Automatic (default) / Left of notification area / Left of Start button; if the chosen side has no room, Pulse uses the other side |
+| Taskbar position | Automatic (default) / Right / Left. Right is next to the clock; Left is to the left of the Start button. Right and Left stay fixed |
 | Size | 80% / 100% (default) / 125% / 150% / 175% / 200% |
 | 语言 / Language | Follow system (default), 中文, or English |
 | Refresh interval | Sets Full mode's refresh interval to 0.5 / 1 (default) / 2 seconds |
@@ -187,7 +187,7 @@ To package a zip (runs `build.bat` first):
 ```bat
 scripts\package.cmd
 scripts\package.cmd -NoBuild
-scripts\package.cmd -Version 1.2.0
+scripts\package.cmd -Version 1.2.1
 ```
 
 `-NoBuild` skips compilation only if `Pulse.exe` already exists in the repository root. Without `-Version`, the script reads `FileVersion` from `app.rc`, falling back to `0.1.0` if it cannot be read. The output is `dist\Pulse-<version>-win-x64.zip`, containing `Pulse.exe`, `README.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the installation and uninstallation scripts from `scripts\`.
