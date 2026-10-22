@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.md)
 
-Pulse is a floating desktop widget for Windows. A single statically linked `Pulse.exe`, built with native C++17, Win32, and Direct2D, displays hardware, battery, and network status.
+Pulse is a floating desktop widget for Windows that can also live in the taskbar. A single statically linked `Pulse.exe`, built with native C++17, Win32, and Direct2D, displays hardware, battery, and network status.
 
 [Download the latest release](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11, 64-bit · No installation required
 
@@ -20,19 +20,27 @@ By default, Full mode shows the following from top to bottom:
 
 Mini mode is a single line that can show Battery %, Time left or Full in, a charging lightning indicator, and an external-power indicator. Its Power component and Full mode's Power chart show battery discharge power under the label System while discharging. In other power states they show processor package power, labeled CPU pkg in Mini mode and Processor in Full mode. The fourth hardware tile is always labeled Processor.
 
-Right-click the window or tray icon and open Show items to choose components separately for each mode:
+Taskbar mode embeds two rows of data in the taskbar, so it takes no desktop space. By default it shows Network speed, Time left / Full in, Power, CPU, Memory, and Latency:
+
+- It sits to the left of the notification area by default. On Windows 11 with centered taskbar icons, when many open apps would put icons under it, it moves to the left of the Start button and leaves room for Widgets on the left. Taskbar position in the right-click menu can fix it to one side.
+- Text colors follow the light or dark taskbar. The battery estimate shows time left while discharging and time to full while charging.
+- Left-click shows or hides the Full mode panel; right-click opens the menu. It re-embeds itself automatically after Explorer restarts.
+- Vertical or side taskbars are not supported yet. If embedding fails, Pulse temporarily shows the Mini mode window and retries about every 30 seconds. The Windows 10 taskbar has not been tested.
+
+Right-click the window, the taskbar data, or the tray icon and open Show items to choose components separately for each mode:
 
 | Mode | Available components |
 | --- | --- |
 | Full mode | CPU / GPU / Memory / Processor, Battery, Power chart, Network, Top processes, Disk speed, System drive usage, System info, GPU memory, Wi-Fi, Battery health, FPS |
 | Mini mode | Battery %, Time left / Full in, Power, CPU %, Memory %, GPU %, Network speed, Latency, Disk, CPU frequency, FPS |
+| Taskbar mode | Same as Mini mode |
 
-Optional metrics are collected only while their components are enabled; disabling them stops collection. Basic sampling for CPU, memory, battery, and network speed, along with network probes, remains active. System info includes CPU frequency, Memory used / total, Processes, and Uptime.
+Optional metrics are collected only while their components are enabled; disabling them stops collection. Basic sampling for CPU, memory, battery, and network speed remains active. Network probes run while Disconnect alerts are enabled or the interface shows latency, and stop when neither needs them. System info includes CPU frequency, Memory used / total, Processes, and Uptime.
 
 Other features:
 
 - Foreground app FPS, measured through ETW DXGI/D3D9 Present events, requires administrator privileges. If FPS is enabled without sufficient privileges, the menu offers Restart as administrator (for FPS). Some apps may not expose a readable frame rate.
-- Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini mode refreshes about every 2 seconds.
+- Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini mode and Taskbar mode refresh about every 2 seconds.
 - Slow latency threshold can be set to 50 / 100 / 150 / 200 / 300 / 500 / 800 ms, with a default of 500 ms.
 - Network disconnected and Network restored cards fade out after about 8 seconds. Hovering pauses the timer; moving away starts a roughly 3-second timer before they fade out. Disconnect alerts and Alert sound have separate switches. Sleep does not count as an outage.
 - Size from 80% to 200%, also adjustable with Ctrl + mouse wheel.
@@ -48,6 +56,10 @@ Full mode:
 Mini mode:
 
 ![Pulse mini mode](docs/screenshots/native-compact.png)
+
+Taskbar mode (light taskbar, Chinese interface, charging):
+
+![Pulse taskbar mode](docs/screenshots/native-taskbar.png)
 
 ## System requirements
 
@@ -91,7 +103,7 @@ Startup uses the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\
 
 Run `scripts\uninstall.cmd`. The script exits only Pulse processes identified as this app by window class or version information, skipping other programs with the same name. It removes the Run value described above and removes Start menu and desktop `Pulse.lnk` shortcuts that target `Pulse.exe` or have no target.
 
-Window position, mode, Always on top, component selections, Refresh interval, Size, language (`[Window] language=auto|zh|en`), Slow latency threshold, Disconnect alerts, and Alert sound are saved in `%LOCALAPPDATA%\Pulse\settings.ini`. Logs for network probes, frame-rate diagnostics, and other events are stored in `%LOCALAPPDATA%\Pulse\pulse_net.log`, in the same folder as the installed app. No settings are written to `%APPDATA%` (the roaming directory), but the uninstaller still checks it for settings and logs with the same names.
+Window position, mode, Always on top, component selections, Taskbar position, Refresh interval, Size, language (`[Window] language=auto|zh|en`), Slow latency threshold, Disconnect alerts, and Alert sound are saved in `%LOCALAPPDATA%\Pulse\settings.ini`. Logs for network probes, frame-rate diagnostics, and other events are stored in `%LOCALAPPDATA%\Pulse\pulse_net.log`, in the same folder as the installed app. When the log exceeds 1 MB, it is renamed to `pulse_net.log.1` and a new log is started. No settings are written to `%APPDATA%` (the roaming directory), but the uninstaller still checks it for settings and logs with the same names.
 
 If these files exist, the script asks whether to remove them. Choosing Y deletes the entire `%LOCALAPPDATA%\Pulse` directory and any detected settings and log files in the roaming directory. Choosing N removes only `Pulse.exe` and the shortcuts, keeping settings and logs. If no settings or logs are found, the installation directory is removed by default.
 
@@ -106,23 +118,25 @@ If these files exist, the script asks whether to remove them. Choosing Y deletes
 - Drag an empty area of the window to move it. Its position is saved.
 - Double-click an empty area, or click the mode button, to switch between Full and Mini modes.
 - The pin button toggles Always on top, which is enabled by default.
-- Minimizing pauses sampling for the UI. Left-click the tray icon to hide or show the window. Hiding also pauses UI sampling, while network probes continue. Sampling resumes when the window is shown again.
+- Minimizing pauses sampling for the UI. Left-click the tray icon to hide or show the window. Hiding also pauses UI sampling, while network probes continue if Disconnect alerts are enabled. Sampling resumes when the window is shown again.
+- In Taskbar mode, left-click the taskbar data or the tray icon to show or hide the Full mode panel.
 - The close button exits the app.
 - Hold Ctrl and scroll inside the window to change the scale by 10 percentage points per notch, between 80% and 200%. Use the mouse wheel without Ctrl to scroll content that extends beyond the screen.
 
-The window and tray icon share this context menu:
+The window, the taskbar data, and the tray icon share this context menu:
 
 | Menu item | Effect |
 | --- | --- |
-| Full mode / Mini mode | Switches display mode |
+| Full mode / Mini mode / Taskbar mode | Switches display mode |
+| Taskbar position | Automatic (default) / Left of notification area / Left of Start button; if the chosen side has no room, Pulse uses the other side |
 | Size | 80% / 100% (default) / 125% / 150% / 175% / 200% |
 | 语言 / Language | Follow system (default), 中文, or English |
 | Refresh interval | Sets Full mode's refresh interval to 0.5 / 1 (default) / 2 seconds |
 | Slow latency threshold | 50 / 100 / 150 / 200 / 300 / 500 (default) / 800 ms |
 | Disconnect alerts | Toggles Network disconnected and Network restored cards; enabled by default |
 | Alert sound | Toggles sound separately; enabled by default and unavailable when Disconnect alerts are disabled |
-| Show items → Full mode / Mini mode | Selects components for each mode |
-| Show items → Reset to defaults | Resets only the default component selections for both modes |
+| Show items → Full mode / Mini mode / Taskbar mode | Selects components for each mode |
+| Show items → Reset to defaults | Resets only the default component selections for all three modes |
 | Always on top | Toggles pinning the window above others |
 | Start with Windows | Toggles startup for the current user |
 | Open log | Opens the local log |
@@ -148,7 +162,9 @@ Under normal conditions, Pulse probes the first address about every 5 seconds. I
 | One successful request with latency < 1000 ms | Clears the failure count; restores an Offline connection |
 | All physical network adapters are disconnected, confirmed after a short debounce | Connection is marked Offline immediately, without waiting for 3 unavailable HTTP results |
 
-After an unavailable result, Pulse checks about every 1 second; once Offline, it retries about every 1.5 seconds. After physical adapters disconnect, the physical connection must return before Pulse can mark the connection as restored, even if a local proxy returns a successful response. System sleep pauses probing and clears outage timing. Probing resumes about 3 seconds after wake.
+After an unavailable result, Pulse checks about every 1 second. Once Offline, it retries about every 1.5 seconds for the first 2 minutes, then about every 3 seconds. While all physical adapters are disconnected, Pulse sends no requests; it probes as soon as adapter status changes, with a fallback check every 15 seconds. After physical adapters disconnect, the physical connection must return before Pulse can mark the connection as restored, even if a local proxy returns a successful response. System sleep pauses probing and clears outage timing. Probing resumes about 3 seconds after wake.
+
+When Disconnect alerts are off and the current interface shows no latency (for example, Mini or Taskbar mode without Latency selected), network probing stops completely and sends no requests.
 
 ## Building from source
 
@@ -171,7 +187,7 @@ To package a zip (runs `build.bat` first):
 ```bat
 scripts\package.cmd
 scripts\package.cmd -NoBuild
-scripts\package.cmd -Version 1.1.0
+scripts\package.cmd -Version 1.2.0
 ```
 
 `-NoBuild` skips compilation only if `Pulse.exe` already exists in the repository root. Without `-Version`, the script reads `FileVersion` from `app.rc`, falling back to `0.1.0` if it cannot be read. The output is `dist\Pulse-<version>-win-x64.zip`, containing `Pulse.exe`, `README.md`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the installation and uninstallation scripts from `scripts\`.
@@ -180,12 +196,15 @@ GitHub Actions automatically builds and publishes a Release when a `v*` tag is p
 
 ## Resource usage
 
-The following CPU-usage figures were measured on an Intel Core Ultra 5 226V laptop running on battery. They use Pulse's process CPU time, expressed as a percentage of one CPU core:
+The following figures were measured on an Intel Core Ultra 5 226V laptop. CPU usage uses Pulse's process CPU time, expressed as a percentage of one CPU core; memory is the Memory column in Task Manager (private working set):
 
-| Mode | CPU usage |
-| --- | --- |
-| Mini mode | About 0.1%–0.3% of one core |
-| Full mode | Runs the full collection path on each refresh; about 0.5%–1.5% of one core |
+| Mode | CPU usage | Memory |
+| --- | --- | --- |
+| Taskbar mode | About 0.1%–0.15% of one core | About 13 MB |
+| Mini mode | About 0.1%–0.3% of one core | About 13 MB |
+| Full mode | Runs the full collection path on each refresh; about 0.5%–1.5% of one core | About 40 MB |
+
+Mini mode, Taskbar mode, and the network alert cards use software rendering and do not load the graphics driver. Full mode uses hardware rendering, and the graphics driver uses more memory. After the Full mode panel has been opened from Mini or Taskbar mode, the driver stays loaded and memory does not return to its initial level until Pulse restarts.
 
 Optional metrics still depend on component selections and their individual collection intervals. These figures vary with hardware, enabled components, refresh interval, and background load, and are for reference only.
 
