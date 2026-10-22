@@ -53,6 +53,8 @@ jobs:
             Pulse.exe
             metrics_selftest.exe
           if-no-files-found: error
+          # CI builds are for checking only; releases come from release.yml.
+          retention-days: 7
 
   # This check is independent. Release builds use only MinGW.
   msvc:
@@ -81,3 +83,4 @@ jobs:
             build-msvc/Pulse.exe
             build-msvc/metrics_selftest.exe
           if-no-files-found: error
+          retention-days: 7
