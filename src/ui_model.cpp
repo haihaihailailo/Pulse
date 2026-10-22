@@ -115,13 +115,19 @@ std::wstring NetworkEventText(const NetEvent& event) {
 void Components::Reset() {
     for (size_t i = 0; i < full.size(); ++i) full[i] = FullComponents[i].enabled;
     for (size_t i = 0; i < compact.size(); ++i) compact[i] = CompactComponents[i].enabled;
+    for (size_t i = 0; i < taskbar.size(); ++i) taskbar[i] = TaskbarComponents[i].enabled;
 }
-Wants CollectionWants(const Components& c, bool compact, PowerMode mode) {
+Wants CollectionWants(const Components& components, DisplayMode display, bool details, PowerMode mode) {
+    Components c = components;
+    const bool compact = display != DisplayMode::Full && !details;
+    if (display == DisplayMode::Taskbar) c.compact = c.taskbar;
     Wants w;
     w.chip_power = compact ? c.Enabled(CompactComponent::Power) && mode != PowerMode::Discharging :
         c.Enabled(FullComponent::Hardware) || (c.Enabled(FullComponent::PowerChart) && mode != PowerMode::Discharging);
     w.gpu_usage = compact ? c.Enabled(CompactComponent::Gpu) : c.Enabled(FullComponent::Hardware);
-    w.processes = !compact && (c.Enabled(FullComponent::Processes) || c.Enabled(FullComponent::SystemInfo));
+    w.processes = !compact && c.Enabled(FullComponent::Processes);
+    w.process_count = !compact && c.Enabled(FullComponent::SystemInfo);
+    w.power_scheme = !compact && c.Enabled(FullComponent::Battery);
     w.memory_detail = !compact && c.Enabled(FullComponent::SystemInfo);
     w.disk_io = compact ? c.Enabled(CompactComponent::DiskIO) : c.Enabled(FullComponent::DiskIO);
     w.sys_disk = !compact && c.Enabled(FullComponent::SystemDisk);
@@ -131,6 +137,14 @@ Wants CollectionWants(const Components& c, bool compact, PowerMode mode) {
     w.wifi = !compact && c.Enabled(FullComponent::Wifi);
     w.battery_health = !compact && c.Enabled(FullComponent::BatteryHealth);
     w.fps = compact ? c.Enabled(CompactComponent::Fps) : c.Enabled(FullComponent::Fps);
+    if (display == DisplayMode::Taskbar && details) {
+        const auto strip = CollectionWants(components, DisplayMode::Taskbar, false, mode);
+        w.chip_power = w.chip_power || strip.chip_power;
+        w.gpu_usage = w.gpu_usage || strip.gpu_usage;
+        w.disk_io = w.disk_io || strip.disk_io;
+        w.cpu_freq = w.cpu_freq || strip.cpu_freq;
+        w.fps = w.fps || strip.fps;
+    }
     return w;
 }
 
@@ -226,7 +240,7 @@ void Model::BreakHistory() {
     std::fill(view_.powerHistory.begin(), view_.powerHistory.end(), -1);
     historyBroken_ = true;
 }
-bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
+bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool taskbar) {
     View v;
     const bool battery = compact ? c.Enabled(CompactComponent::Battery) : c.Enabled(FullComponent::Battery);
     const bool eta = compact && c.Enabled(CompactComponent::Eta);
@@ -271,10 +285,20 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c) {
         if (c.Enabled(CompactComponent::Network)) {
             v.compactUp = L"↑ " + CompactSpeed(s.up_bps);
             v.compactDown = L"↓ " + CompactSpeed(s.down_bps);
+            if (taskbar) {
+                const auto up = FormatSpeed(s.up_bps), down = FormatSpeed(s.down_bps);
+                v.compactUp = up.value + L" " + up.unit;
+                v.compactDown = down.value + L" " + down.unit;
+            }
         }
         if (c.Enabled(CompactComponent::DiskIO)) {
             v.diskRead = T(Key::ReadPrefix) + CompactSpeed(s.disk_read_bps);
             v.diskWrite = T(Key::WritePrefix) + CompactSpeed(s.disk_write_bps);
+            if (taskbar) {
+                const auto read = FormatSpeed(s.disk_read_bps), write = FormatSpeed(s.disk_write_bps);
+                v.diskRead = read.value + L" " + read.unit;
+                v.diskWrite = write.value + L" " + write.unit;
+            }
         }
         if (c.Enabled(CompactComponent::CpuFrequency)) v.cpuFrequency = Number(s.cpu_mhz / 1000, 2) + T(Key::GhzSuffix);
         if (c.Enabled(CompactComponent::Fps)) {

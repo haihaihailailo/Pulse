@@ -100,37 +100,57 @@ UINT MonitorDpi(HMONITOR monitor) {
     return x ? x : 96;
 }
 
-HRESULT Renderer::Initialize() {
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory_.Put());
-    if (FAILED(hr)) return hr;
-    hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
-                            reinterpret_cast<IUnknown**>(write_.Put()));
-    if (FAILED(hr)) return hr;
-    ComPtr<IDWriteFontCollection> collection;
-    hr = write_->GetSystemFontCollection(collection.Put());
-    if (FAILED(hr)) return hr;
-    auto available = [&](const wchar_t* name) {
-        UINT32 index = 0;
-        BOOL exists = FALSE;
-        return SUCCEEDED(collection->FindFamilyName(name, &index, &exists)) && exists;
+HRESULT Renderer::Initialize(bool fullPanel) {
+    fullPanel_ = fullPanel;
+    struct Shared {
+        ComPtr<ID2D1Factory> factory;
+        ComPtr<IDWriteFactory> write;
+        ComPtr<IDWriteTypography> tabular;
+        ComPtr<ID2D1StrokeStyle> stroke;
+        std::wstring font, numericFont;
+        HRESULT result = E_FAIL;
+        Shared() {
+            result = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, factory.Put());
+            if (FAILED(result)) return;
+            result = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(write.Put()));
+            if (FAILED(result)) return;
+            ComPtr<IDWriteFontCollection> collection;
+            result = write->GetSystemFontCollection(collection.Put());
+            if (FAILED(result)) return;
+            auto available = [&](const wchar_t* name) {
+                UINT32 index = 0; BOOL exists = FALSE;
+                return SUCCEEDED(collection->FindFamilyName(name, &index, &exists)) && exists;
+            };
+            font = available(L"Segoe UI Variable") ? L"Segoe UI Variable" :
+                available(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text" : L"Microsoft YaHei UI";
+            numericFont = available(L"Segoe UI Variable Display") ? L"Segoe UI Variable Display" : font;
+            result = write->CreateTypography(tabular.Put());
+            if (FAILED(result)) return;
+            result = tabular->AddFontFeature({DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1});
+            if (FAILED(result)) return;
+            auto properties = D2D1::StrokeStyleProperties();
+            properties.startCap = properties.endCap = properties.dashCap = D2D1_CAP_STYLE_ROUND;
+            properties.lineJoin = D2D1_LINE_JOIN_ROUND;
+            result = factory->CreateStrokeStyle(properties, nullptr, 0, stroke.Put());
+        }
     };
-    font_ = available(L"Segoe UI Variable") ? L"Segoe UI Variable" :
-            available(L"Segoe UI Variable Text") ? L"Segoe UI Variable Text" : L"Microsoft YaHei UI";
-    numericFont_ = available(L"Segoe UI Variable Display") ? L"Segoe UI Variable Display" : font_;
-    hr = write_->CreateTypography(tabular_.Put());
-    if (FAILED(hr)) return hr;
-    hr = tabular_->AddFontFeature({DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, 1});
-    if (FAILED(hr)) return hr;
-    auto properties = D2D1::StrokeStyleProperties();
-    properties.startCap = properties.endCap = properties.dashCap = D2D1_CAP_STYLE_ROUND;
-    properties.lineJoin = D2D1_LINE_JOIN_ROUND;
-    hr = factory_->CreateStrokeStyle(properties, nullptr, 0, roundStroke_.Put());
-    if (FAILED(hr)) return hr;
+    static Shared shared; // All renderers live on the UI thread.
+    if (FAILED(shared.result)) return shared.result;
+    factory_.Retain(shared.factory.Get()); write_.Retain(shared.write.Get());
+    tabular_.Retain(shared.tabular.Get()); roundStroke_.Retain(shared.stroke.Get());
+    font_ = shared.font; numericFont_ = shared.numericFont;
+    HRESULT hr = S_OK;
     auto* format = Format(12, false, false);
     if (!format) return E_FAIL;
     hr = write_->CreateEllipsisTrimmingSign(format, ellipsis_.Put());
-    if (SUCCEEDED(hr)) UpdateFullLayout();
+    if (SUCCEEDED(hr) && fullPanel_) UpdateFullLayout();
     return hr;
+}
+void Renderer::SetSoftware(bool software) {
+    if (software_ == software) return;
+    software_ = software;
+    DiscardTarget();
 }
 void Renderer::SetWindow(HWND window, UINT dpi) { window_ = window; SetDpi(dpi); }
 void Renderer::SetDpi(UINT dpi) {
@@ -162,7 +182,7 @@ void Renderer::LanguageChanged() {
     if (!write_) return;
     if (auto* format = Format(12, false, false))
         write_->CreateEllipsisTrimmingSign(format, ellipsis_.Put());
-    UpdateFullLayout();
+    if (fullPanel_) UpdateFullLayout();
     if (compact_) UpdateCompactLayout();
 }
 void Renderer::SetComponents(const Components& components, bool compact) {
@@ -204,7 +224,8 @@ HRESULT Renderer::CreateTarget() {
     RECT r{};
     GetClientRect(window_, &r);
     if (r.right <= 0 || r.bottom <= 0) return E_FAIL;
-    auto properties = D2D1::RenderTargetProperties();
+    auto properties = D2D1::RenderTargetProperties(software_ ?
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE : D2D1_RENDER_TARGET_TYPE_DEFAULT);
     properties.dpiX = properties.dpiY = RenderDpi();
     HRESULT hr = factory_->CreateHwndRenderTarget(properties,
         D2D1::HwndRenderTargetProperties(window_, D2D1::SizeU(r.right, r.bottom)), target_.Put());
@@ -416,6 +437,8 @@ void Renderer::Buttons(bool compact, bool pinned, Button hover, Button pressed, 
             line(16,6,15,7); line(9,7,9,11); line(15,7,15,11);
             line(9,11,5,15); line(15,11,19,15); line(5,15,5,17);
             line(19,15,19,17); line(5,17,19,17); line(12,17,12,22);
+        } else if (taskbarDetails_ && b == Button::Mode) {
+            line(5,8,12,15); line(12,15,19,8);
         } else if (compact) {
             line(15,3,21,3); line(21,3,21,9); line(9,21,3,21); line(3,21,3,15);
             line(21,3,14,10); line(3,21,10,14);

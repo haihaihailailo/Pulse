@@ -199,6 +199,15 @@ const Entry strings[] = {
     {L"K", L"K"}, // CompactK
     {L"M", L"M"}, // CompactM
     {L"G", L"G"}, // CompactG
+    {L"任务栏模式", L"Taskbar mode"},
+    {L"CPU", L"CPU"}, {L"内存", L"Mem"}, {L"功率", L"Pwr"}, {L"延迟", L"Ping"},
+    {L"电量", L"Bat"}, {L"续航", L"ETA"}, {L"GPU", L"GPU"}, {L"频率", L"Freq"},
+    {L"帧数", L"FPS"}, {L"读", L"Rd"}, {L"写", L"Wr"},
+    {L"任务栏位置", L"Taskbar position"},
+    {L"自动", L"Automatic"},
+    {L"通知区左侧", L"Left of notification area"},
+    {L"开始按钮左侧", L"Left of Start button"},
+    {L"充满", L"Full"}, // TaskbarFull
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;

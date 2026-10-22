@@ -121,7 +121,7 @@ struct Settings {
 struct Wants {
     bool chip_power = true;   // Energy Meter：pkg/cpu/gpu/mem 功耗
     bool gpu_usage = true;    // GPU 占用（GPU Engine）
-    bool processes = true;    // 进程前三 + process_count
+    bool processes = true;    // 进程前三（扫描同时可提供 process_count）
     bool memory_detail = false;   // mem_used_gb / mem_total_gb
     bool disk_io = false;
     bool sys_disk = false;
@@ -131,6 +131,8 @@ struct Wants {
     bool wifi = false;
     bool battery_health = false;
     bool fps = false;             // 前台帧率（ETW；关闭时不建会话）
+    bool power_scheme = false;    // Only the full battery card displays this.
+    bool process_count = false;   // Cheap count, independent of the top-three scan.
 };
 
 class Metrics {
@@ -159,6 +161,7 @@ public:
     // System sleep is separate from SetPaused (which only pauses UI sampling).
     void OnSuspend();
     void OnResume();
+    void SetProbeEnabled(bool enabled); // Thread safe; disabled intervals never create outage events.
 
 private:
     struct Impl;

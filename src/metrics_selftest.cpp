@@ -1,5 +1,6 @@
 // Console profiler: --samples N (default 60), --compact, --brief, --url URL,
-// --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800, --fps.
+// --interval-ms 500|1000|2000, --switch-every N, --slow-ms 300|500|800, --fps,
+// --no-probe, --process-count-only.
 // Timings are per actual collection, not per cached Sample() call.
 // g++ -std=c++17 -O2 -municode -static -finput-charset=UTF-8 -fexec-charset=UTF-8
 //   -o metrics_selftest.exe src/metrics_selftest.cpp src/metrics.cpp src/netprobe.cpp src/fpsmon.cpp
@@ -237,7 +238,7 @@ void PrintSample(int index, const pulse::Snapshot& s) {
     UnlockPrint();
 }
 
-int RunFpsTest(const pulse::Settings& settings, bool full) {
+int RunFpsTest(const pulse::Settings& settings, bool full, bool no_probe) {
     std::wprintf(L"FPS 自测：先启动采集，再每秒打印一次，共 10 次。\n"
                  L"status：0 未启用，1 正常，2 需要管理员或 Performance Log Users，3 前台没有 Present，4 其他错误。\n"
                  L"前台若是本进程、桌面或任务栏，沿用上一个程序；本进程首次置前时选后方应用。请在这 10 秒内切到要测的窗口。\n"
@@ -250,6 +251,7 @@ int RunFpsTest(const pulse::Settings& settings, bool full) {
     wants.processes = false;
     wants.fps = true;
     metrics.SetWants(wants);
+    metrics.SetProbeEnabled(!no_probe);
     metrics.Start(settings, nullptr, nullptr);
     std::wprintf(L"采样模式：%ls\n", full ? L"完整" : L"迷你");
     metrics.Sample(full);
@@ -292,11 +294,13 @@ void OnNet(const pulse::NetEvent& event, void*) {
 int wmain(int argc, wchar_t** argv) {
     _setmode(_fileno(stdout), _O_U16TEXT);
     int samples = 60, interval_ms = 1000, switch_every = 0;
-    bool full = true, brief = false, fps_test = false;
+    bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false;
     pulse::Settings settings;
     for (int i = 1; i < argc; ++i) {
         if (std::wcscmp(argv[i], L"--compact") == 0) full = false;
         else if (std::wcscmp(argv[i], L"--brief") == 0) brief = true;
+        else if (std::wcscmp(argv[i], L"--no-probe") == 0) no_probe = true;
+        else if (std::wcscmp(argv[i], L"--process-count-only") == 0) count_only = true;
         else if (std::wcscmp(argv[i], L"--url") == 0 && i + 1 < argc)
             settings.probe_urls.emplace_back(argv[++i]);
         else if (std::wcscmp(argv[i], L"--slow-ms") == 0 && i + 1 < argc) {
@@ -322,12 +326,12 @@ int wmain(int argc, wchar_t** argv) {
             if (!end || *end || value < 1 || value > 86400) return 2;
             switch_every = static_cast<int>(value);
         } else {
-            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps]\n");
+            std::wprintf(L"Usage: metrics_selftest.exe [--samples N] [--compact] [--brief] [--interval-ms 500|1000|2000] [--switch-every N] [--slow-ms 300|500|800] [--url URL ...] [--fps] [--no-probe] [--process-count-only]\n");
             return 2;
         }
     }
     if (!CheckDurations()) return 1;
-    if (fps_test) return RunFpsTest(settings, full);
+    if (fps_test) return RunFpsTest(settings, full, no_probe);
     InitializeCriticalSection(&g_print);
     pulse::diagnostics::SetTimingCallback(OnTiming, nullptr);
     LARGE_INTEGER frequency{}, start{}, finish{};
@@ -336,12 +340,19 @@ int wmain(int argc, wchar_t** argv) {
     const auto cpu_start = ProcessCpuTicks();
     {
         pulse::Metrics metrics;
-        const auto wants_for = [](bool detailed, pulse::PowerMode mode) {
+        const auto wants_for = [count_only](bool detailed, pulse::PowerMode mode) {
             pulse::Wants w;
             w.chip_power = detailed || mode != pulse::PowerMode::Discharging;
             w.gpu_usage = w.processes = detailed;
             w.memory_detail = w.disk_io = w.sys_disk = w.cpu_freq = detailed;
             w.uptime = w.gpu_memory = w.wifi = w.battery_health = detailed;
+            w.power_scheme = w.process_count = detailed;
+            if (count_only) {
+                w.chip_power = w.gpu_usage = w.processes = false;
+                w.memory_detail = w.disk_io = w.sys_disk = w.cpu_freq = false;
+                w.uptime = w.gpu_memory = w.wifi = w.battery_health = w.power_scheme = false;
+                w.process_count = true;
+            }
             return w;
         };
         pulse::PowerMode mode = pulse::PowerMode::Unknown;
@@ -351,6 +362,7 @@ int wmain(int argc, wchar_t** argv) {
         std::wprintf(L"Energy raw: pWh; W = delta_pwh * 3.6e-9 / QPC_seconds. Compact/fallback: Power mW / 1000.\n");
         std::wprintf(L"CPU: Processor Utility (PDH, display clamped 0..100); GetSystemTimes prints the old Processor Time basis.\n"
                      L"cpu_from_utility=false means warmup/fallback; unknown first interval prints nan. Network slow_ms=%d.\n", settings.slow_ms);
+        metrics.SetProbeEnabled(!no_probe);
         metrics.Start(settings, OnNet, nullptr);
         for (int i = 0; i < samples; ++i) {
             const bool detailed = switch_every && (i / switch_every) % 2 ? !full : full;

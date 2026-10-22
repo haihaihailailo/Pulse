@@ -10,6 +10,8 @@ namespace pulse::ui {
 using i18n::Key;
 using i18n::T;
 
+enum class DisplayMode { Full, Compact, Taskbar };
+
 enum class FullComponent : std::size_t {
     Hardware, Battery, PowerChart, Network, Processes, DiskIO, SystemDisk,
     SystemInfo, GpuMemory, Wifi, BatteryHealth, Fps, Count
@@ -56,15 +58,25 @@ inline constexpr std::array<FullComponent, FullComponents.size()> FullOrder{{
     FullComponent::SystemInfo, FullComponent::GpuMemory, FullComponent::Wifi,
     FullComponent::BatteryHealth, FullComponent::Fps, FullComponent::Processes
 }};
+inline constexpr auto TaskbarComponents = [] {
+    auto items = CompactComponents;
+    for (auto& item : items) item.enabled = false;
+    for (auto c : {CompactComponent::Network, CompactComponent::Cpu, CompactComponent::Memory,
+                   CompactComponent::Eta, CompactComponent::Power, CompactComponent::Latency})
+        items[static_cast<std::size_t>(c)].enabled = true;
+    return items;
+}();
 struct Components {
     std::array<bool, FullComponents.size()> full{};
     std::array<bool, CompactComponents.size()> compact{};
+    std::array<bool, CompactComponents.size()> taskbar{};
     Components() { Reset(); }
     void Reset();
     bool Enabled(FullComponent c) const { return full[static_cast<std::size_t>(c)]; }
     bool Enabled(CompactComponent c) const { return compact[static_cast<std::size_t>(c)]; }
 };
-Wants CollectionWants(const Components& components, bool compact, PowerMode mode = PowerMode::Unknown);
+Wants CollectionWants(const Components& components, DisplayMode mode, bool details = false,
+                      PowerMode power = PowerMode::Unknown);
 
 struct Speed {
     std::wstring value, unit;
@@ -107,7 +119,7 @@ struct View {
 
 class Model {
 public:
-    bool Update(const Snapshot& snapshot, bool compact, const Components& components);
+    bool Update(const Snapshot& snapshot, bool compact, const Components& components, bool taskbar = false);
     void BreakHistory();
     const View& Data() const { return view_; }
 private:

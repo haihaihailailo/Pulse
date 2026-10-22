@@ -1,5 +1,6 @@
 ﻿#include "ui_window.h"
 #include "ui_renderer.h"
+#include "ui_taskbar.h"
 #include "metrics.h"
 #include "netprobe.h"
 #include <windowsx.h>
@@ -49,7 +50,9 @@ constexpr UINT DpiFitMessage = WM_APP + 6;
 constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
 constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109, CmdRestartAdmin = 110;
-constexpr UINT CmdShortcutDesktop = 111, CmdShortcutStartMenu = 112;
+constexpr UINT CmdShortcutDesktop = 111, CmdShortcutStartMenu = 112, CmdTaskbar = 113;
+constexpr UINT CmdTaskbarComponent = 700;
+constexpr UINT CmdTaskbarPosition = 750;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
 constexpr UINT CmdRefresh = 400;
 constexpr UINT CmdSlowThreshold = 450;
@@ -63,7 +66,27 @@ constexpr std::array<int, 6> ZoomLevels{{80, 100, 125, 150, 175, 200}};
 constexpr DWORD MainStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
 constexpr DWORD ToastStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
 
-void AllowShowFromLowerIntegrity(HWND window);
+void AllowShowFromLowerIntegrity(HWND window, UINT message = ShowMessage);
+
+void AlertSound(bool play) {
+    using PlayFn = BOOL(WINAPI*)(LPCWSTR, HMODULE, DWORD);
+    static HMODULE module = nullptr;
+    static PlayFn sound = nullptr;
+    static bool tried = false;
+    if (!play && !sound) return;
+    if (play && !tried) {
+        tried = true;
+        module = LoadLibraryExW(L"winmm.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (module) sound = reinterpret_cast<PlayFn>(GetProcAddress(module, "PlaySoundW"));
+    }
+    if (!sound) return;
+    if (!play) { sound(nullptr, nullptr, 0); return; }
+    wchar_t directory[MAX_PATH]{};
+    const UINT length = GetWindowsDirectoryW(directory, MAX_PATH);
+    if (!length || length >= MAX_PATH) return;
+    const std::wstring file = std::wstring(directory) + L"\\Media\\Windows Notify System Generic.wav";
+    sound(file.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+}
 
 void SetSampleTimer(HWND window, bool compact, UINT fullInterval) {
     using CoalescableTimerFn = UINT_PTR(WINAPI*)(HWND, UINT_PTR, UINT, TIMERPROC, ULONG);
@@ -271,7 +294,10 @@ struct Config {
     int slow_ms = 500;
     int zoom = 100;
     i18n::Preference language = i18n::Preference::Auto;
-    bool compact = false, pinned = true;
+    DisplayMode mode = DisplayMode::Full;
+    TaskbarPosition taskbarPosition = TaskbarPosition::Auto;
+    int widgetsWidth = 120;
+    bool pinned = true;
     bool notify = true, notify_sound = true;
     std::wstring file;
     Components components;
@@ -293,7 +319,22 @@ struct Config {
         wchar_t languageValue[32]{};
         GetPrivateProfileStringW(L"Window", L"language", L"auto", languageValue, 32, file.c_str());
         language = i18n::ParsePreference(languageValue);
-        compact = GetPrivateProfileIntW(L"Window", L"Compact", 0, file.c_str()) != 0;
+        wchar_t modeValue[32]{};
+        GetPrivateProfileStringW(L"Window", L"Mode", L"", modeValue, 32, file.c_str());
+        if (std::wcscmp(modeValue, L"taskbar") == 0) mode = DisplayMode::Taskbar;
+        else if (std::wcscmp(modeValue, L"compact") == 0) mode = DisplayMode::Compact;
+        else if (std::wcscmp(modeValue, L"full") == 0) mode = DisplayMode::Full;
+        else mode = GetPrivateProfileIntW(L"Window", L"Compact", 0, file.c_str()) ? DisplayMode::Compact : DisplayMode::Full;
+        wchar_t positionValue[32]{};
+        GetPrivateProfileStringW(L"Taskbar", L"position", L"auto", positionValue, 32, file.c_str());
+        taskbarPosition = std::wcscmp(positionValue, L"right") == 0 ? TaskbarPosition::Right :
+            std::wcscmp(positionValue, L"left") == 0 ? TaskbarPosition::Left : TaskbarPosition::Auto;
+        wchar_t widgetsValue[32]{};
+        GetPrivateProfileStringW(L"Taskbar", L"widgets_width", L"120", widgetsValue, 32, file.c_str());
+        wchar_t* widgetsEnd = nullptr;
+        const long widgetsDips = std::wcstol(widgetsValue, &widgetsEnd, 10);
+        widgetsWidth = widgetsEnd != widgetsValue && *widgetsEnd == L'\0' ?
+            static_cast<int>(std::clamp(widgetsDips, 0L, 300L)) : 120;
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
         wchar_t zoomValue[32]{};
         GetPrivateProfileStringW(L"Window", L"zoom", L"100", zoomValue, 32, file.c_str());
@@ -314,6 +355,8 @@ struct Config {
             components.full[i] = ReadComponent(L"Full", FullComponents[i]);
         for (size_t i = 0; i < CompactComponents.size(); ++i)
             components.compact[i] = ReadComponent(L"Compact", CompactComponents[i]);
+        for (size_t i = 0; i < TaskbarComponents.size(); ++i)
+            components.taskbar[i] = ReadComponent(L"Taskbar", TaskbarComponents[i]);
         return true;
     }
     void Save() const {
@@ -321,9 +364,15 @@ struct Config {
         const auto sx = std::to_wstring(x), sy = std::to_wstring(y);
         WritePrivateProfileStringW(L"Window", L"X", sx.c_str(), file.c_str());
         WritePrivateProfileStringW(L"Window", L"Y", sy.c_str(), file.c_str());
-        WritePrivateProfileStringW(L"Window", L"Compact", compact ? L"1" : L"0", file.c_str());
+        WritePrivateProfileStringW(L"Window", L"Mode", mode == DisplayMode::Taskbar ? L"taskbar" :
+            mode == DisplayMode::Compact ? L"compact" : L"full", file.c_str());
+        WritePrivateProfileStringW(L"Window", L"Compact", mode != DisplayMode::Full ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"language", i18n::PreferenceValue(language), file.c_str());
+        WritePrivateProfileStringW(L"Taskbar", L"position", taskbarPosition == TaskbarPosition::Left ? L"left" :
+            taskbarPosition == TaskbarPosition::Right ? L"right" : L"auto", file.c_str());
+        const auto widgetsValue = std::to_wstring(widgetsWidth);
+        WritePrivateProfileStringW(L"Taskbar", L"widgets_width", widgetsValue.c_str(), file.c_str());
         const auto zoomValue = std::to_wstring(zoom);
         WritePrivateProfileStringW(L"Window", L"zoom", zoomValue.c_str(), file.c_str());
         const auto interval = std::to_wstring(refresh_ms);
@@ -336,6 +385,8 @@ struct Config {
             WritePrivateProfileStringW(L"Full", FullComponents[i].key, components.full[i] ? L"1" : L"0", file.c_str());
         for (size_t i = 0; i < CompactComponents.size(); ++i)
             WritePrivateProfileStringW(L"Compact", CompactComponents[i].key, components.compact[i] ? L"1" : L"0", file.c_str());
+        for (size_t i = 0; i < TaskbarComponents.size(); ++i)
+            WritePrivateProfileStringW(L"Taskbar", TaskbarComponents[i].key, components.taskbar[i] ? L"1" : L"0", file.c_str());
     }
 };
 
@@ -344,7 +395,8 @@ public:
     explicit Toast(NetEvent event, HWND notify) : event_(std::move(event)), message_(NetworkEventText(event_)), notify_(notify) {}
     ~Toast() { if (window_) DestroyWindow(window_); }
     bool Open(HINSTANCE instance, UINT dpi, int zoom) {
-        if (FAILED(renderer_.Initialize())) return false;
+        renderer_.SetSoftware(true);
+        if (FAILED(renderer_.Initialize(false))) return false;
         dpi_ = dpi;
         zoom_ = zoom;
         renderer_.SetZoom(zoom_);
@@ -532,6 +584,7 @@ public:
     ~Application() {
         callbackWindow_.store(nullptr, std::memory_order_release);
         metrics_.reset();
+        taskbar_.Close();
         toasts_.clear();
         if (window_ && IsWindow(window_)) DestroyWindow(window_);
         RemoveTray();
@@ -544,6 +597,7 @@ public:
     }
     int Execute(int showCommand, bool restarted) {
         config_.Load();
+        taskbarFallback_ = config_.mode == DisplayMode::Taskbar;
         i18n::SetLanguage(config_.language);
         notificationState_.store(config_.notify ? 1u : 0u, std::memory_order_release);
         if (FAILED(renderer_.Initialize())) {
@@ -572,9 +626,10 @@ public:
         if (!RegisterClassExW(&cls)) return 1;
         registeredToast_ = true;
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
+        renderer_.SetSoftware(config_.mode != DisplayMode::Full);
         renderer_.SetZoom(config_.zoom);
-        renderer_.SetComponents(config_.components, config_.compact);
-        model_.Update(Snapshot{}, config_.compact, config_.components);
+        renderer_.SetComponents(config_.components, Compact());
+        model_.Update(Snapshot{}, Compact(), config_.components);
         renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
         const auto size = FittedSize(work);
         const int width = static_cast<int>(size.cx), height = static_cast<int>(size.cy);
@@ -588,26 +643,31 @@ public:
             config_.x, config_.y, width, height, nullptr, nullptr, instance_, this);
         if (!window_) return 1;
         AllowShowFromLowerIntegrity(window_);
+        if (taskbarCreated_) AllowShowFromLowerIntegrity(window_, taskbarCreated_);
         callbackWindow_.store(window_, std::memory_order_release);
         Fit(false);
         SetWindowPos(window_, config_.pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         AddTray();
+        ConfigureTaskbar();
+        if (config_.mode == DisplayMode::Taskbar) TrackTaskbar(true);
         metrics_ = std::make_unique<Metrics>();
-        const Wants initialWants = CollectionWants(config_.components, config_.compact, powerMode_);
+        const Wants initialWants = CollectionWants(config_.components, CollectionMode(), details_, powerMode_);
         metrics_->SetWants(initialWants); // Always before Start and the first Sample, including --restarted.
         if (initialWants.fps) {
             diagnostics::WriteLog(L"FPS", L"ui startup wants=1 compact=" +
-                std::to_wstring(config_.compact ? 1 : 0) + L" restarted=" + std::to_wstring(restarted ? 1 : 0) +
+                std::to_wstring(Compact() ? 1 : 0) + L" restarted=" + std::to_wstring(restarted ? 1 : 0) +
                 L" full_fps=" + std::to_wstring(config_.components.Enabled(FullComponent::Fps) ? 1 : 0) +
                 L" compact_fps=" + std::to_wstring(config_.components.Enabled(CompactComponent::Fps) ? 1 : 0));
         }
         Settings settings;
         settings.slow_ms = config_.slow_ms;
+        metrics_->SetProbeEnabled(ProbeNeeded());
         metrics_->Start(settings, NetworkEvent, this);
         running_ = true;
         const bool startMinimized = showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE || showCommand == SW_SHOWMINNOACTIVE;
-        ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
+        if (!TaskbarMode())
+            ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
         Sampling(true);
         UpdateWindow(window_);
         MSG message{};
@@ -647,8 +707,111 @@ private:
             if (PostMessageW(window, NetMessage, notificationState, reinterpret_cast<LPARAM>(copy.get()))) copy.release();
         } catch (...) {}
     }
-    float ContentWidth() const { return config_.compact ? renderer_.CompactWidth() : renderer_.FullWidth(); }
-    float ContentHeight() const { return config_.compact ? 40 : FullLayout(config_.components, renderer_.FullWidth()).height; }
+    bool TaskbarMode() const { return config_.mode == DisplayMode::Taskbar && !taskbarFallback_; }
+    bool Compact() const { return config_.mode == DisplayMode::Compact || taskbarFallback_; }
+    DisplayMode CollectionMode() const { return taskbarFallback_ ? DisplayMode::Compact : config_.mode; }
+    bool Cheap() const { return config_.mode != DisplayMode::Full && !details_; }
+    void ConfigureTaskbar() {
+        taskbar_.Configure(config_.components, config_.zoom, config_.taskbarPosition, config_.widgetsWidth);
+    }
+    bool ProbeNeeded() const {
+        if (config_.notify) return true;
+        if (TaskbarMode()) {
+            return (taskbar_.Visible() && config_.components.taskbar[static_cast<size_t>(CompactComponent::Latency)]) ||
+                (details_ && IsWindowVisible(window_) && !IsIconic(window_) && config_.components.Enabled(FullComponent::Network));
+        }
+        if (!window_ || !IsWindowVisible(window_) || IsIconic(window_)) return false;
+        return Compact() ? config_.components.Enabled(CompactComponent::Latency) :
+                           config_.components.Enabled(FullComponent::Network);
+    }
+    void UpdateCollection() {
+        if (!metrics_) return;
+        metrics_->SetWants(CollectionWants(config_.components, CollectionMode(), details_, powerMode_));
+        metrics_->SetProbeEnabled(ProbeNeeded());
+    }
+    void PositionDetails() {
+        if (!TaskbarMode() || !details_ || fitting_) return;
+        const RECT strip = taskbar_.ScreenRect();
+        const RECT work = WorkArea(MonitorFromRect(&strip, MONITOR_DEFAULTTOPRIMARY));
+        const UINT dpi = MonitorDpi(MonitorFromRect(&strip, MONITOR_DEFAULTTOPRIMARY));
+        dpi_ = dpi;
+        renderer_.SetDpi(dpi_);
+        const auto size = FittedSize(work);
+        const int x = ClampCoordinate(strip.right - size.cx, work.left, work.right, size.cx);
+        const int y = ClampCoordinate(std::min(strip.top, work.bottom) - size.cy - 2, work.top, work.bottom, size.cy);
+        RECT current{};
+        GetWindowRect(window_, &current);
+        if (current.left == x && current.top == y && current.right - current.left == size.cx &&
+            current.bottom - current.top == size.cy) return;
+        fitting_ = true;
+        SetWindowPos(window_, config_.pinned ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, size.cx, size.cy, SWP_NOACTIVATE);
+        fitting_ = false;
+    }
+    void ToggleDetails() {
+        if (!TaskbarMode()) return;
+        details_ = !details_;
+        renderer_.SetTaskbarDetails(details_);
+        if (!details_) {
+            ShowWindow(window_, SW_HIDE);
+            renderer_.SetSoftware(true);
+        } else {
+            renderer_.SetSoftware(false);
+            renderer_.SetComponents(config_.components, false);
+            PositionDetails();
+            ShowWindow(window_, SW_SHOWNORMAL);
+            SetForegroundWindow(window_);
+        }
+        Reconfigure(true);
+        PositionDetails();
+    }
+    void SetTaskbarFallback(bool fallback) {
+        if (taskbarFallback_ == fallback) return;
+        CapturePosition();
+        taskbarFallback_ = fallback;
+        details_ = false;
+        renderer_.SetTaskbarDetails(false);
+        renderer_.SetSoftware(true);
+        renderer_.SetComponents(config_.components, Compact());
+        hover_ = pressed_ = Button::None;
+        dragging_ = dragCandidate_ = false;
+        if (GetCapture() == window_) ReleaseCapture();
+        scroll_ = 0;
+        renderer_.SetScroll(0);
+        model_.Update(latest_, Compact(), config_.components);
+        renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
+        repaintPending_ = true;
+        if (fallback) {
+            SetWindowPos(window_, nullptr, config_.x, config_.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            Fit(false);
+            ShowWindow(window_, SW_SHOWNOACTIVATE);
+            InvalidateRect(window_, nullptr, FALSE);
+        } else ShowWindow(window_, SW_HIDE);
+        Sampling(false, true);
+    }
+    void TrackTaskbar(bool retryNow = false) {
+        if (config_.mode != DisplayMode::Taskbar) return;
+        const ULONGLONG now = GetTickCount64();
+        if (taskbarFallback_ && !retryNow && now < taskbarRetryAt_) return;
+        bool ready = true;
+        if (taskbarFallback_ || retryNow) {
+            ConfigureTaskbar();
+            ready = taskbar_.Open(instance_, window_);
+        }
+        if (ready) ready = taskbar_.Update(latest_);
+        if (!ready) {
+            taskbar_.Close();
+            taskbarRetryAt_ = GetTickCount64() + 30000;
+            SetTaskbarFallback(true);
+            return;
+        }
+        const bool recovered = taskbarRetryAt_ != 0;
+        taskbarRetryAt_ = 0;
+        SetTaskbarFallback(false);
+        if (recovered) diagnostics::WriteLog(L"UI", L"Taskbar attach retry succeeded; returning to taskbar mode");
+        if (details_) PositionDetails();
+    }
+    float ContentWidth() const { return Compact() ? renderer_.CompactWidth() : renderer_.FullWidth(); }
+    float ContentHeight() const { return Compact() ? 40 : FullLayout(config_.components, renderer_.FullWidth()).height; }
     float Scale() const { return dpi_ / 96.0f * config_.zoom / 100.0f; }
     SIZE FittedSize(const RECT& work) const {
         return {std::min(Pixels(ContentWidth(), dpi_, config_.zoom), std::max(1, static_cast<int>(work.right - work.left))),
@@ -660,16 +823,17 @@ private:
         return r.right / Scale();
     }
     Button Hit(LPARAM l) const {
-        return renderer_.HitTest(GET_X_LPARAM(l) / Scale(), GET_Y_LPARAM(l) / Scale(), config_.compact, CurrentWidth());
+        return renderer_.HitTest(GET_X_LPARAM(l) / Scale(), GET_Y_LPARAM(l) / Scale(), Compact(), CurrentWidth());
     }
     void CapturePosition() {
-        if (!window_ || IsIconic(window_)) return;
+        if (!window_ || TaskbarMode() || IsIconic(window_)) return;
         RECT r{};
         if (GetWindowRect(window_, &r)) { config_.x = r.left; config_.y = r.top; }
     }
     void Save() { CapturePosition(); config_.Save(); }
     void Fit(bool anchor, const RECT* suggestion = nullptr, bool topRight = false) {
         if (!window_ || fitting_) return;
+        if (TaskbarMode()) { PositionDetails(); return; }
         if (IsIconic(window_)) {
             if (topRight && !zoomFitPending_) {
                 WINDOWPLACEMENT placement{};
@@ -708,7 +872,7 @@ private:
         }
         x = ClampCoordinate(x, work.left, work.right, width);
         y = ClampCoordinate(y, work.top, work.bottom, height);
-        ClampScroll((config_.compact ? width : height) / Scale());
+        ClampScroll((Compact() ? width : height) / Scale());
         if (old.left == x && old.top == y && old.right - old.left == width && old.bottom - old.top == height) return;
         fitting_ = true;
         SetWindowPos(window_, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -719,25 +883,29 @@ private:
         if (viewport <= 0) {
             RECT client{};
             GetClientRect(window_, &client);
-            viewport = (config_.compact ? client.right : client.bottom) / Scale();
+            viewport = (Compact() ? client.right : client.bottom) / Scale();
         }
-        const float extent = config_.compact ? ContentWidth() : ContentHeight();
+        const float extent = Compact() ? ContentWidth() : ContentHeight();
         scroll_ = std::clamp(scroll_, 0.0f, std::max(0.0f, extent - viewport));
         renderer_.SetScroll(scroll_);
     }
     Snapshot ReadMetrics() {
-        auto sample = metrics_->Sample(!config_.compact);
+        auto sample = metrics_->Sample(!Cheap());
         fpsStatus_ = sample.fps_status;
         if (powerMode_ != sample.mode) {
             powerMode_ = sample.mode;
-            metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
+            metrics_->SetWants(CollectionWants(config_.components, CollectionMode(), details_, powerMode_));
         }
         return sample;
     }
     void Refresh() {
         if (!running_ || !active_ || !metrics_) return;
+        if (config_.mode == DisplayMode::Taskbar) UpdateCollection();
         const auto sample = ReadMetrics();
-        if (model_.Update(sample, config_.compact, config_.components) || renderLost_) repaintPending_ = true;
+        latest_ = sample;
+        TrackTaskbar();
+        if (TaskbarMode() && !details_) return;
+        if (model_.Update(sample, Compact(), config_.components) || renderLost_) repaintPending_ = true;
         if (renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible)) Fit(true);
         // Keep sampling while covered, then draw the newest view when exposed.
         // Checking once per sample also recovers if no exposure WM_PAINT arrives.
@@ -747,31 +915,36 @@ private:
     }
     void Sampling(bool sampleNow, bool resetTimer = false) {
         if (!running_ || !metrics_) return;
-        const bool active = !systemSuspended_ && IsWindowVisible(window_) && !IsIconic(window_);
+        const bool active = !systemSuspended_ && (config_.mode == DisplayMode::Taskbar ||
+            (IsWindowVisible(window_) && !IsIconic(window_)));
         const bool changed = active_ != active;
         if (changed || resetTimer || !active) KillTimer(window_, SampleTimer);
+        UpdateCollection();
         metrics_->SetPaused(!active);
         active_ = active;
         if (!active) {
             // Pausing stops the timer, so Take would otherwise never get a chance
             // to release an active FPS session until the window was shown again.
-            if (changed) metrics_->Sample(!config_.compact);
+            if (changed) metrics_->Sample(!Cheap());
             return;
         }
         if (changed) model_.BreakHistory();
-        if (changed || resetTimer) SetSampleTimer(window_, config_.compact, config_.refresh_ms);
+        if (changed || resetTimer) SetSampleTimer(window_, Cheap(), config_.refresh_ms);
         if (sampleNow || changed) Refresh();
     }
     void Reconfigure(bool resetHistory, bool visibleChanged = true) {
-        if (metrics_) metrics_->SetWants(CollectionWants(config_.components, config_.compact, powerMode_));
+        UpdateCollection();
+        ConfigureTaskbar();
         if (!visibleChanged) { Save(); return; }
         hover_ = pressed_ = Button::None;
         scroll_ = 0;
         renderer_.SetScroll(0);
-        renderer_.SetComponents(config_.components, config_.compact);
+        renderer_.SetComponents(config_.components, Compact());
         if (resetHistory) model_.BreakHistory();
         const Snapshot sample = metrics_ ? ReadMetrics() : Snapshot{};
-        model_.Update(sample, config_.compact, config_.components);
+        latest_ = sample;
+        TrackTaskbar();
+        model_.Update(sample, Compact(), config_.components);
         renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
         repaintPending_ = true;
         Fit(true);
@@ -787,6 +960,7 @@ private:
             return;
         }
         renderer_.LanguageChanged();
+        taskbar_.LanguageChanged();
         Reconfigure(false); // Rebuild view, fixed widths, HWND size and text layouts once.
         for (auto& toast : toasts_) toast->LanguageChanged();
         ArrangeToasts();
@@ -800,16 +974,44 @@ private:
             Shell_NotifyIconW(NIM_MODIFY, &data);
         }
     }
-    void SetCompact(bool compact) {
-        if (config_.compact == compact) return;
-        config_.compact = compact;
+    void SetMode(DisplayMode mode) {
+        if (config_.mode == mode) {
+            if (mode == DisplayMode::Taskbar && taskbarFallback_) TrackTaskbar(true);
+            return;
+        }
+        CapturePosition();
+        const bool fromTaskbar = config_.mode == DisplayMode::Taskbar;
+        const POINT floating{config_.x, config_.y};
+        details_ = false;
+        renderer_.SetTaskbarDetails(false);
+        ShowWindow(window_, SW_HIDE);
+        taskbar_.Close();
+        taskbarFallback_ = false;
+        taskbarRetryAt_ = 0;
+        config_.mode = mode;
+        if (mode == DisplayMode::Taskbar) {
+            taskbarFallback_ = true;
+            ConfigureTaskbar();
+            TrackTaskbar(true);
+        }
+        renderer_.SetSoftware(config_.mode != DisplayMode::Full);
         Reconfigure(true);
+        if (!TaskbarMode()) {
+            if (fromTaskbar) SetWindowPos(window_, nullptr, floating.x, floating.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            Show();
+            Save();
+        }
+        Sampling(true, true);
     }
+    void SetCompact(bool compact) { SetMode(compact ? DisplayMode::Compact : DisplayMode::Full); }
     void SetZoom(int percent) {
         percent = std::clamp(percent, 80, 200);
         if (config_.zoom == percent) return;
         config_.zoom = percent;
         renderer_.SetZoom(percent);
+        ConfigureTaskbar();
+        TrackTaskbar();
+        PositionDetails();
         hover_ = pressed_ = Button::None;
         dragging_ = dragCandidate_ = false;
         if (GetCapture() == window_) ReleaseCapture();
@@ -827,12 +1029,14 @@ private:
         if (active_) InvalidateRect(window_, nullptr, FALSE);
     }
     void Show() {
+        if (TaskbarMode()) { if (!details_) ToggleDetails(); return; }
         ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
         Fit(false);
         SetForegroundWindow(window_);
         Sampling(true);
     }
     void ToggleVisibility() {
+        if (TaskbarMode()) { ToggleDetails(); return; }
         if (IsWindowVisible(window_) && !IsIconic(window_)) {
             Save();
             ShowWindow(window_, SW_HIDE);
@@ -931,7 +1135,8 @@ private:
     }
     bool FpsNeedsAdmin() const {
         if (fpsStatus_ != 2) return false;
-        return config_.compact ? config_.components.Enabled(CompactComponent::Fps)
+        if (TaskbarMode() && config_.components.taskbar[static_cast<size_t>(CompactComponent::Fps)]) return true;
+        return Compact() ? config_.components.Enabled(CompactComponent::Fps)
                                : config_.components.Enabled(FullComponent::Fps);
     }
     void RestartElevated() {
@@ -954,8 +1159,25 @@ private:
     void Menu(POINT point) {
         HMENU menu = CreatePopupMenu();
         if (!menu) return;
-        AppendMenuW(menu, MF_STRING | (!config_.compact ? MF_CHECKED : 0), CmdFull, T(Key::FullMode).c_str());
-        AppendMenuW(menu, MF_STRING | (config_.compact ? MF_CHECKED : 0), CmdCompact, T(Key::MiniMode).c_str());
+        AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Full ? MF_CHECKED : 0), CmdFull, T(Key::FullMode).c_str());
+        AppendMenuW(menu, MF_STRING | (Compact() ? MF_CHECKED : 0), CmdCompact, T(Key::MiniMode).c_str());
+        AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Taskbar ? MF_CHECKED : 0), CmdTaskbar, T(Key::TaskbarMode).c_str());
+        const UINT selectedMode = config_.mode == DisplayMode::Taskbar ? CmdTaskbar : Compact() ? CmdCompact : CmdFull;
+        for (UINT id : {CmdFull, CmdCompact, CmdTaskbar}) {
+            MENUITEMINFOW info{}; info.cbSize = sizeof(info); info.fMask = MIIM_FTYPE | MIIM_STATE;
+            info.fType = MFT_STRING | MFT_RADIOCHECK; info.fState = id == selectedMode ? MFS_CHECKED : MFS_UNCHECKED;
+            SetMenuItemInfoW(menu, id, FALSE, &info);
+        }
+        HMENU position = CreatePopupMenu();
+        if (position) {
+            const Key labels[] = {Key::TaskbarPositionAuto, Key::TaskbarPositionRight, Key::TaskbarPositionLeft};
+            for (UINT i = 0; i < 3; ++i)
+                AppendMenuW(position, MF_STRING, CmdTaskbarPosition + i, T(labels[i]).c_str());
+            CheckMenuRadioItem(position, CmdTaskbarPosition, CmdTaskbarPosition + 2,
+                CmdTaskbarPosition + static_cast<UINT>(config_.taskbarPosition), MF_BYCOMMAND);
+            if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(position), T(Key::TaskbarPositionMenu).c_str()))
+                DestroyMenu(position);
+        }
         HMENU language = CreatePopupMenu();
         if (language) {
             const Key labels[] = {Key::LanguageAuto, Key::LanguageZh, Key::LanguageEn};
@@ -1012,13 +1234,18 @@ private:
         HMENU contents = CreatePopupMenu();
         HMENU full = CreatePopupMenu();
         HMENU compact = CreatePopupMenu();
-        if (contents && full && compact) {
+        HMENU taskbar = CreatePopupMenu();
+        if (contents && full && compact && taskbar) {
             for (size_t i = 0; i < FullComponents.size(); ++i)
                 AppendMenuW(full, MF_STRING | (config_.components.full[i] ? MF_CHECKED : 0),
                             CmdFullComponent + static_cast<UINT>(i), T(FullComponents[i].label).c_str());
             for (size_t i = 0; i < CompactComponents.size(); ++i)
                 AppendMenuW(compact, MF_STRING | (config_.components.compact[i] ? MF_CHECKED : 0),
                             CmdCompactComponent + static_cast<UINT>(i), T(CompactComponents[i].label).c_str());
+            for (size_t i = 0; i < TaskbarComponents.size(); ++i)
+                AppendMenuW(taskbar, MF_STRING | (config_.components.taskbar[i] ? MF_CHECKED : 0),
+                    CmdTaskbarComponent + static_cast<UINT>(i), T(TaskbarComponents[i].label).c_str());
+            AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(taskbar), T(Key::TaskbarMode).c_str());
             AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(full), T(Key::FullMode).c_str());
             AppendMenuW(contents, MF_POPUP, reinterpret_cast<UINT_PTR>(compact), T(Key::MiniMode).c_str());
             AppendMenuW(contents, MF_SEPARATOR, 0, nullptr);
@@ -1028,6 +1255,7 @@ private:
             if (contents) DestroyMenu(contents);
             if (full) DestroyMenu(full);
             if (compact) DestroyMenu(compact);
+            if (taskbar) DestroyMenu(taskbar);
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (config_.pinned ? MF_CHECKED : 0), CmdPin, T(Key::AlwaysOnTop).c_str());
@@ -1052,6 +1280,13 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (command >= CmdTaskbarPosition && command < CmdTaskbarPosition + 3) {
+            config_.taskbarPosition = static_cast<TaskbarPosition>(command - CmdTaskbarPosition);
+            ConfigureTaskbar();
+            TrackTaskbar();
+            Save();
+            return;
+        }
         if (command >= CmdLanguage && command < CmdLanguage + static_cast<UINT>(Languages.size())) {
             SetLanguage(Languages[command - CmdLanguage]);
             return;
@@ -1070,34 +1305,42 @@ private:
         }
         if (command >= CmdRefresh && command < CmdRefresh + static_cast<UINT>(RefreshIntervals.size())) {
             config_.refresh_ms = RefreshIntervals[command - CmdRefresh];
-            if (!config_.compact) Sampling(false, true);
+            if (!Cheap()) Sampling(false, true);
             Save();
             return;
         }
         if (command >= CmdFullComponent && command < CmdFullComponent + static_cast<UINT>(FullComponents.size())) {
             const size_t i = command - CmdFullComponent;
             config_.components.full[i] = !config_.components.full[i];
-            Reconfigure(false, !config_.compact);
+            Reconfigure(false, !Compact() && (!TaskbarMode() || details_));
             return;
         }
         if (command >= CmdCompactComponent && command < CmdCompactComponent + static_cast<UINT>(CompactComponents.size())) {
             const size_t i = command - CmdCompactComponent;
             config_.components.compact[i] = !config_.components.compact[i];
-            Reconfigure(false, config_.compact);
+            Reconfigure(false, Compact());
+            return;
+        }
+        if (command >= CmdTaskbarComponent && command < CmdTaskbarComponent + static_cast<UINT>(TaskbarComponents.size())) {
+            const size_t i = command - CmdTaskbarComponent;
+            config_.components.taskbar[i] = !config_.components.taskbar[i];
+            Reconfigure(false, config_.mode == DisplayMode::Taskbar);
             return;
         }
         switch (command) {
+        case CmdTaskbar: SetMode(DisplayMode::Taskbar); break;
         case CmdNetworkNotify:
             config_.notify = !config_.notify;
             notificationState_.fetch_add(1u, std::memory_order_acq_rel);
             ClearNetworkNotifications(); // Dismiss cards and discard queued events on either toggle.
-            if (!config_.notify) PlaySoundW(nullptr, nullptr, 0);
+            if (!config_.notify) AlertSound(false);
+            UpdateCollection();
             Save();
             break;
         case CmdNotifySound:
             if (config_.notify) {
                 config_.notify_sound = !config_.notify_sound;
-                if (!config_.notify_sound) PlaySoundW(nullptr, nullptr, 0);
+                if (!config_.notify_sound) AlertSound(false);
                 Save();
             }
             break;
@@ -1115,9 +1358,9 @@ private:
     }
     void ActivateButton(Button button) {
         switch (button) {
-        case Button::Mode: SetCompact(!config_.compact); break;
+        case Button::Mode: if (TaskbarMode()) ToggleDetails(); else SetCompact(!Compact()); break;
         case Button::Pin: TogglePin(); break;
-        case Button::Minimize: ShowWindow(window_, SW_MINIMIZE); Sampling(false); break;
+        case Button::Minimize: if (TaskbarMode()) ToggleDetails(); else { ShowWindow(window_, SW_MINIMIZE); Sampling(false); } break;
         case Button::Close: SendMessageW(window_, WM_CLOSE, 0, 0); break;
         default: break;
         }
@@ -1147,9 +1390,7 @@ private:
     }
     void Notify(const NetEvent& event) {
         if (!config_.notify) return;
-        if (config_.notify_sound)
-            PlaySoundW(L"C:\\Windows\\Media\\Windows Notify System Generic.wav", nullptr,
-                       SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+        if (config_.notify_sound) AlertSound(true);
         auto toast = std::make_unique<Toast>(event, window_);
         if (toast->Open(instance_, dpi_, config_.zoom)) {
             toasts_.push_back(std::move(toast));
@@ -1170,13 +1411,18 @@ private:
         KillTimer(window_, SampleTimer);
         callbackWindow_.store(nullptr, std::memory_order_release);
         if (metrics_) metrics_->SetPaused(true);
+        taskbar_.Close();
         metrics_.reset(); // Joins callbacks while HWND and Application are still alive.
         ClearNetworkNotifications();
         RemoveTray();
         PostQuitMessage(0);
     }
     LRESULT Handle(UINT message, WPARAM w, LPARAM l) {
-        if (taskbarCreated_ && message == taskbarCreated_) { tray_ = false; AddTray(); return 0; }
+        if (taskbarCreated_ && message == taskbarCreated_) {
+            tray_ = false; AddTray();
+            if (config_.mode == DisplayMode::Taskbar) TrackTaskbar(true);
+            return 0;
+        }
         switch (message) {
         case WM_CREATE:
             dpi_ = WindowDpi(window_);
@@ -1189,14 +1435,16 @@ private:
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PaintSession paint(window_);
-            if (renderer_.CanRender()) {
-                const HRESULT hr = renderer_.Paint(model_.Data(), config_.compact, config_.pinned, hover_, pressed_);
+            if ((!TaskbarMode() || details_) && renderer_.CanRender()) {
+                const HRESULT hr = renderer_.Paint(model_.Data(), Compact(), config_.pinned, hover_, pressed_);
                 renderLost_ = FAILED(hr);
                 repaintPending_ = hr != S_OK;
             } else repaintPending_ = true;
             return 0;
         }
         case WM_SIZE:
+            if (w == SIZE_MINIMIZED && config_.mode == DisplayMode::Taskbar && details_)
+                PostMessageW(window_, TaskbarMessage, static_cast<WPARAM>(TaskbarAction::Collapse), 0);
             if (w != SIZE_MINIMIZED) {
                 renderer_.Resize();
                 ClampScroll();
@@ -1234,6 +1482,8 @@ private:
         case WM_SHOWWINDOW: Sampling(w != 0); break;
         case WM_TIMER: if (w == SampleTimer) Refresh(); return 0;
         case WM_DPICHANGED: {
+            if (config_.mode == DisplayMode::Taskbar)
+                PostMessageW(window_, TaskbarMessage, static_cast<WPARAM>(TaskbarAction::Changed), 0);
             dpi_ = HIWORD(w);
             UpdateIcons();
             renderer_.SetDpi(dpi_);
@@ -1250,11 +1500,16 @@ private:
             return 0;
         }
         case WM_DISPLAYCHANGE:
+            TrackTaskbar();
             Fit(false);
+            PositionDetails();
             ArrangeToasts();
             if (active_) InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_SETTINGCHANGE:
+            taskbar_.ThemeChanged();
+            TrackTaskbar();
+            PositionDetails();
             if (w == SPI_SETWORKAREA) { Fit(false); ArrangeToasts(); }
             if (config_.language == i18n::Preference::Auto) SetLanguage(config_.language);
             return 0;
@@ -1325,7 +1580,9 @@ private:
             return 0;
         }
         case WM_LBUTTONDBLCLK:
-            if (Hit(l) == Button::None) SetCompact(!config_.compact);
+            if (Hit(l) == Button::None) {
+                if (TaskbarMode()) ToggleDetails(); else SetCompact(!Compact());
+            }
             return 0;
         case WM_MOUSELEAVE:
             zoomWheelDelta_ = 0;
@@ -1345,7 +1602,7 @@ private:
                 POINT p{};
                 GetCursorPos(&p);
                 ScreenToClient(window_, &p);
-                const auto button = renderer_.HitTest(p.x / Scale(), p.y / Scale(), config_.compact, CurrentWidth());
+                const auto button = renderer_.HitTest(p.x / Scale(), p.y / Scale(), Compact(), CurrentWidth());
                 SetCursor(LoadCursorW(nullptr, button == Button::None ? IDC_ARROW : IDC_HAND));
                 return TRUE;
             }
@@ -1372,6 +1629,17 @@ private:
                 w == notificationState_.load(std::memory_order_acquire)) Notify(*event);
             return 0;
         }
+        case TaskbarMessage:
+            if (config_.mode != DisplayMode::Taskbar || stopping_) return 0;
+            if (w == static_cast<WPARAM>(TaskbarAction::Toggle)) ToggleDetails();
+            else if (w == static_cast<WPARAM>(TaskbarAction::Collapse)) { if (details_) ToggleDetails(); }
+            else if (w == static_cast<WPARAM>(TaskbarAction::Menu)) {
+                POINT p{}; GetCursorPos(&p); Menu(p);
+            } else {
+                if (w == static_cast<WPARAM>(TaskbarAction::SettingsChanged)) taskbar_.ThemeChanged();
+                TrackTaskbar();
+            }
+            return 0;
         case ShowMessage: Show(); return 0;
         case ReapToastMessage:
             toasts_.erase(std::remove_if(toasts_.begin(), toasts_.end(), [](const auto& t) { return !t->Window(); }), toasts_.end());
@@ -1408,6 +1676,11 @@ private:
     // callback cannot replay its card after reminders have been re-enabled.
     std::atomic<UINT_PTR> notificationState_{1};
     Renderer renderer_;
+    TaskbarStrip taskbar_;
+    Snapshot latest_;
+    bool details_ = false;
+    bool taskbarFallback_ = false;
+    ULONGLONG taskbarRetryAt_ = 0; // Checked on SampleTimer; no extra wakeups.
     Model model_;
     Config config_;
     std::unique_ptr<Metrics> metrics_;
@@ -1462,11 +1735,11 @@ void ActivateExistingInstance() {
     PostMessageW(previous, ShowMessage, 0, 0);
 }
 
-void AllowShowFromLowerIntegrity(HWND window) {
+void AllowShowFromLowerIntegrity(HWND window, UINT message) {
     using FilterFn = BOOL (WINAPI*)(HWND, UINT, DWORD, void*);
     const auto filter = reinterpret_cast<FilterFn>(
         GetProcAddress(GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx"));
-    if (filter) filter(window, ShowMessage, MSGFLT_ALLOW, nullptr);
+    if (filter) filter(window, message, MSGFLT_ALLOW, nullptr);
 }
 } // namespace
 

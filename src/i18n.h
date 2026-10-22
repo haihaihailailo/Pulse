@@ -188,6 +188,11 @@ enum class Key : std::size_t {
     CompactK,
     CompactM,
     CompactG,
+    TaskbarMode,
+    TaskbarCpu, TaskbarMemory, TaskbarPower, TaskbarPing, TaskbarBattery,
+    TaskbarEta, TaskbarGpu, TaskbarFrequency, TaskbarFps, TaskbarRead, TaskbarWrite,
+    TaskbarPositionMenu, TaskbarPositionAuto, TaskbarPositionRight, TaskbarPositionLeft,
+    TaskbarFull,
     Count
 };
 namespace detail {

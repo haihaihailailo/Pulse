@@ -66,6 +66,7 @@ public:
     void SetSlowThreshold(int slow_ms); // Uses the same lock as result classification.
     void OnSuspend();
     void OnResume();
+    void SetEnabled(bool enabled);
     void RequestProbe(); // Reuses Metrics' passive NIC notifications; no polling.
 
 private:

@@ -37,6 +37,7 @@
 #include <netioapi.h>
 #include <winioctl.h>
 #include <setupapi.h>
+#include <psapi.h>
 #include <batclass.h>
 #include <wlanapi.h>
 
@@ -105,6 +106,8 @@ constexpr unsigned kWantGpuMem = 1u << 8;
 constexpr unsigned kWantWifi = 1u << 9;
 constexpr unsigned kWantBattery = 1u << 10;
 constexpr unsigned kWantFps = 1u << 11;
+constexpr unsigned kWantScheme = 1u << 12;
+constexpr unsigned kWantCount = 1u << 13;
 constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc;
 
 static_assert(sizeof(void*) == 8, "x64 only");
@@ -658,6 +661,8 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.wifi) bits |= kWantWifi;
     if (w.battery_health) bits |= kWantBattery;
     if (w.fps) bits |= kWantFps;
+    if (w.power_scheme) bits |= kWantScheme;
+    if (w.process_count) bits |= kWantCount;
     return bits;
 }
 
@@ -675,6 +680,8 @@ constexpr Wants UnpackWants(unsigned bits) {
     w.wifi = (bits & kWantWifi) != 0;
     w.battery_health = (bits & kWantBattery) != 0;
     w.fps = (bits & kWantFps) != 0;
+    w.power_scheme = (bits & kWantScheme) != 0;
+    w.process_count = (bits & kWantCount) != 0;
     return w;
 }
 
@@ -768,8 +775,25 @@ bool QueryBatteryDevice(HANDLE device, double& health, int& cycles, unsigned lon
 // GUID_DEVCLASS_BATTERY {72631e54-78a4-11d0-bcf7-00aa00b7b32a}. The largest designed
 // capacity wins when several battery devices are present.
 bool ReadBatteryHealth(double& health, int& cycles) {
+    struct SetupApi {
+        HMODULE module = LoadLibraryExW(L"setupapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        decltype(&SetupDiGetClassDevsW) get = nullptr;
+        decltype(&SetupDiEnumDeviceInterfaces) enumerate = nullptr;
+        decltype(&SetupDiGetDeviceInterfaceDetailW) detail = nullptr;
+        decltype(&SetupDiDestroyDeviceInfoList) destroy = nullptr;
+        SetupApi() {
+            if (!module) return;
+            get = reinterpret_cast<decltype(get)>(GetProcAddress(module, "SetupDiGetClassDevsW"));
+            enumerate = reinterpret_cast<decltype(enumerate)>(GetProcAddress(module, "SetupDiEnumDeviceInterfaces"));
+            detail = reinterpret_cast<decltype(detail)>(GetProcAddress(module, "SetupDiGetDeviceInterfaceDetailW"));
+            destroy = reinterpret_cast<decltype(destroy)>(GetProcAddress(module, "SetupDiDestroyDeviceInfoList"));
+        }
+        ~SetupApi() { if (module) FreeLibrary(module); }
+    };
+    static const SetupApi api;
+    if (!api.get || !api.enumerate || !api.detail || !api.destroy) return false;
     const GUID guid = MakeGuid(0x72631e54, 0x78A4, 0x11d0, 0xbc, 0xf7, 0x00, 0xaa, 0x00, 0xb7, 0xb3, 0x2a);
-    const HDEVINFO devices = SetupDiGetClassDevsW(&guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    const HDEVINFO devices = api.get(&guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (devices == INVALID_HANDLE_VALUE) return false;
     bool found = false;
     double best_health = NAN;
@@ -778,15 +802,15 @@ bool ReadBatteryHealth(double& health, int& cycles) {
     for (DWORD index = 0; index < 32; ++index) {
         SP_DEVICE_INTERFACE_DATA iface{};
         iface.cbSize = sizeof(iface);
-        if (!SetupDiEnumDeviceInterfaces(devices, nullptr, &guid, index, &iface)) break;
+        if (!api.enumerate(devices, nullptr, &guid, index, &iface)) break;
         DWORD need = 0;
-        SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &need, nullptr);
+        api.detail(devices, &iface, nullptr, 0, &need, nullptr);
         if (need < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) || need > (64u * 1024u)) continue;
         std::vector<unsigned char> buf(need);
         auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
         // x64 requires 8. sizeof() is 6 on some MinGW headers, which SetupDi rejects.
         detail->cbSize = 8;
-        if (!SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, need, nullptr, nullptr)) continue;
+        if (!api.detail(devices, &iface, detail, need, nullptr, nullptr)) continue;
         HANDLE device = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (device == INVALID_HANDLE_VALUE) {
@@ -807,7 +831,7 @@ bool ReadBatteryHealth(double& health, int& cycles) {
             best_cycles = one_cycles;
         }
     }
-    SetupDiDestroyDeviceInfoList(devices);
+    api.destroy(devices);
     if (!found) return false;
     health = best_health;
     cycles = best_cycles;
@@ -1127,6 +1151,7 @@ struct Metrics::Impl {
     ProcScan procs_;
     std::vector<ProcUsage> top_cache_;
     double self_cache_ = NAN;
+    unsigned long long procs_due_ = 0;
 
     bool have_energy_due_ = false;
     unsigned long long energy_due_ = 0;
@@ -1248,7 +1273,7 @@ private:
     void UpdateScheme(unsigned long long now);
     void UpdateEnergy(bool full, unsigned long long now);
     void UpdateGpu(bool full, unsigned long long now);
-    void UpdateProcs(Snapshot& s);
+    void UpdateProcs(Snapshot& s, unsigned long long now);
     void UpdateDisk(unsigned long long now, Snapshot& s);
     void UpdateSysDisk(unsigned long long now, Snapshot& s);
     void UpdateCpuFreq(Snapshot& s);
@@ -1810,8 +1835,9 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
     if (!w.processes) {
         s.top_procs.clear();
         s.self_cpu_percent = NAN;
-        s.process_count = -1;
     }
+    if (!w.processes && !w.process_count) s.process_count = -1;
+    if (!w.power_scheme) { s.power_scheme.clear(); s.power_scheme_kind = PowerSchemeKind::Unknown; }
     if (!w.memory_detail) {
         s.mem_used_gb = NAN;
         s.mem_total_gb = NAN;
@@ -1884,6 +1910,7 @@ void Metrics::Impl::ReleaseProcs() {
     top_cache_.shrink_to_fit();
     self_cache_ = NAN;
     process_count_ = -1;
+    procs_due_ = 0;
 }
 
 void Metrics::Impl::ReleaseDisk() {
@@ -2499,7 +2526,14 @@ void Metrics::Impl::UpdateFps(Snapshot& s, unsigned long long now) {
     }
 }
 
-void Metrics::Impl::UpdateProcs(Snapshot& s) {
+void Metrics::Impl::UpdateProcs(Snapshot& s, unsigned long long now) {
+    if (now < procs_due_) {
+        s.top_procs = top_cache_;
+        s.self_cpu_percent = self_cache_;
+        s.process_count = process_count_;
+        return;
+    }
+    procs_due_ = now + 2000;
     procs_buffers_ = true;
     diagnostics::ScopedTiming timing(L"Process scan");
     int count = -1;
@@ -2515,7 +2549,7 @@ void Metrics::Impl::UpdateProcs(Snapshot& s) {
 
 Snapshot Metrics::Impl::Take(bool full) {
     Wants wants = CurrentWants();
-    if (!full) wants.processes = false;
+    if (!full) { wants.processes = false; wants.power_scheme = false; }
     if (!wants.chip_power) ReleaseEnergy();
     if (!wants.gpu_usage) ReleaseGpu();
     if (!wants.processes) ReleaseProcs();
@@ -2533,6 +2567,7 @@ Snapshot Metrics::Impl::Take(bool full) {
         top_cache_.clear();
         self_cache_ = NAN;
         process_count_ = -1;
+        procs_due_ = 0;
         // Switch back to the compact Power-only query, or establish fresh full
         // Energy/GPU baselines. No differences may cross a mode/pause boundary.
         ReleaseEnergy();
@@ -2550,6 +2585,13 @@ Snapshot Metrics::Impl::Take(bool full) {
         last_.fps_status = 0;
         last_.fps_process.clear();
         last_.fps_top.clear();
+        const auto network = probe.Get();
+        last_.net_state = network.state;
+        last_.latency_ms = network.latency_ms;
+        last_.offline_since_unix = network.offline_since_unix;
+        last_.offline_by_latency = network.offline_by_latency;
+        last_.offline_reason = network.offline_reason;
+        last_.offline_latency_ms = network.offline_latency_ms;
         return last_;
     }
     diagnostics::ScopedTiming timing(L"Sample total (includes stages)");
@@ -2568,9 +2610,11 @@ Snapshot Metrics::Impl::Take(bool full) {
     UpdateCpu(s, now, wants.cpu_freq);
     UpdateMem(s, wants.memory_detail);
     UpdateBattery(s, now, dt, has_dt);
-    UpdateScheme(now);
-    s.power_scheme = scheme_;
-    s.power_scheme_kind = scheme_kind_;
+    if (wants.power_scheme) {
+        UpdateScheme(now);
+        s.power_scheme = scheme_;
+        s.power_scheme_kind = scheme_kind_;
+    } else scheme_ready_ = false;
     if (wants.chip_power) {
         UpdateEnergy(full, now);
         s.pkg_w = pkg_w_;
@@ -2586,7 +2630,16 @@ Snapshot Metrics::Impl::Take(bool full) {
         UpdateGpu(full, now);
         s.gpu_percent = gpu_percent_;
     }
-    if (full && wants.processes) UpdateProcs(s);
+    if (full && wants.processes) UpdateProcs(s, GetTickCount64());
+    if (wants.process_count && !wants.processes) {
+        // K32 lives in kernel32; no additional self-test link dependency.
+        using PerformanceFn = BOOL(WINAPI*)(PPERFORMANCE_INFORMATION, DWORD);
+        static const auto performance = reinterpret_cast<PerformanceFn>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetPerformanceInfo"));
+        PERFORMANCE_INFORMATION info{};
+        info.cb = sizeof(info);
+        if (performance && performance(&info, sizeof(info))) s.process_count = static_cast<int>(info.ProcessCount);
+    }
     if (wants.disk_io) UpdateDisk(now, s);
     if (wants.sys_disk) UpdateSysDisk(now, s);
     if (wants.uptime) UpdateUptime(s);
@@ -2626,6 +2679,8 @@ void Metrics::SetPaused(bool paused) {
 }
 
 std::wstring Metrics::LogPath() const { return impl_->probe.LogPath(); }
+
+void Metrics::SetProbeEnabled(bool enabled) { impl_->probe.SetEnabled(enabled); }
 
 void Metrics::SetSlowThreshold(int slow_ms) { impl_->probe.SetSlowThreshold(slow_ms); }
 

@@ -36,6 +36,7 @@ public:
     T* operator->() const { return value_; }
     explicit operator bool() const { return value_ != nullptr; }
     T** Put() { Reset(); return &value_; }
+    void Retain(T* value) { if (value) value->AddRef(); Reset(); value_ = value; }
     void Reset() { if (value_) { value_->Release(); value_ = nullptr; } }
 private:
     T* value_ = nullptr;
@@ -51,7 +52,9 @@ Layout FullLayout(const Components& components, float width = 320);
 
 class Renderer {
 public:
-    HRESULT Initialize();
+    HRESULT Initialize(bool fullPanel = true);
+    void SetSoftware(bool software);
+    void SetTaskbarDetails(bool details) { taskbarDetails_ = details; }
     void SetWindow(HWND window, UINT dpi);
     void SetDpi(UINT dpi);
     void SetZoom(int percent);
@@ -106,8 +109,8 @@ private:
     float compactWidth_ = 51, fullWidth_ = 320;
     float networkLabelWidth_ = 32, latencyLabelWidth_ = 34, systemLabelWidth_ = 84;
     float readLabelWidth_ = 20, writeLabelWidth_ = 20;
-    bool chartVisible_ = false, compact_ = false;
-    bool compactEtaVisible_ = true;
+    bool chartVisible_ = false, compact_ = false, fullPanel_ = true, software_ = false;
+    bool compactEtaVisible_ = true, taskbarDetails_ = false;
     float scroll_ = 0;
     HWND window_ = nullptr;
     UINT dpi_ = 96;

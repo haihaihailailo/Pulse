@@ -346,7 +346,8 @@ struct Status {
 class CsLock {
 public:
     explicit CsLock(CRITICAL_SECTION* cs) : cs_(cs) { EnterCriticalSection(cs_); }
-    ~CsLock() { LeaveCriticalSection(cs_); }
+    ~CsLock() { Unlock(); }
+    void Unlock() { if (cs_) { LeaveCriticalSection(cs_); cs_ = nullptr; } }
     CsLock(const CsLock&) = delete;
     CsLock& operator=(const CsLock&) = delete;
 
@@ -367,13 +368,33 @@ void WriteLogLine(const std::wstring& path, const wchar_t* category, const std::
     std::string utf8(static_cast<std::size_t>(count), '\0');
     WideCharToMultiByte(CP_UTF8, 0, line.data(), static_cast<int>(line.size()), &utf8[0], count,
                         nullptr, nullptr);
+    // Serialize GUI/self-test rotation and BOM creation. If coordination is
+    // unavailable, append the complete record without attempting a rename.
+    static HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\Pulse.Diagnostics.Log.v1");
+    const DWORD wait = mutex ? WaitForSingleObject(mutex, 100) : WAIT_FAILED;
+    const bool owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+    struct Release { HANDLE h; ~Release() { if (h) ReleaseMutex(h); } } release{owned ? mutex : nullptr};
     EnsureParent(path);
     HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_DATA,
                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
     LARGE_INTEGER size{};
-    if (GetFileSizeEx(file, &size) && size.QuadPart == 0) utf8.insert(0, "\xEF\xBB\xBF");
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 1024 * 1024 && owned &&
+        MoveFileExW(path.c_str(), (path + L".1").c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        const HANDLE replacement = CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (replacement != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            file = replacement;
+            size.QuadPart = -1;
+            GetFileSizeEx(file, &size);
+        }
+        // If reopening failed, the original handle still appends this complete
+        // record to the archive. Failed renames keep appending to the live file.
+    }
+    if (size.QuadPart == 0) utf8.insert(0, "\xEF\xBB\xBF");
     WriteAll(file, utf8.data(), static_cast<DWORD>(utf8.size()));
     CloseHandle(file);
 }
@@ -388,6 +409,7 @@ void diagnostics::WriteLog(const wchar_t* category, const std::wstring& message)
 struct NetProbe::Impl {
     Impl() {
         InitializeCriticalSection(&status_cs_);
+        InitializeCriticalSection(&publication_cs_);
         cs_ready_ = true;
         log_path_ = MakeLogPath();
     }
@@ -398,6 +420,7 @@ struct NetProbe::Impl {
         if (network_event_) CloseHandle(network_event_);
         if (cs_ready_) {
             DeleteCriticalSection(&status_cs_);
+            DeleteCriticalSection(&publication_cs_);
             cs_ready_ = false;
         }
     }
@@ -500,26 +523,46 @@ struct NetProbe::Impl {
     }
 
     void OnSuspend() {
+        CsLock publication(&publication_cs_);
         CsLock lock(&status_cs_);
         if (suspended_) return;
         suspended_ = true;
         resume_pending_ = false;
         ++power_epoch_; // Invalidate an in-flight result before cancelling its I/O.
+        std::wstring log;
         if (status_.outage_active)
-            AppendLog(L"进入睡眠，结束本次断网计时（已持续 " +
+            log = (L"进入睡眠，结束本次断网计时（已持续 " +
                       FormatOutageDuration((GetTickCount64() - status_.first_failure_tick) / 1000) + L"）");
         else
-            AppendLog(L"进入睡眠，暂停网络探测");
+            log = L"进入睡眠，暂停网络探测";
         status_ = Status{};
         view_ = MakeView(status_);
         if (wake_event_) SetEvent(wake_event_);
+        lock.Unlock();
+        AppendLog(log);
     }
 
     void OnResume() {
+        CsLock publication(&publication_cs_);
         CsLock lock(&status_cs_);
         // Windows may send AUTOMATIC and RESUMESUSPEND for the same resume.
         if (!suspended_ && resume_pending_) return;
-        ResetAfterResumeLocked(false);
+        const auto log = ResetAfterResumeLocked(false);
+        lock.Unlock();
+        AppendLog(log);
+    }
+
+    void SetEnabled(bool enabled) {
+        if (enabled_.load(std::memory_order_acquire) == enabled) return;
+        CsLock publication(&publication_cs_);
+        CsLock lock(&status_cs_);
+        if (enabled_ == enabled) return;
+        enabled_.store(enabled, std::memory_order_release);
+        ++power_epoch_;
+        status_ = Status{};
+        view_ = MakeView(status_);
+        if (!resume_pending_) resume_not_before_ = 0;
+        if (wake_event_) SetEvent(wake_event_);
     }
 
     void RequestProbe() {
@@ -530,22 +573,24 @@ struct NetProbe::Impl {
     }
 
 private:
-    void ResetAfterResumeLocked(bool detected_gap) {
-        if (detected_gap && status_.outage_active)
-            AppendLog(L"检测到系统挂起：进入睡眠，结束本次断网计时");
+    std::wstring ResetAfterResumeLocked(bool detected_gap) {
         suspended_ = false;
         resume_pending_ = true;
         resume_not_before_ = GetTickCount64() + kResumeDelayMs;
         ++power_epoch_;
         status_ = Status{};
         view_ = MakeView(status_);
-        AppendLog(detected_gap ? L"检测到系统挂起，3 秒后重新探测" : L"系统恢复，3 秒后重新探测");
         if (wake_event_) SetEvent(wake_event_);
+        return detected_gap ? L"检测到系统挂起，结束旧计时，3 秒后重新探测" : L"系统恢复，3 秒后重新探测";
     }
 
     void ResumeAfterGap(std::uint64_t epoch) {
+        CsLock publication(&publication_cs_);
         CsLock lock(&status_cs_);
-        if (!suspended_ && epoch == power_epoch_) ResetAfterResumeLocked(true);
+        std::wstring log;
+        if (!suspended_ && epoch == power_epoch_) log = ResetAfterResumeLocked(true);
+        lock.Unlock();
+        if (!log.empty()) AppendLog(log);
     }
 
     static DWORD WINAPI ThreadProc(LPVOID param) {
@@ -808,8 +853,7 @@ private:
     }
 
     // Caller holds status_cs_: power transitions and event publication stay ordered.
-    void PublishEvent(const std::wstring& log, std::wstring notification, bool recovered, NetEvent& event) {
-        if (!log.empty()) AppendLog(log);
+    void PublishEvent(std::wstring notification, bool recovered, NetEvent& event) {
         if (!notification.empty() && !Stopping() && cb_) {
             event.recovered = recovered;
             event.message = std::move(notification);
@@ -818,9 +862,11 @@ private:
     }
 
     bool ApplyLinkDisconnected(std::uint64_t epoch) {
+        CsLock publication(&publication_cs_);
         CsLock lock(&status_cs_);
-        if (suspended_ || resume_pending_ || epoch != power_epoch_ ||
+        if (!enabled_ || suspended_ || epoch != power_epoch_ ||
             network_pending_.load(std::memory_order_acquire)) return false;
+        resume_pending_ = false;
         Status& state = status_;
         state.has_result = true;
         state.latest_ok = false;
@@ -846,14 +892,16 @@ private:
         event.reason = state.outage_reason;
         event.offline_start_unix = state.outage_unix;
         event.event_unix = state.first_failure_unix;
-        PublishEvent(L"网络断开：网络连接已断开",
-                     LocalTimeText(now, false) + L" 起网络连接已断开", false, event);
+        PublishEvent(LocalTimeText(now, false) + L" 起网络连接已断开", false, event);
+        lock.Unlock();
+        AppendLog(L"网络断开：网络连接已断开");
         return true;
     }
 
     bool ApplyResult(bool& ok, ULONGLONG& ms, bool timed_out, std::uint64_t epoch) {
+        CsLock publication(&publication_cs_);
         CsLock lock(&status_cs_);
-        if (suspended_ || epoch != power_epoch_ ||
+        if (!enabled_ || suspended_ || epoch != power_epoch_ ||
             network_pending_.load(std::memory_order_acquire)) return false;
         // A local proxy/TUN response cannot recover a confirmed physical outage.
         // This query is confined to recovery attempts after physical disconnection.
@@ -934,7 +982,9 @@ private:
         }
         // Serialize publication with OnSuspend/OnResume: after either returns,
         // the UI can safely drain every notification from the previous epoch.
-        PublishEvent(log, std::move(notification), recovered, event);
+        PublishEvent(std::move(notification), recovered, event);
+        lock.Unlock();
+        if (!log.empty()) AppendLog(log);
         return true;
     }
 
@@ -1010,7 +1060,7 @@ private:
         while (!Stopping()) {
             // The flag also survives NIC events consumed inside an HTTP wait.
             const bool network_changed = network_pending_.exchange(false, std::memory_order_acq_rel);
-            bool suspended = false, resuming = false, fast = false, offline = false;
+            bool suspended = false, resuming = false, fast = false, offline = false, physical = false, enabled = false;
             {
                 CsLock lock(&status_cs_);
                 // Reset under the same lock as the power handlers, before
@@ -1020,14 +1070,21 @@ private:
                     epoch = power_epoch_;
                     next_due = resume_not_before_;
                     last_start = 0;
-                    race_next = false;
+                    race_next = enabled_ && !resume_pending_;
                     link_check_due = 0;
                     link_was_disconnected = false;
                 }
                 suspended = suspended_;
+                enabled = enabled_;
+                physical = status_.link_disconnected;
                 resuming = resume_pending_;
                 fast = status_.fail_count != 0;
                 offline = status_.outage_active;
+            }
+            if (!enabled) {
+                const DWORD waited = WaitForMultipleObjects(3, events, FALSE, INFINITE);
+                if (waited == WAIT_OBJECT_0 || waited == WAIT_FAILED) break;
+                continue;
             }
             ULONGLONG now = GetTickCount64();
             if (!suspended && last_start && now - last_start > gap_limit) {
@@ -1053,7 +1110,7 @@ private:
                         if (ApplyLinkDisconnected(epoch)) {
                             // The outage is published; resume HTTP at the existing
                             // offline cadence without three confirmations.
-                            next_due = GetTickCount64() + kOfflineIntervalMs;
+                            next_due = GetTickCount64() + 15000;
                         }
                     } else {
                         // Some drivers publish the IP notification before updating
@@ -1075,6 +1132,14 @@ private:
                 continue;
             }
 
+            // No HTTP while all physical links are down. NIC notifications wake
+            // this wait immediately; 15 s also covers missed driver notifications.
+            if ((physical || fast || !last_start) && detail::AllPhysicalNicsDisconnected()) {
+                ApplyLinkDisconnected(epoch);
+                last_start = now;
+                next_due = now + 15000;
+                continue;
+            }
             last_start = now;
             const std::int64_t round_start = ProbeClockNow();
             ++round;
@@ -1118,7 +1183,9 @@ private:
                               applied ? L"applied" : L"invalidated", trace);
             {
                 CsLock lock(&status_cs_);
-                const ULONGLONG interval = status_.outage_active ? kOfflineIntervalMs :
+                const ULONGLONG interval = status_.outage_active ?
+                    (status_.link_disconnected ? 15000ULL :
+                     GetTickCount64() - status_.first_failure_tick >= 120000 ? 3000ULL : kOfflineIntervalMs) :
                     status_.fail_count ? kConfirmIntervalMs :
                     static_cast<ULONGLONG>(config_.interval_s) * 1000ULL;
                 // Cadence is measured start-to-start. If a round consumes its
@@ -1134,6 +1201,8 @@ private:
     Status status_{};
     NetProbe::View view_{};
     mutable CRITICAL_SECTION status_cs_{};
+    CRITICAL_SECTION publication_cs_{}; // Orders transitions/logs without blocking Get on disk.
+    std::atomic<bool> enabled_{true};
     bool cs_ready_ = false;
     std::wstring log_path_;
     Metrics::EventCallback cb_ = nullptr;
@@ -1173,6 +1242,8 @@ void NetProbe::SetSlowThreshold(int slow_ms) { impl_->SetSlowThreshold(slow_ms);
 void NetProbe::OnSuspend() { impl_->OnSuspend(); }
 
 void NetProbe::OnResume() { impl_->OnResume(); }
+
+void NetProbe::SetEnabled(bool enabled) { impl_->SetEnabled(enabled); }
 
 void NetProbe::RequestProbe() { impl_->RequestProbe(); }
 
