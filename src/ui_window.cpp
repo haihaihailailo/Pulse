@@ -6,6 +6,7 @@
 #include "development.h"
 #include "window_interaction.h"
 #include "development_ui.h"
+#include "portable.h"
 #include <windowsx.h>
 #include <shellapi.h>
 #ifndef SEE_MASK_NOCLOSEPROCESS
@@ -42,9 +43,9 @@ constexpr wchar_t MainClass[] = L"Pulse.Development.Main.v1";
 constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Development.SingleInstance.v1";
 constexpr wchar_t ToastClass[] = L"Pulse.Development.Notification.v1";
 #else
-constexpr wchar_t MainClass[] = L"Pulse.Native.Main.v1";
-constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Native.SingleInstance.v1";
-constexpr wchar_t ToastClass[] = L"Pulse.Native.Notification.v1";
+const wchar_t* MainClass = L"Pulse.Native.Main.v1";
+const wchar_t* SingleInstanceMutex = L"Local\\Pulse.Native.SingleInstance.v1";
+const wchar_t* ToastClass = L"Pulse.Native.Notification.v1";
 #endif
 constexpr wchar_t RestartedArg[] = L"--restarted";
 constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -330,8 +331,8 @@ struct Config {
         const std::wstring folder = development::DataDirectory();
 #else
         wchar_t directory[MAX_PATH]{};
-        if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, nullptr, SHGFP_TYPE_CURRENT, directory))) return false;
-        std::wstring folder = std::wstring(directory) + L"\\Pulse";
+        if (!portable::Enabled() && FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, nullptr, SHGFP_TYPE_CURRENT, directory))) return false;
+        std::wstring folder = portable::Enabled() ? portable::directory : std::wstring(directory) + L"\\Pulse";
         if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
 #endif
         file = folder + L"\\settings.ini";
@@ -675,7 +676,7 @@ public:
         }
         config_.x = ClampCoordinate(config_.x, work.left, work.right, width);
         config_.y = ClampCoordinate(config_.y, work.top, work.bottom, height);
-        window_ = CreateWindowExW(WS_EX_TOOLWINDOW, MainClass, T(Key::AppName).c_str(), MainStyle,
+        window_ = CreateWindowExW(WS_EX_TOOLWINDOW, MainClass, portable::Enabled() ? L"Pulse Portable" : T(Key::AppName).c_str(), MainStyle,
             config_.x, config_.y, width, height, nullptr, nullptr, instance_, this);
         if (!window_) return 1;
         RECT initialRect{};
@@ -1290,6 +1291,7 @@ private:
         return true;
     }
     bool StartupEnabled() const {
+        if (portable::Enabled()) return false;
 #ifdef PULSE_DEVELOPMENT
         return false;
 #endif
@@ -1309,6 +1311,7 @@ private:
         return enabled;
     }
     void ToggleStartup() {
+        if (portable::Enabled()) return;
 #ifdef PULSE_DEVELOPMENT
         return;
 #endif
@@ -1354,6 +1357,7 @@ private:
                                : config_.components.Enabled(FullComponent::Fps);
     }
     void RestartElevated() {
+        if (portable::Enabled()) return;
 #ifdef PULSE_DEVELOPMENT
         return;
 #endif
@@ -1500,6 +1504,10 @@ private:
                         CmdCompactComponent + static_cast<UINT>(CompactComponent::Fps)})
             EnableMenuItem(menu, id, MF_BYCOMMAND | MF_GRAYED);
 #endif
+        if (portable::Enabled()) {
+            for (UINT id : {CmdStartup, CmdShortcutDesktop, CmdShortcutStartMenu, CmdRestartAdmin})
+                EnableMenuItem(menu, id, MF_BYCOMMAND | MF_GRAYED);
+        }
         return menu;
     }
     void Menu(POINT point) {
@@ -1513,6 +1521,8 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (portable::Enabled() && (command == CmdStartup || command == CmdShortcutDesktop ||
+            command == CmdShortcutStartMenu || command == CmdRestartAdmin)) return;
 #ifdef PULSE_DEVELOPMENT
         if (command == CmdTaskbar || command == CmdStartup || command == CmdShortcutDesktop ||
             command == CmdShortcutStartMenu || command == CmdRestartAdmin || command == CmdLog ||
@@ -2058,6 +2068,13 @@ void EnableDpiAwareness() {
 }
 
 int Run(HINSTANCE instance, int showCommand, const wchar_t* commandLine) {
+#ifndef PULSE_DEVELOPMENT
+    if (portable::Enabled()) {
+        MainClass = L"Pulse.Portable.Main.v1";
+        SingleInstanceMutex = L"Local\\Pulse.Portable.SingleInstance.v1";
+        ToastClass = L"Pulse.Portable.Notification.v1";
+    }
+#endif
     const bool restarted = CommandHasRestarted(commandLine);
     HANDLE mutex = CreateMutexW(nullptr, FALSE, SingleInstanceMutex);
     if (!mutex) {

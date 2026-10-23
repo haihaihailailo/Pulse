@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include "development.h"
+#include "portable.h"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -142,6 +143,7 @@ std::wstring MakeLogPath() {
 #ifdef PULSE_DEVELOPMENT
     return development::DataDirectory() + L"\\pulse_net.log";
 #else
+    if (portable::Enabled()) return portable::directory + L"\\pulse_net.log";
     std::wstring base = GetEnv(L"LOCALAPPDATA");
     if (base.empty()) {
         const std::wstring user = GetEnv(L"USERPROFILE");
@@ -375,7 +377,8 @@ void WriteLogLine(const std::wstring& path, const wchar_t* category, const std::
                         nullptr, nullptr);
     // Serialize GUI/self-test rotation and BOM creation. If coordination is
     // unavailable, append the complete record without attempting a rename.
-    static HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\Pulse.Diagnostics.Log.v1");
+    static HANDLE mutex = CreateMutexW(nullptr, FALSE, portable::Enabled() ?
+        L"Local\\Pulse.Portable.Diagnostics.Log.v1" : L"Local\\Pulse.Diagnostics.Log.v1");
     const DWORD wait = mutex ? WaitForSingleObject(mutex, 100) : WAIT_FAILED;
     const bool owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
     struct Release { HANDLE h; ~Release() { if (h) ReleaseMutex(h); } } release{owned ? mutex : nullptr};

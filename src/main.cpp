@@ -2,6 +2,7 @@
 #include "i18n.h"
 #include "development.h"
 #include "development_ui.h"
+#include "portable.h"
 #include <exception>
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
@@ -13,6 +14,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     pulse::ui::EnableDarkMode();
     pulse::ui::EnableDpiAwareness();
     try {
+        pulse::portable::Initialize();
 #ifdef PULSE_DEVELOPMENT
         if (pulse::development::ParseSmoke(commandLine) == pulse::development::SmokeMode::UiPeer)
             return pulse::development::RunUiPeer(instance);
