@@ -1,5 +1,7 @@
 ﻿#include "ui_renderer.h"
 #include <d2d1helper.h>
+#include "window_interaction.h"
+#include "development_ui.h"
 #include <dwmapi.h>
 #include <algorithm>
 #include <cmath>
@@ -158,7 +160,7 @@ void Renderer::SetDpi(UINT dpi) {
     if (target_) target_->SetDpi(RenderDpi(), RenderDpi());
 }
 void Renderer::SetZoom(int percent) {
-    percent = std::clamp(percent, 80, 200);
+    percent = std::clamp(percent, MinimumZoom, MaximumZoom);
     if (zoom_ == percent) return;
     zoom_ = percent;
     // Keep all layout coordinates in logical DIPs. The target's effective DPI
@@ -227,14 +229,41 @@ HRESULT Renderer::CreateTarget() {
     auto properties = D2D1::RenderTargetProperties(software_ ?
         D2D1_RENDER_TARGET_TYPE_SOFTWARE : D2D1_RENDER_TARGET_TYPE_DEFAULT);
     properties.dpiX = properties.dpiY = RenderDpi();
+#ifdef PULSE_DEVELOPMENT
+    properties.usage = D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE;
+    properties.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE);
+#endif
     HRESULT hr = factory_->CreateHwndRenderTarget(properties,
-        D2D1::HwndRenderTargetProperties(window_, D2D1::SizeU(r.right, r.bottom)), target_.Put());
+        D2D1::HwndRenderTargetProperties(window_, D2D1::SizeU(r.right, r.bottom)
+#ifdef PULSE_DEVELOPMENT
+            , D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS
+#endif
+        ), target_.Put());
     if (FAILED(hr)) return hr;
     target_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
     hr = target_->CreateSolidColorBrush(TextColor, brush_.Put());
     if (FAILED(hr)) DiscardTarget();
     return hr;
 }
+#ifdef PULSE_DEVELOPMENT
+HRESULT Renderer::CaptureForDevelopment(const wchar_t* name) {
+    if (!target_) return E_FAIL;
+    ComPtr<ID2D1GdiInteropRenderTarget> interop;
+    HRESULT result = target_->QueryInterface(__uuidof(ID2D1GdiInteropRenderTarget), reinterpret_cast<void**>(interop.Put()));
+    if (FAILED(result)) return result;
+    target_->BeginDraw();
+    HDC dc = nullptr;
+    result = interop->GetDC(D2D1_DC_INITIALIZE_MODE_COPY, &dc);
+    if (SUCCEEDED(result)) {
+        const auto size = target_->GetPixelSize();
+        const bool saved = development::SaveBitmap(dc, size.width, size.height, name);
+        const HRESULT released = interop->ReleaseDC(nullptr);
+        result = !saved ? E_FAIL : released;
+    }
+    const HRESULT finished = target_->EndDraw();
+    return FAILED(result) ? result : finished;
+}
+#endif
 HRESULT Renderer::Finish() {
     const HRESULT hr = target_->EndDraw();
     // Consume the previous presentation's occlusion flag. Future checks then

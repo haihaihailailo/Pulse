@@ -3,6 +3,9 @@
 #include "ui_taskbar.h"
 #include "metrics.h"
 #include "netprobe.h"
+#include "development.h"
+#include "window_interaction.h"
+#include "development_ui.h"
 #include <windowsx.h>
 #include <shellapi.h>
 #ifndef SEE_MASK_NOCLOSEPROCESS
@@ -34,10 +37,16 @@
 
 namespace pulse::ui {
 namespace {
+#ifdef PULSE_DEVELOPMENT
+constexpr wchar_t MainClass[] = L"Pulse.Development.Main.v1";
+constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Development.SingleInstance.v1";
+constexpr wchar_t ToastClass[] = L"Pulse.Development.Notification.v1";
+#else
 constexpr wchar_t MainClass[] = L"Pulse.Native.Main.v1";
 constexpr wchar_t SingleInstanceMutex[] = L"Local\\Pulse.Native.SingleInstance.v1";
-constexpr wchar_t RestartedArg[] = L"--restarted";
 constexpr wchar_t ToastClass[] = L"Pulse.Native.Notification.v1";
+#endif
+constexpr wchar_t RestartedArg[] = L"--restarted";
 constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr int kAppIconId = 1;
 constexpr UINT SampleTimer = 1;
@@ -51,6 +60,7 @@ constexpr UINT CmdFull = 101, CmdCompact = 102, CmdPin = 103, CmdStartup = 104;
 constexpr UINT CmdLog = 105, CmdExit = 106, CmdDefaults = 107, TrayId = 1;
 constexpr UINT CmdNetworkNotify = 108, CmdNotifySound = 109, CmdRestartAdmin = 110;
 constexpr UINT CmdShortcutDesktop = 111, CmdShortcutStartMenu = 112, CmdTaskbar = 113;
+constexpr UINT CmdSnap = 114, CmdClickThrough = 115;
 constexpr UINT CmdTaskbarComponent = 700;
 constexpr UINT CmdTaskbarPosition = 750;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
@@ -62,13 +72,16 @@ constexpr std::array<i18n::Preference, 3> Languages{{
     i18n::Preference::Auto, i18n::Preference::Chinese, i18n::Preference::English}};
 constexpr std::array<UINT, 3> RefreshIntervals{{500u, 1000u, 2000u}};
 constexpr std::array<int, 7> SlowThresholds{{50, 100, 150, 200, 300, 500, 800}};
-constexpr std::array<int, 6> ZoomLevels{{80, 100, 125, 150, 175, 200}};
+constexpr std::array<int, 11> ZoomLevels{{30, 40, 50, 60, 70, 80, 100, 125, 150, 175, 200}};
 constexpr DWORD MainStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX;
 constexpr DWORD ToastStyle = WS_POPUP | WS_CAPTION | WS_THICKFRAME;
 
 void AllowShowFromLowerIntegrity(HWND window, UINT message = ShowMessage);
 
 void AlertSound(bool play) {
+#ifdef PULSE_DEVELOPMENT
+    return;
+#endif
     using PlayFn = BOOL(WINAPI*)(LPCWSTR, HMODULE, DWORD);
     static HMODULE module = nullptr;
     static PlayFn sound = nullptr;
@@ -212,6 +225,9 @@ HRESULT ReadShortcutTarget(const std::wstring& path, std::wstring& target) {
     return result;
 }
 void CreateShortcut(HWND owner, REFKNOWNFOLDERID destination) {
+#ifdef PULSE_DEVELOPMENT
+    return;
+#endif
     const auto fail = [owner](HRESULT result) {
         wchar_t code[16]{};
         std::swprintf(code, sizeof(code) / sizeof(code[0]), L"0x%08lX", static_cast<unsigned long>(result));
@@ -298,6 +314,7 @@ struct Config {
     TaskbarPosition taskbarPosition = TaskbarPosition::Auto;
     int widgetsWidth = 120;
     bool pinned = true;
+    bool snap = true;
     bool notify = true, notify_sound = true;
     std::wstring file;
     Components components;
@@ -309,10 +326,14 @@ struct Config {
         return info.enabled;
     }
     bool Load() {
+#ifdef PULSE_DEVELOPMENT
+        const std::wstring folder = development::DataDirectory();
+#else
         wchar_t directory[MAX_PATH]{};
         if (FAILED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA | CSIDL_FLAG_CREATE, nullptr, SHGFP_TYPE_CURRENT, directory))) return false;
         std::wstring folder = std::wstring(directory) + L"\\Pulse";
         if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+#endif
         file = folder + L"\\settings.ini";
         x = static_cast<int>(GetPrivateProfileIntW(L"Window", L"X", INT_MIN, file.c_str()));
         y = static_cast<int>(GetPrivateProfileIntW(L"Window", L"Y", INT_MIN, file.c_str()));
@@ -336,11 +357,12 @@ struct Config {
         widgetsWidth = widgetsEnd != widgetsValue && *widgetsEnd == L'\0' ?
             static_cast<int>(std::clamp(widgetsDips, 0L, 300L)) : 120;
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
+        snap = GetPrivateProfileIntW(L"Window", L"snap", 1, file.c_str()) != 0;
         wchar_t zoomValue[32]{};
         GetPrivateProfileStringW(L"Window", L"zoom", L"100", zoomValue, 32, file.c_str());
         wchar_t* zoomEnd = nullptr;
         const long zoomPercent = std::wcstol(zoomValue, &zoomEnd, 10);
-        zoom = zoomEnd != zoomValue && *zoomEnd == L'\0' && zoomPercent >= 80 && zoomPercent <= 200 ?
+        zoom = zoomEnd != zoomValue && *zoomEnd == L'\0' && zoomPercent >= MinimumZoom && zoomPercent <= MaximumZoom ?
             static_cast<int>(zoomPercent) : 100;
         const UINT interval = GetPrivateProfileIntW(L"Window", L"refresh_ms", 1000, file.c_str());
         refresh_ms = std::find(RefreshIntervals.begin(), RefreshIntervals.end(), interval) != RefreshIntervals.end() ? interval : 1000u;
@@ -357,6 +379,14 @@ struct Config {
             components.compact[i] = ReadComponent(L"Compact", CompactComponents[i]);
         for (size_t i = 0; i < TaskbarComponents.size(); ++i)
             components.taskbar[i] = ReadComponent(L"Taskbar", TaskbarComponents[i]);
+#ifdef PULSE_DEVELOPMENT
+        if (mode == DisplayMode::Taskbar) mode = DisplayMode::Compact;
+        pinned = false;
+        notify = notify_sound = false;
+        components.full[static_cast<size_t>(FullComponent::Fps)] = false;
+        components.compact[static_cast<size_t>(CompactComponent::Fps)] = false;
+        components.taskbar[static_cast<size_t>(CompactComponent::Fps)] = false;
+#endif
         return true;
     }
     void Save() const {
@@ -368,6 +398,7 @@ struct Config {
             mode == DisplayMode::Compact ? L"compact" : L"full", file.c_str());
         WritePrivateProfileStringW(L"Window", L"Compact", mode != DisplayMode::Full ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
+        WritePrivateProfileStringW(L"Window", L"snap", snap ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"language", i18n::PreferenceValue(language), file.c_str());
         WritePrivateProfileStringW(L"Taskbar", L"position", taskbarPosition == TaskbarPosition::Left ? L"left" :
             taskbarPosition == TaskbarPosition::Right ? L"right" : L"auto", file.c_str());
@@ -595,13 +626,18 @@ public:
         if (classIcon_) DestroyIcon(classIcon_);
         if (classSmallIcon_) DestroyIcon(classSmallIcon_);
     }
-    int Execute(int showCommand, bool restarted) {
+    int Execute(int showCommand, bool restarted, bool smoke = false, bool resumeSmoke = false) {
+#ifdef PULSE_DEVELOPMENT
+        development::UiPeer peer(smoke);
+#endif
         config_.Load();
         taskbarFallback_ = config_.mode == DisplayMode::Taskbar;
         i18n::SetLanguage(config_.language);
         notificationState_.store(config_.notify ? 1u : 0u, std::memory_order_release);
         if (FAILED(renderer_.Initialize())) {
+#ifndef PULSE_DEVELOPMENT
             MessageBoxW(nullptr, T(Key::GraphicsFailed).c_str(), L"Pulse", MB_OK | MB_ICONERROR);
+#endif
             return 1;
         }
         POINT initial{config_.x == INT_MIN ? 0 : config_.x, config_.y == INT_MIN ? 0 : config_.y};
@@ -639,9 +675,12 @@ public:
         }
         config_.x = ClampCoordinate(config_.x, work.left, work.right, width);
         config_.y = ClampCoordinate(config_.y, work.top, work.bottom, height);
-        window_ = CreateWindowExW(WS_EX_APPWINDOW, MainClass, T(Key::AppName).c_str(), MainStyle,
+        window_ = CreateWindowExW(WS_EX_TOOLWINDOW, MainClass, T(Key::AppName).c_str(), MainStyle,
             config_.x, config_.y, width, height, nullptr, nullptr, instance_, this);
         if (!window_) return 1;
+        RECT initialRect{};
+        GetWindowRect(window_, &initialRect);
+        dockedEdges_ = config_.snap ? DockedEdges(initialRect, work) : 0;
         AllowShowFromLowerIntegrity(window_);
         if (taskbarCreated_) AllowShowFromLowerIntegrity(window_, taskbarCreated_);
         callbackWindow_.store(window_, std::memory_order_release);
@@ -670,6 +709,33 @@ public:
             ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
         Sampling(true);
         UpdateWindow(window_);
+#ifdef PULSE_DEVELOPMENT
+        if (smoke) {
+            development::RequireIsolatedDesktop();
+            const bool restored = config_.mode == DisplayMode::Compact && config_.zoom == 125 && !config_.snap && !clickThrough_;
+            if (resumeSmoke && !restored) throw std::runtime_error("Development settings were not restored");
+            InteractionSmoke(peer, !resumeSmoke && development::Environment(L"PULSE_DEV_SESSION_KIND") == L"test");
+            SetMode(DisplayMode::Full);
+            const HRESULT fullPaint = renderer_.Paint(model_.Data(), false, config_.pinned, hover_, pressed_);
+            SetMode(DisplayMode::Compact);
+            SetZoom(125);
+            // Exercise the same handlers as the menu. They must be inert in development builds.
+            for (UINT command : {CmdStartup, CmdShortcutDesktop, CmdShortcutStartMenu, CmdRestartAdmin, CmdTaskbar}) Command(command);
+            if (!Compact() || StartupEnabled() || ProbeNeeded()) throw std::runtime_error("Development restriction failed");
+            const HRESULT compactPaint = renderer_.Paint(model_.Data(), true, config_.pinned, hover_, pressed_);
+            if (FAILED(fullPaint) || FAILED(compactPaint)) throw std::runtime_error("Development renderer failed");
+            Save();
+            diagnostics::WriteLog(L"DEV", resumeSmoke ? L"isolated smoke resume" : L"isolated smoke first run");
+            char receipt[512]{};
+            std::snprintf(receipt, sizeof(receipt), "{\"pass\":true,\"restored\":%s,\"mode\":\"compact\",\"zoom\":125,\"fullPaint\":%ld,\"compactPaint\":%ld,\"pid\":%lu,\"taskbarHidden\":true,\"trayProtocol\":true,\"snapChecks\":true,\"zoomRange\":[30,200],\"crossProcessHitTest\":true,\"trayRecovery\":true}\n",
+                        restored ? "true" : "false", static_cast<long>(fullPaint), static_cast<long>(compactPaint), GetCurrentProcessId());
+            development::WriteSmokeReceipt(receipt, resumeSmoke);
+            std::printf("PULSE_DEV_SMOKE %s", receipt);
+            std::fflush(stdout);
+            SendMessageW(window_, WM_CLOSE, 0, 0);
+            if (!peer.Close()) throw std::runtime_error("Development UI peer did not exit");
+        }
+#endif
         MSG message{};
         BOOL result;
         while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
@@ -715,6 +781,9 @@ private:
         taskbar_.Configure(config_.components, config_.zoom, config_.taskbarPosition, config_.widgetsWidth);
     }
     bool ProbeNeeded() const {
+#ifdef PULSE_DEVELOPMENT
+        return false;
+#endif
         if (config_.notify) return true;
         if (TaskbarMode()) {
             return (taskbar_.Visible() && config_.components.taskbar[static_cast<size_t>(CompactComponent::Latency)]) ||
@@ -831,6 +900,110 @@ private:
         if (GetWindowRect(window_, &r)) { config_.x = r.left; config_.y = r.top; }
     }
     void Save() { CapturePosition(); config_.Save(); }
+#ifdef PULSE_DEVELOPMENT
+    void InteractionSmoke(development::UiPeer& peer, bool capture) {
+        auto require = [](bool condition, const char* message) {
+            if (!condition) throw std::runtime_error(message);
+        };
+        auto bounds = [&] { RECT r{}; GetWindowRect(window_, &r); return r; };
+        require((GetWindowLongPtrW(window_, GWL_EXSTYLE) & (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW)) == WS_EX_TOOLWINDOW,
+                "Taskbar button style not hidden");
+        require(tray_ && SendMessageW(peer.shell, development::PeerCount, 0, 0) >= 1, "Native tray registration did not reach isolated peer");
+        if (!config_.snap) Command(CmdSnap);
+        HMENU menu = BuildMenu();
+        require(menu && (GetMenuState(menu, CmdSnap, MF_BYCOMMAND) & MF_CHECKED) &&
+                !(GetMenuState(menu, CmdClickThrough, MF_BYCOMMAND) & MF_GRAYED), "Interaction menu state mismatch");
+        DestroyMenu(menu);
+
+        // Independent expected coordinates, including a monitor left of the primary display.
+        const RECT syntheticWork{-1920, -100, 0, 1000};
+        RECT r = SnapToWorkArea({-1915, -95, -1715, 5}, syntheticWork, 12);
+        require(r.left == -1920 && r.top == -100 && r.right == -1720 && r.bottom == 0, "Top-left snap failed");
+        r = SnapToWorkArea({-205, 895, -5, 995}, syntheticWork, 12);
+        require(r.right == 0 && r.bottom == 1000, "Bottom-right snap failed");
+        r = SnapToWorkArea({-1895, -75, -1695, 25}, syntheticWork, 12);
+        require(r.left == -1895 && r.top == -75, "Drag away did not release snap");
+        r = SnapToWorkArea({-1903, 300, -1703, 400}, syntheticWork, 18);
+        require(r.left == -1920 && r.top == 300, "DPI-scaled snap distance failed");
+
+        SetMode(DisplayMode::Compact); SetZoom(100);
+        const auto work = WorkArea(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST));
+        r = bounds();
+        SetWindowPos(window_, nullptr, work.right - (r.right-r.left) - 5, work.bottom - (r.bottom-r.top) - 5,
+                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SnapCurrent();
+        r = bounds(); require(r.right == work.right && r.bottom == work.bottom, "Live corner snap failed");
+        SetZoom(-1); r = bounds();
+        if (config_.zoom != 30 || r.right != work.right || r.bottom != work.bottom)
+            throw std::runtime_error("30 percent docked zoom failed: rect=" + std::to_string(r.left) + "," +
+                std::to_string(r.top) + "," + std::to_string(r.right) + "," + std::to_string(r.bottom) +
+                " work=" + std::to_string(work.left) + "," + std::to_string(work.top) + "," +
+                std::to_string(work.right) + "," + std::to_string(work.bottom) +
+                " dpi=" + std::to_string(dpi_) + " edges=" + std::to_string(dockedEdges_));
+        const LONG smallWidth = r.right-r.left;
+        SetZoom(999); r = bounds();
+        require(config_.zoom == 200 && r.right-r.left > smallWidth && r.right == work.right && r.bottom == work.bottom,
+                "200 percent docked zoom failed");
+        SetMode(DisplayMode::Full); r = bounds();
+        require(r.right == work.right && r.bottom == work.bottom, "Mode change lost dock anchor");
+
+        Snapshot sample{};
+        sample.percent = 68; sample.cpu_percent = 24; sample.mem_percent = 48;
+        for (auto mode : {DisplayMode::Full, DisplayMode::Compact}) {
+            SetMode(mode);
+            for (int zoom : {30, 100, 200}) {
+                SetZoom(zoom);
+                model_.Update(sample, Compact(), config_.components);
+                require(renderer_.Paint(model_.Data(), Compact(), config_.pinned, Button::None, Button::None) == S_OK,
+                        "Zoom range render failed");
+                if (capture) {
+                    const auto name = std::wstring(Compact() ? L"compact-" : L"full-") + std::to_wstring(zoom) + L".bmp";
+                    require(SUCCEEDED(renderer_.CaptureForDevelopment(name.c_str())), "Native render capture failed");
+                }
+            }
+        }
+        Command(CmdSnap); // Persist OFF and verify it on the next process launch.
+        require(!config_.snap && dockedEdges_ == 0, "Snap menu did not disable docking");
+        SetZoom(100);
+        SetWindowPos(window_, nullptr, work.left+80, work.top+80, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        r = bounds();
+        SetWindowPos(peer.target, HWND_NOTOPMOST, r.left-10, r.top-10, r.right-r.left+20, r.bottom-r.top+20, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SetWindowPos(window_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        const POINT point{(r.left+r.right)/2, (r.top+r.bottom)/2};
+        require(WindowFromPoint(point) == window_, "Interactive window not hit before click-through");
+        Command(CmdClickThrough);
+        require(clickThrough_ && WindowFromPoint(point) == peer.target, "Cross-process click-through hit test failed");
+        require(renderer_.Paint(model_.Data(), true, config_.pinned, Button::None, Button::None) == S_OK,
+                "Layered click-through render failed");
+        if (capture) require(SUCCEEDED(renderer_.CaptureForDevelopment(L"compact-click-through.bmp")), "Click-through capture failed");
+        SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
+        require(!clickThrough_ && IsWindowVisible(window_) && WindowFromPoint(point) == window_, "Tray click did not restore interaction");
+        ActivateButton(Button::Minimize);
+        require(!IsWindowVisible(window_), "Minimize did not hide to tray");
+        SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
+        require(IsWindowVisible(window_), "Tray did not restore hidden window");
+        Command(CmdClickThrough);
+        SendMessageW(window_, taskbarCreated_, 0, 0);
+        require(!clickThrough_ && tray_, "Shell restart did not recover direct control");
+        RemoveTray(); Command(CmdClickThrough);
+        require(!clickThrough_, "Click-through enabled without tray recovery");
+        AddTray(); require(tray_, "Tray re-registration failed");
+    }
+#endif
+    RECT SnapDrag(RECT candidate) {
+        if (!config_.snap || TaskbarMode()) { dockedEdges_ = 0; return candidate; }
+        const auto monitor = MonitorFromRect(&candidate, MONITOR_DEFAULTTONEAREST);
+        const auto work = WorkArea(monitor);
+        candidate = SnapToWorkArea(candidate, work, Pixels(12, MonitorDpi(monitor)));
+        dockedEdges_ = DockedEdges(candidate, work);
+        return candidate;
+    }
+    void SnapCurrent() {
+        if (!window_ || TaskbarMode() || IsIconic(window_)) return;
+        RECT r{}; GetWindowRect(window_, &r);
+        r = SnapDrag(r);
+        SetWindowPos(window_, nullptr, r.left, r.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     void Fit(bool anchor, const RECT* suggestion = nullptr, bool topRight = false) {
         if (!window_ || fitting_) return;
         if (TaskbarMode()) { PositionDetails(); return; }
@@ -869,6 +1042,12 @@ private:
             const RECT screen = GetMonitorInfoW(monitor, &info) ? info.rcMonitor : work;
             if (static_cast<long long>(old.left) + old.right > static_cast<long long>(screen.left) + screen.right) x = old.right - width;
             if (static_cast<long long>(old.top) + old.bottom > static_cast<long long>(screen.top) + screen.bottom) y = old.bottom - height;
+        }
+        if (config_.snap) {
+            if (dockedEdges_ & DockLeft) x = work.left;
+            else if (dockedEdges_ & DockRight) x = work.right - width;
+            if (dockedEdges_ & DockTop) y = work.top;
+            else if (dockedEdges_ & DockBottom) y = work.bottom - height;
         }
         x = ClampCoordinate(x, work.left, work.right, width);
         y = ClampCoordinate(y, work.top, work.bottom, height);
@@ -975,6 +1154,9 @@ private:
         }
     }
     void SetMode(DisplayMode mode) {
+#ifdef PULSE_DEVELOPMENT
+        if (mode == DisplayMode::Taskbar) return;
+#endif
         if (config_.mode == mode) {
             if (mode == DisplayMode::Taskbar && taskbarFallback_) TrackTaskbar(true);
             return;
@@ -1005,7 +1187,7 @@ private:
     }
     void SetCompact(bool compact) { SetMode(compact ? DisplayMode::Compact : DisplayMode::Full); }
     void SetZoom(int percent) {
-        percent = std::clamp(percent, 80, 200);
+        percent = std::clamp(percent, MinimumZoom, MaximumZoom);
         if (config_.zoom == percent) return;
         config_.zoom = percent;
         renderer_.SetZoom(percent);
@@ -1029,6 +1211,7 @@ private:
         if (active_) InvalidateRect(window_, nullptr, FALSE);
     }
     void Show() {
+        SetClickThrough(false);
         if (TaskbarMode()) { if (!details_) ToggleDetails(); return; }
         ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
         Fit(false);
@@ -1084,7 +1267,32 @@ private:
         Shell_NotifyIconW(NIM_DELETE, &data);
         tray_ = false;
     }
+    bool SetClickThrough(bool enabled) {
+        if (enabled == clickThrough_) return true;
+        if (enabled && (!tray_ || TaskbarMode())) return false;
+        const auto oldStyle = GetWindowLongPtrW(window_, GWL_EXSTYLE);
+        const LONG_PTR flags = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        SetLastError(0);
+        if (!SetWindowLongPtrW(window_, GWL_EXSTYLE, enabled ? oldStyle | flags : oldStyle & ~flags) && GetLastError())
+            return false;
+        if (enabled && !SetLayeredWindowAttributes(window_, 0, 255, LWA_ALPHA)) {
+            SetWindowLongPtrW(window_, GWL_EXSTYLE, oldStyle);
+            return false;
+        }
+        clickThrough_ = enabled;
+        dragging_ = dragCandidate_ = false;
+        hover_ = pressed_ = Button::None;
+        if (GetCapture() == window_) ReleaseCapture();
+        renderer_.DiscardTarget();
+        SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        InvalidateRect(window_, nullptr, FALSE);
+        return true;
+    }
     bool StartupEnabled() const {
+#ifdef PULSE_DEVELOPMENT
+        return false;
+#endif
         HKEY key = nullptr;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, RunKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return false;
         DWORD type = 0, bytes = 0;
@@ -1101,6 +1309,9 @@ private:
         return enabled;
     }
     void ToggleStartup() {
+#ifdef PULSE_DEVELOPMENT
+        return;
+#endif
         const bool disable = StartupEnabled();
         HKEY key = nullptr;
         LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, RunKey, 0, nullptr, 0,
@@ -1120,6 +1331,9 @@ private:
         if (status != ERROR_SUCCESS) MessageBoxW(window_, T(Key::StartupSettingFailed).c_str(), L"Pulse", MB_OK | MB_ICONWARNING);
     }
     void OpenLog() {
+#ifdef PULSE_DEVELOPMENT
+        return;
+#endif
         if (!metrics_) return;
         const auto log = metrics_->LogPath();
         if (log.empty()) {
@@ -1140,6 +1354,9 @@ private:
                                : config_.components.Enabled(FullComponent::Fps);
     }
     void RestartElevated() {
+#ifdef PULSE_DEVELOPMENT
+        return;
+#endif
         const auto path = ExecutablePath();
         if (path.empty() || !window_) return;
         SHELLEXECUTEINFOW info{};
@@ -1156,9 +1373,9 @@ private:
         if (info.hProcess) CloseHandle(info.hProcess);
         SendMessageW(window_, WM_CLOSE, 0, 0);
     }
-    void Menu(POINT point) {
+    HMENU BuildMenu() {
         HMENU menu = CreatePopupMenu();
-        if (!menu) return;
+        if (!menu) return nullptr;
         AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Full ? MF_CHECKED : 0), CmdFull, T(Key::FullMode).c_str());
         AppendMenuW(menu, MF_STRING | (Compact() ? MF_CHECKED : 0), CmdCompact, T(Key::MiniMode).c_str());
         AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Taskbar ? MF_CHECKED : 0), CmdTaskbar, T(Key::TaskbarMode).c_str());
@@ -1259,6 +1476,10 @@ private:
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (config_.pinned ? MF_CHECKED : 0), CmdPin, T(Key::AlwaysOnTop).c_str());
+        AppendMenuW(menu, MF_STRING | (config_.snap ? MF_CHECKED : 0) | (TaskbarMode() ? MF_GRAYED : 0),
+                    CmdSnap, T(Key::SnapToEdge).c_str());
+        AppendMenuW(menu, MF_STRING | (clickThrough_ ? MF_CHECKED : 0) | (!tray_ || TaskbarMode() ? MF_GRAYED : 0),
+                    CmdClickThrough, T(Key::ClickThrough).c_str());
         AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CmdStartup, T(Key::StartWithWindows).c_str());
         HMENU shortcuts = CreatePopupMenu();
         if (shortcuts) {
@@ -1272,6 +1493,18 @@ private:
         if (FpsNeedsAdmin())
             AppendMenuW(menu, MF_STRING, CmdRestartAdmin, T(Key::RestartAdmin).c_str());
         AppendMenuW(menu, MF_STRING, CmdExit, T(Key::Exit).c_str());
+#ifdef PULSE_DEVELOPMENT
+        for (UINT id : {CmdTaskbar, CmdStartup, CmdShortcutDesktop, CmdShortcutStartMenu,
+                        CmdRestartAdmin, CmdLog, CmdNetworkNotify, CmdNotifySound,
+                        CmdFullComponent + static_cast<UINT>(FullComponent::Fps),
+                        CmdCompactComponent + static_cast<UINT>(CompactComponent::Fps)})
+            EnableMenuItem(menu, id, MF_BYCOMMAND | MF_GRAYED);
+#endif
+        return menu;
+    }
+    void Menu(POINT point) {
+        HMENU menu = BuildMenu();
+        if (!menu) return;
         SetForegroundWindow(window_);
         const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                                               point.x, point.y, window_, nullptr);
@@ -1280,6 +1513,14 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+#ifdef PULSE_DEVELOPMENT
+        if (command == CmdTaskbar || command == CmdStartup || command == CmdShortcutDesktop ||
+            command == CmdShortcutStartMenu || command == CmdRestartAdmin || command == CmdLog ||
+            command == CmdNetworkNotify || command == CmdNotifySound ||
+            command == CmdFullComponent + static_cast<UINT>(FullComponent::Fps) ||
+            command == CmdCompactComponent + static_cast<UINT>(CompactComponent::Fps) ||
+            (command >= CmdTaskbarComponent && command < CmdTaskbarPosition + 3)) return;
+#endif
         if (command >= CmdTaskbarPosition && command < CmdTaskbarPosition + 3) {
             config_.taskbarPosition = static_cast<TaskbarPosition>(command - CmdTaskbarPosition);
             ConfigureTaskbar();
@@ -1348,6 +1589,12 @@ private:
         case CmdFull: SetCompact(false); break;
         case CmdCompact: SetCompact(true); break;
         case CmdPin: TogglePin(); break;
+        case CmdSnap:
+            config_.snap = !config_.snap;
+            if (config_.snap) SnapCurrent(); else dockedEdges_ = 0;
+            Save();
+            break;
+        case CmdClickThrough: SetClickThrough(!clickThrough_); break;
         case CmdStartup: ToggleStartup(); break;
         case CmdShortcutDesktop: CreateShortcut(window_, FOLDERID_Desktop); break;
         case CmdShortcutStartMenu: CreateShortcut(window_, FOLDERID_Programs); break;
@@ -1360,7 +1607,7 @@ private:
         switch (button) {
         case Button::Mode: if (TaskbarMode()) ToggleDetails(); else SetCompact(!Compact()); break;
         case Button::Pin: TogglePin(); break;
-        case Button::Minimize: if (TaskbarMode()) ToggleDetails(); else { ShowWindow(window_, SW_MINIMIZE); Sampling(false); } break;
+        case Button::Minimize: if (TaskbarMode()) ToggleDetails(); else if (tray_) { Save(); ShowWindow(window_, SW_HIDE); Sampling(false); } break;
         case Button::Close: SendMessageW(window_, WM_CLOSE, 0, 0); break;
         default: break;
         }
@@ -1419,6 +1666,7 @@ private:
     }
     LRESULT Handle(UINT message, WPARAM w, LPARAM l) {
         if (taskbarCreated_ && message == taskbarCreated_) {
+            SetClickThrough(false); // Restore direct control before rebuilding a lost tray icon.
             tray_ = false; AddTray();
             if (config_.mode == DisplayMode::Taskbar) TrackTaskbar(true);
             return 0;
@@ -1452,6 +1700,11 @@ private:
             }
             Sampling(false);
             return 0;
+        case WM_WINDOWPOSCHANGING:
+            // Fit already validates size and work-area bounds. The default thick-frame
+            // minimum would inflate the 30% compact window at high display DPI.
+            if (fitting_) return 0;
+            break;
         case WM_GETMINMAXINFO: {
             auto* limits = reinterpret_cast<MINMAXINFO*>(l);
             const RECT work = WorkArea(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST));
@@ -1513,9 +1766,10 @@ private:
             if (w == SPI_SETWORKAREA) { Fit(false); ArrangeToasts(); }
             if (config_.language == i18n::Preference::Auto) SetLanguage(config_.language);
             return 0;
-        case WM_EXITSIZEMOVE: Fit(false); Save(); return 0;
+        case WM_EXITSIZEMOVE: SnapCurrent(); Fit(false); Save(); return 0;
         case WM_DWMCOMPOSITIONCHANGED: StyleWindow(window_); return 0;
         case WM_SYSCOMMAND:
+            if ((w & 0xfff0) == SC_MINIMIZE) { ActivateButton(Button::Minimize); return 0; }
             if ((w & 0xfff0) == SC_MAXIMIZE || (w & 0xfff0) == SC_SIZE) return 0;
             break;
         case WM_MOUSEWHEEL: {
@@ -1558,7 +1812,10 @@ private:
                 const int dx = cursor.x - dragOrigin_.x, dy = cursor.y - dragOrigin_.y;
                 if (dragging_ || std::abs(dx) >= GetSystemMetrics(SM_CXDRAG) || std::abs(dy) >= GetSystemMetrics(SM_CYDRAG)) {
                     dragging_ = true;
-                    SetWindowPos(window_, nullptr, dragRect_.left + dx, dragRect_.top + dy, 0, 0,
+                    RECT candidate = dragRect_;
+                    OffsetRect(&candidate, dx, dy);
+                    candidate = SnapDrag(candidate);
+                    SetWindowPos(window_, nullptr, candidate.left, candidate.top, 0, 0,
                                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
                 }
             } else {
@@ -1616,7 +1873,10 @@ private:
         case WM_COMMAND: Command(LOWORD(w)); return 0;
         case TrayMessage:
             if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT ||
-                (!trayVersion4_ && LOWORD(l) == WM_LBUTTONUP)) ToggleVisibility();
+                (!trayVersion4_ && LOWORD(l) == WM_LBUTTONUP)) {
+                if (clickThrough_) { SetClickThrough(false); Show(); }
+                else ToggleVisibility();
+            }
             else if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) {
                 POINT p{};
                 GetCursorPos(&p);
@@ -1692,6 +1952,8 @@ private:
     bool zoomFitPending_ = false;
     bool systemSuspended_ = false;
     bool tray_ = false, trayVersion4_ = false;
+    bool clickThrough_ = false; // Session-only: every launch starts interactive.
+    unsigned dockedEdges_ = 0;
     bool registeredMain_ = false, registeredToast_ = false, renderLost_ = false;
     float scroll_ = 0;
     int zoomWheelDelta_ = 0;
@@ -1832,6 +2094,11 @@ int Run(HINSTANCE instance, int showCommand, const wchar_t* commandLine) {
     ComApartment apartment;
     if (FAILED(apartment.result)) return 1;
     Application app(instance);
+#ifdef PULSE_DEVELOPMENT
+    const auto smoke = development::ParseSmoke(commandLine);
+    return app.Execute(showCommand, restarted, smoke != development::SmokeMode::None, smoke == development::SmokeMode::Resume);
+#else
     return app.Execute(showCommand, restarted);
+#endif
 }
 } // namespace pulse::ui

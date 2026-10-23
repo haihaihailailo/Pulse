@@ -8,6 +8,7 @@
 
 #include "metrics.h"
 #include "netprobe.h"
+#include "development.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -292,6 +293,10 @@ void OnNet(const pulse::NetEvent& event, void*) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+#ifdef PULSE_DEVELOPMENT
+    try { pulse::development::Initialize(); }
+    catch (const std::exception& error) { std::fprintf(stderr, "PULSE_DEV_REFUSED: %s\n", error.what()); return 2; }
+#endif
     _setmode(_fileno(stdout), _O_U16TEXT);
     int samples = 60, interval_ms = 1000, switch_every = 0;
     bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false;
@@ -330,6 +335,10 @@ int wmain(int argc, wchar_t** argv) {
             return 2;
         }
     }
+#ifdef PULSE_DEVELOPMENT
+    if (fps_test || !settings.probe_urls.empty()) return 2;
+    no_probe = true;
+#endif
     if (!CheckDurations()) return 1;
     if (fps_test) return RunFpsTest(settings, full, no_probe);
     InitializeCriticalSection(&g_print);

@@ -19,7 +19,11 @@ namespace {
 struct Entry { std::wstring zh, en; };
 // The two columns have exactly the same order as Key in i18n.h.
 const Entry strings[] = {
+#ifdef PULSE_DEVELOPMENT
+    {L"Pulse Dev", L"Pulse Dev"}, // AppName: visibly separate from the installed application.
+#else
     {L"Pulse", L"Pulse"}, // AppName
+#endif
     {L"Pulse 启动失败，请检查系统图形组件与可用内存。", L"Pulse could not start. Check the system graphics components and available memory."}, // StartupFailed
     {L"Pulse 遇到无法恢复的错误。", L"Pulse encountered an unrecoverable error."}, // FatalError
     {L"无法初始化 Direct2D / DirectWrite。", L"Could not initialize Direct2D / DirectWrite."}, // GraphicsFailed
@@ -208,6 +212,8 @@ const Entry strings[] = {
     {L"右侧", L"Right"},
     {L"左侧", L"Left"},
     {L"充满", L"Full"}, // TaskbarFull
+    {L"靠边吸附", L"Snap to screen edges"},
+    {L"鼠标穿透（点击托盘图标恢复）", L"Click through (click tray icon to restore)"},
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;

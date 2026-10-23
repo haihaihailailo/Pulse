@@ -6,6 +6,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include "development.h"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -138,6 +139,9 @@ std::wstring GetEnv(const wchar_t* name) {
 }
 
 std::wstring MakeLogPath() {
+#ifdef PULSE_DEVELOPMENT
+    return development::DataDirectory() + L"\\pulse_net.log";
+#else
     std::wstring base = GetEnv(L"LOCALAPPDATA");
     if (base.empty()) {
         const std::wstring user = GetEnv(L"USERPROFILE");
@@ -145,6 +149,7 @@ std::wstring MakeLogPath() {
     }
     if (base.empty()) base = L".";
     return base + L"\\Pulse\\pulse_net.log";
+#endif
 }
 
 void EnsureParent(const std::wstring& path) {

@@ -72,6 +72,9 @@ public:
     D2D1_RECT_F ButtonRect(Button button, bool compact, float width) const;
     HRESULT Paint(const View& v, bool compact, bool pinned, Button hover, Button pressed);
     HRESULT PaintToast(const NetEvent& event, const std::wstring& message);
+#ifdef PULSE_DEVELOPMENT
+    HRESULT CaptureForDevelopment(const wchar_t* name);
+#endif
 private:
     using FormatKey = std::tuple<int, int, bool>;
     HRESULT CreateTarget();

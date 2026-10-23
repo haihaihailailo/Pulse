@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "automatic_cleanup": false,
+  "project_budget_bytes": 1073741824,
+  "minimum_free_bytes": 42949672960,
+  "control_reserve_bytes": 1048576,
+  "allowed_output_roots": ["dev-work"],
+  "reservations": {"development": 16777216},
+  "managed_directories": {
+    "dev-work/builds": {"owner": "pulse-development-builds", "maximum_bytes": 268435456},
+    "dev-work/sessions": {"owner": "pulse-development-sessions", "maximum_bytes": 67108864}
+  },
+  "ordinary_logs": {"maximum_age_days": 7, "maximum_bytes": 104857600},
+  "notes": "Builds and bounded session evidence are retained under explicit leases. No automatic deletion or scheduled cleanup. Ordinary log production is disabled in the development variant; smoke markers and resource receipts are critical test evidence. Stop at capacity or incomplete transactions."
+}

@@ -145,6 +145,9 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
         w.cpu_freq = w.cpu_freq || strip.cpu_freq;
         w.fps = w.fps || strip.fps;
     }
+#ifdef PULSE_DEVELOPMENT
+    w.fps = false;
+#endif
     return w;
 }
 
