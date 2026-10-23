@@ -4,7 +4,7 @@
 
 Pulse is a floating desktop widget for Windows that can also live in the taskbar. A single statically linked `Pulse.exe`, built with native C++17, Win32, and Direct2D, displays hardware, battery, and network status.
 
-[Download the latest release](https://github.com/yftx888/Pulse/releases/latest) · Windows 10 / 11, 64-bit · No installation required
+[Download the latest custom release](https://github.com/haihaihailailo/Pulse/releases/latest) · Windows 10 / 11, 64-bit · No installation required
 
 <p align="center"><img src="docs/screenshots/demo-full.webp" alt="Pulse full mode" width="400"></p>
 <p align="center"><img src="docs/screenshots/demo-compact.webp" alt="Pulse mini mode" width="760"></p>
@@ -43,7 +43,7 @@ Other features:
 - Full mode refreshes every 0.5 / 1 / 2 seconds, with a default of 1 second. Mini mode and Taskbar mode refresh about every 2 seconds.
 - Slow latency threshold can be set to 50 / 100 / 150 / 200 / 300 / 500 / 800 ms, with a default of 500 ms.
 - Network disconnected and Network restored cards fade out after about 8 seconds. Hovering pauses the timer; moving away starts a roughly 3-second timer before they fade out. Disconnect alerts and Alert sound have separate switches. Sleep does not count as an outage.
-- Size from 80% to 200%, also adjustable with Ctrl + mouse wheel.
+- Size from 30% to 200%, also adjustable with Ctrl + mouse wheel. The full panel automatically shrinks to fit the current work area, preserving and restoring your preferred scale when space allows.
 - Interface language: English or Chinese, switchable from the right-click menu (语言 / Language), follows the Windows display language by default.
 - Dark context menus, a tray icon, Always on top, Start with Windows, and Reset to defaults for component selections.
 
@@ -121,7 +121,7 @@ If these files exist, the script asks whether to remove them. Choosing Y deletes
 - Minimizing pauses sampling for the UI. Left-click the tray icon to hide or show the window. Hiding also pauses UI sampling, while network probes continue if Disconnect alerts are enabled. Sampling resumes when the window is shown again.
 - In Taskbar mode, left-click the taskbar data or the tray icon to show or hide the Full mode panel.
 - The close button exits the app.
-- Hold Ctrl and scroll inside the window to change the scale by 10 percentage points per notch, between 80% and 200%. Use the mouse wheel without Ctrl to scroll content that extends beyond the screen.
+- Hold Ctrl and scroll inside the window to change the scale by 10 percentage points per notch, between 30% and 200%. Full mode adapts to the current work area and DPI, including when FPS or other cards are enabled, without overwriting your preferred scale. If an exceptionally small work area cannot fit the panel at 30%, use the mouse wheel without Ctrl to scroll.
 
 The window, the taskbar data, and the tray icon share this context menu:
 
@@ -129,7 +129,7 @@ The window, the taskbar data, and the tray icon share this context menu:
 | --- | --- |
 | Full mode / Mini mode / Taskbar mode | Switches display mode |
 | Taskbar position | Automatic (default) / Right / Left. Right is next to the clock; Left is to the left of the Start button. Right and Left stay fixed |
-| Size | 80% / 100% (default) / 125% / 150% / 175% / 200% |
+| Size | 30%–200% (100% by default) |
 | 语言 / Language | Follow system (default), 中文, or English |
 | Refresh interval | Sets Full mode's refresh interval to 0.5 / 1 (default) / 2 seconds |
 | Slow latency threshold | 50 / 100 / 150 / 200 / 300 / 500 (default) / 800 ms |

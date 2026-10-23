@@ -667,10 +667,12 @@ public:
         registeredToast_ = true;
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
         renderer_.SetSoftware(config_.mode != DisplayMode::Full);
-        renderer_.SetZoom(config_.zoom);
+        effectiveZoom_ = config_.zoom;
+        renderer_.SetZoom(effectiveZoom_);
         renderer_.SetComponents(config_.components, Compact());
         model_.Update(Snapshot{}, Compact(), config_.components);
         renderer_.SetCompactEtaVisible(model_.Data().compactEtaVisible);
+        ApplyWindowZoom(work);
         const auto size = FittedSize(work);
         const int width = static_cast<int>(size.cx), height = static_cast<int>(size.cy);
         if (config_.x == INT_MIN || config_.y == INT_MIN) {
@@ -812,6 +814,7 @@ private:
         const UINT dpi = MonitorDpi(MonitorFromRect(&strip, MONITOR_DEFAULTTOPRIMARY));
         dpi_ = dpi;
         renderer_.SetDpi(dpi_);
+        ApplyWindowZoom(work);
         const auto size = FittedSize(work);
         const int x = ClampCoordinate(strip.right - size.cx, work.left, work.right, size.cx);
         const int y = ClampCoordinate(std::min(strip.top, work.bottom) - size.cy - 2, work.top, work.bottom, size.cy);
@@ -888,10 +891,23 @@ private:
     }
     float ContentWidth() const { return Compact() ? renderer_.CompactWidth() : renderer_.FullWidth(); }
     float ContentHeight() const { return Compact() ? 40 : FullLayout(config_.components, renderer_.FullWidth()).height; }
-    float Scale() const { return dpi_ / 96.0f * config_.zoom / 100.0f; }
+    float Scale() const { return dpi_ / 96.0f * effectiveZoom_ / 100.0f; }
+    int WindowZoom(const RECT& work) const {
+        return config_.mode == DisplayMode::Full ?
+            WorkAreaZoom(config_.zoom, ContentWidth(), ContentHeight(), dpi_, work) : config_.zoom;
+    }
+    void ApplyWindowZoom(const RECT& work) {
+        const int zoom = WindowZoom(work);
+        if (effectiveZoom_ == zoom) return;
+        effectiveZoom_ = zoom;
+        renderer_.SetZoom(zoom);
+        repaintPending_ = true;
+        if (window_) InvalidateRect(window_, nullptr, FALSE);
+    }
     SIZE FittedSize(const RECT& work) const {
-        return {std::min(Pixels(ContentWidth(), dpi_, config_.zoom), std::max(1, static_cast<int>(work.right - work.left))),
-                std::min(Pixels(ContentHeight(), dpi_, config_.zoom), std::max(1, static_cast<int>(work.bottom - work.top)))};
+        const int zoom = WindowZoom(work);
+        return {std::min(Pixels(ContentWidth(), dpi_, zoom), std::max(1, static_cast<int>(work.right - work.left))),
+                std::min(Pixels(ContentHeight(), dpi_, zoom), std::max(1, static_cast<int>(work.bottom - work.top)))};
     }
     float CurrentWidth() const {
         RECT r{};
@@ -932,6 +948,15 @@ private:
         require(r.left == -1895 && r.top == -75, "Drag away did not release snap");
         r = SnapToWorkArea({-1903, 300, -1703, 400}, syntheticWork, 18);
         require(r.left == -1920 && r.top == 300, "DPI-scaled snap distance failed");
+        // Independent regression examples: all 12 cards are 1320 DIP tall.
+        require(WorkAreaZoom(70, 320, 1320, 168, {0, 0, 2560, 1516}) == 65,
+                "Full panel did not fit the reported high-DPI work area");
+        require(WorkAreaZoom(70, 320, 1320, 96, {0, 0, 1920, 1080}) == 70 &&
+                WorkAreaZoom(70, 320, 1320, 168, {-3840, -200, 0, 1960}) == 70,
+                "Full panel did not recover the preferred zoom on a larger work area");
+        require(WorkAreaZoom(70, 320, 1320, 168, {0, 0, 325, 2160}) == 58 &&
+                WorkAreaZoom(70, 320, 1320, 168, {0, 0, 2560, 100}) == MinimumZoom,
+                "Work-area width or minimum readable zoom was ignored");
 
         SetMode(DisplayMode::Compact); SetZoom(100);
         const auto work = WorkArea(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST));
@@ -969,6 +994,56 @@ private:
                 }
             }
         }
+        // Exercise the reported layout with synthetic FPS data. CollectionWants
+        // still disables ETW in development; no real FPS collector is enabled.
+        const auto previousComponents = config_.components;
+        const bool previousPinned = config_.pinned;
+        if (config_.pinned) TogglePin();
+        SetMode(DisplayMode::Full);
+        config_.components.full.fill(true);
+        Reconfigure(false);
+        SetZoom(70);
+        require(!CollectionWants(config_.components, DisplayMode::Full).fps,
+                "Synthetic FPS layout enabled the real collector");
+        RECT client{}; GetClientRect(window_, &client);
+        require(FullLayout(config_.components).height == 1320 && config_.zoom == 70 &&
+                GetPrivateProfileIntW(L"Window", L"zoom", 0, config_.file.c_str()) == 70,
+                "Full layout or saved preferred zoom changed");
+        if (Pixels(ContentHeight(), dpi_, MinimumZoom) <= work.bottom-work.top &&
+            Pixels(ContentWidth(), dpi_, MinimumZoom) <= work.right-work.left) {
+            require(ContentHeight() * Scale() <= client.bottom && ContentWidth() * Scale() <= client.right && scroll_ == 0,
+                    "FPS or bottom process card is clipped");
+        }
+        r = bounds();
+        require(r.right == work.right && r.bottom == work.bottom &&
+                !(GetWindowLongPtrW(window_, GWL_EXSTYLE) & WS_EX_TOPMOST),
+                "Automatic fit lost docking or changed topmost preference");
+        sample.fps = 60; sample.fps_status = 1; sample.fps_process = L"Synthetic preview";
+        model_.Update(sample, false, config_.components);
+        Command(CmdClickThrough);
+        require(clickThrough_ && renderer_.Paint(model_.Data(), false, false, Button::None, Button::None) == S_OK,
+                "Fitted full panel failed to render with click-through");
+        if (capture) require(SUCCEEDED(renderer_.CaptureForDevelopment(L"full-fps-70-fit.bmp")),
+                             "Fitted FPS panel capture failed");
+        SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
+        require(!clickThrough_ && config_.clickThrough, "Fitted panel tray recovery lost the preference");
+        Command(CmdClickThrough); Command(CmdClickThrough); // Restore saved OFF for the remaining smoke checks.
+        const auto close = renderer_.ButtonRect(Button::Close, false, CurrentWidth());
+        require(Hit(MAKELPARAM(static_cast<int>((close.left+close.right) * .5f * Scale()),
+                             static_cast<int>((close.top+close.bottom) * .5f * Scale()))) == Button::Close,
+                "Fitted panel hit testing used the preferred rather than effective zoom");
+        config_.components.full.fill(false);
+        config_.components.full[static_cast<size_t>(FullComponent::Hardware)] = true;
+        Reconfigure(false);
+        if (Pixels(ContentWidth(), dpi_, 70) <= work.right-work.left &&
+            Pixels(ContentHeight(), dpi_, 70) <= work.bottom-work.top)
+            require(effectiveZoom_ == 70 && config_.zoom == 70, "Removing cards did not restore preferred zoom");
+        config_.components = previousComponents;
+        Reconfigure(false);
+        SetMode(DisplayMode::Compact);
+        require(effectiveZoom_ == 70, "Full-panel fit leaked into compact mode");
+        if (config_.pinned != previousPinned) TogglePin();
+
         Command(CmdSnap); // Persist OFF and verify it on the next process launch.
         require(!config_.snap && dockedEdges_ == 0, "Snap menu did not disable docking");
         SetZoom(100);
@@ -1045,6 +1120,7 @@ private:
         zoomFitPending_ = false;
         const auto monitor = MonitorFromRect(&base, MONITOR_DEFAULTTONEAREST);
         const RECT work = WorkArea(monitor);
+        ApplyWindowZoom(work);
         const auto size = FittedSize(work);
         const int width = static_cast<int>(size.cx), height = static_cast<int>(size.cy);
         int x = base.left, y = base.top;
@@ -1203,7 +1279,6 @@ private:
         percent = std::clamp(percent, MinimumZoom, MaximumZoom);
         if (config_.zoom == percent) return;
         config_.zoom = percent;
-        renderer_.SetZoom(percent);
         ConfigureTaskbar();
         TrackTaskbar();
         PositionDetails();
@@ -1984,6 +2059,7 @@ private:
     bool registeredMain_ = false, registeredToast_ = false, renderLost_ = false;
     float scroll_ = 0;
     int zoomWheelDelta_ = 0;
+    int effectiveZoom_ = 100; // Runtime fit only; Config::zoom remains the user's choice.
     bool repaintPending_ = true;
     bool dragCandidate_ = false, dragging_ = false;
     POINT dragOrigin_{};
