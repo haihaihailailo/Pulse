@@ -316,6 +316,7 @@ struct Config {
     int widgetsWidth = 120;
     bool pinned = true;
     bool snap = true;
+    bool clickThrough = false;
     bool notify = true, notify_sound = true;
     std::wstring file;
     Components components;
@@ -359,6 +360,7 @@ struct Config {
             static_cast<int>(std::clamp(widgetsDips, 0L, 300L)) : 120;
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
         snap = GetPrivateProfileIntW(L"Window", L"snap", 1, file.c_str()) != 0;
+        clickThrough = GetPrivateProfileIntW(L"Window", L"click_through", 0, file.c_str()) != 0;
         wchar_t zoomValue[32]{};
         GetPrivateProfileStringW(L"Window", L"zoom", L"100", zoomValue, 32, file.c_str());
         wchar_t* zoomEnd = nullptr;
@@ -400,6 +402,7 @@ struct Config {
         WritePrivateProfileStringW(L"Window", L"Compact", mode != DisplayMode::Full ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"OnTop", pinned ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"snap", snap ? L"1" : L"0", file.c_str());
+        WritePrivateProfileStringW(L"Window", L"click_through", clickThrough ? L"1" : L"0", file.c_str());
         WritePrivateProfileStringW(L"Window", L"language", i18n::PreferenceValue(language), file.c_str());
         WritePrivateProfileStringW(L"Taskbar", L"position", taskbarPosition == TaskbarPosition::Left ? L"left" :
             taskbarPosition == TaskbarPosition::Right ? L"right" : L"auto", file.c_str());
@@ -708,6 +711,9 @@ public:
         const bool startMinimized = showCommand == SW_SHOWMINIMIZED || showCommand == SW_MINIMIZE || showCommand == SW_SHOWMINNOACTIVE;
         if (!TaskbarMode())
             ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : SW_SHOWNORMAL);
+        // Apply the saved preference only after the tray recovery path is ready.
+        // A missing tray leaves the window interactive without losing the preference.
+        SetClickThrough(config_.clickThrough);
         Sampling(true);
         UpdateWindow(window_);
 #ifdef PULSE_DEVELOPMENT
@@ -974,11 +980,14 @@ private:
         require(WindowFromPoint(point) == window_, "Interactive window not hit before click-through");
         Command(CmdClickThrough);
         require(clickThrough_ && WindowFromPoint(point) == peer.target, "Cross-process click-through hit test failed");
+        require(config_.clickThrough && GetPrivateProfileIntW(L"Window", L"click_through", 0, config_.file.c_str()) == 1,
+                "Click-through preference was not saved");
         require(renderer_.Paint(model_.Data(), true, config_.pinned, Button::None, Button::None) == S_OK,
                 "Layered click-through render failed");
         if (capture) require(SUCCEEDED(renderer_.CaptureForDevelopment(L"compact-click-through.bmp")), "Click-through capture failed");
         SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
         require(!clickThrough_ && IsWindowVisible(window_) && WindowFromPoint(point) == window_, "Tray click did not restore interaction");
+        require(config_.clickThrough, "Temporary tray recovery erased the startup preference");
         ActivateButton(Button::Minimize);
         require(!IsWindowVisible(window_), "Minimize did not hide to tray");
         SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
@@ -989,6 +998,9 @@ private:
         RemoveTray(); Command(CmdClickThrough);
         require(!clickThrough_, "Click-through enabled without tray recovery");
         AddTray(); require(tray_, "Tray re-registration failed");
+        Command(CmdClickThrough); Command(CmdClickThrough);
+        require(!config_.clickThrough && GetPrivateProfileIntW(L"Window", L"click_through", 1, config_.file.c_str()) == 0,
+                "Disabling click-through was not saved");
     }
 #endif
     RECT SnapDrag(RECT candidate) {
@@ -1604,7 +1616,12 @@ private:
             if (config_.snap) SnapCurrent(); else dockedEdges_ = 0;
             Save();
             break;
-        case CmdClickThrough: SetClickThrough(!clickThrough_); break;
+        case CmdClickThrough:
+            if (SetClickThrough(!clickThrough_)) {
+                config_.clickThrough = clickThrough_;
+                Save();
+            }
+            break;
         case CmdStartup: ToggleStartup(); break;
         case CmdShortcutDesktop: CreateShortcut(window_, FOLDERID_Desktop); break;
         case CmdShortcutStartMenu: CreateShortcut(window_, FOLDERID_Programs); break;
@@ -1962,7 +1979,7 @@ private:
     bool zoomFitPending_ = false;
     bool systemSuspended_ = false;
     bool tray_ = false, trayVersion4_ = false;
-    bool clickThrough_ = false; // Session-only: every launch starts interactive.
+    bool clickThrough_ = false; // Effective state; temporary recovery keeps the saved preference.
     unsigned dockedEdges_ = 0;
     bool registeredMain_ = false, registeredToast_ = false, renderLost_ = false;
     float scroll_ = 0;

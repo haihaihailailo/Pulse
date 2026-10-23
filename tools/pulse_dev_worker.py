@@ -122,6 +122,7 @@ def production(config):
     exe = Path(config['installedExe'])
     home = Path(os.environ['USERPROFILE'])
     paths = [exe, home/'AppData/Local/Pulse/settings.ini',
+             home/'AppData/Local/Pulse/pulse_net.log', home/'AppData/Local/Pulse/pulse_net.log.1',
              home/'AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Pulse.lnk', home/'Desktop/Pulse.lnk']
     files = {str(file): sha(safe(file)) if file.exists() else None for file in paths}
     registry = {}
@@ -137,10 +138,12 @@ def production(config):
     return dict(files=files, registry=registry, processes=current)
 
 
-def apply_interactive_defaults(pid, profile, defaults_hash):
+def apply_interactive_defaults(pid, profile, defaults_hash, window_class='Pulse.Development.Main.v1', desktop=None,
+                               expect_saved_click_through=False):
     """Use the application's existing commands after its tray and visible window exist."""
     callback = C.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
     api(U, 'EnumWindows', W.BOOL, [callback, W.LPARAM])
+    api(U, 'EnumDesktopWindows', W.BOOL, [W.HANDLE, callback, W.LPARAM])
     api(U, 'GetWindowThreadProcessId', W.DWORD, [W.HWND, C.POINTER(W.DWORD)])
     api(U, 'GetClassNameW', C.c_int, [W.HWND, W.LPWSTR, C.c_int])
     api(U, 'IsWindowVisible', W.BOOL, [W.HWND])
@@ -160,10 +163,13 @@ def apply_interactive_defaults(pid, profile, defaults_hash):
         owner = W.DWORD(); U.GetWindowThreadProcessId(window, C.byref(owner))
         if owner.value == pid:
             name = C.create_unicode_buffer(128); U.GetClassNameW(window, name, len(name))
-            if name.value == 'Pulse.Development.Main.v1' and U.IsWindowVisible(window):
+            if name.value == window_class and U.IsWindowVisible(window):
                 windows.append(window)
         return True
-    U.EnumWindows(visit, 0)
+    if desktop:
+        U.EnumDesktopWindows(desktop, visit, 0)
+    else:
+        U.EnumWindows(visit, 0)
     if not windows:
         return None
     if len(windows) != 1:
@@ -183,8 +189,10 @@ def apply_interactive_defaults(pid, profile, defaults_hash):
         if not U.SetWindowPos(window, None, work.right-(rect.right-rect.left), work.top, 0, 0, 0x15):
             raise RuntimeError('Cannot dock development startup window')
         send(0x232)  # WM_EXITSIZEMOVE: native snap, fit and save handlers.
-        if not U.GetWindowLongPtrW(window, -20) & 0x20:
+        sent_click_through = False
+        if not desktop and not expect_saved_click_through and not U.GetWindowLongPtrW(window, -20) & 0x20:
             send(0x111, 115)  # Existing click-through command, requires a registered tray.
+            sent_click_through = True
         U.GetWindowRect(window, C.byref(rect))
         style = U.GetWindowLongPtrW(window, -20)
         saved = configparser.ConfigParser(); saved.read(profile/'settings.ini', encoding='utf-8-sig')
@@ -193,11 +201,14 @@ def apply_interactive_defaults(pid, profile, defaults_hash):
         if (saved.get('Window','Mode') != 'full' or saved.getint('Window','zoom') != 70 or
                 saved.getint('Window','OnTop') != 0 or saved.getint('Window','snap') != 1 or
                 not all(saved.getint('Full', key) == 1 for key in keys) or
-                style & 8 or not style & 0x20 or not style & 0x80000 or
+                style & 8 or (not desktop and (not style & 0x20 or not style & 0x80000)) or
                 rect.right != work.right or rect.top != work.top or rect.bottom > work.bottom):
             raise RuntimeError('Development startup defaults did not take effect')
-        return dict(pid=pid,defaultsSha256=defaults_hash,mode='full',zoom=70,allAvailableItems=True,
-                    fpsEnabled=False,topmost=False,clickThrough=True,dock='right',
+        if expect_saved_click_through and saved.getint('Window','click_through',fallback=0) != 1:
+            raise RuntimeError('Saved click-through preference was not retained')
+        return dict(pid=pid,window=int(window),defaultsSha256=defaults_hash,mode='full',zoom=70,allAvailableItems=True,
+                    fpsEnabled=False,topmost=False,clickThrough=bool(style & 0x20),dock='right',
+                    clickThroughCommandSent=sent_click_through,
                     bounds=[rect.left,rect.top,rect.right,rect.bottom],
                     workArea=[work.left,work.top,work.right,work.bottom])
     finally:
@@ -248,7 +259,7 @@ def main(plan_file, expected):
             H['K'].CloseHandle(handle); raise C.WinError(C.get_last_error())
         limits.ProcessMemoryLimit = limits.JobMemoryLimit = plan['jobMiB'] * MIB
         limits.BasicLimitInformation.LimitFlags |= 0x4 | 0x8
-        limits.BasicLimitInformation.PerJobUserTimeLimit = (600 if plan['action'] == 'run' else 120) * 10000000
+        limits.BasicLimitInformation.PerJobUserTimeLimit = (600 if plan['action'] in ('run','trial') else 120) * 10000000
         limits.BasicLimitInformation.ActiveProcessLimit = 16
         class Cpu(C.Structure):
             _fields_ = [('flags', W.DWORD), ('rate', W.DWORD)]
@@ -282,11 +293,17 @@ def main(plan_file, expected):
             if build_bytes > 256 * MIB:
                 raise RuntimeError('Registered build capacity bound exceeded')
         if startup_state and startup_state.get('pid') and not startup_state.get('applied'):
-            applied = apply_interactive_defaults(startup_state['pid'], startup_state['profile'], startup_state['sha256'])
+            applied = apply_interactive_defaults(startup_state['pid'], startup_state['profile'], startup_state['sha256'],
+                startup_state.get('window_class','Pulse.Development.Main.v1'), desktop,
+                startup_state.get('expect_saved_click_through',False))
             if applied:
-                write(startup_state['profile']/'startup-defaults.json', applied)
+                write(startup_state['profile']/startup_state.get('receipt_name','startup-defaults.json'), applied)
                 receipt['interactiveDefaults'] = applied
                 startup_state['applied'] = True
+                if plan['action'] == 'trial-test':
+                    api(U, 'PostMessageW', W.BOOL, [W.HWND,W.UINT,W.WPARAM,W.LPARAM])
+                    if not U.PostMessageW(applied['window'], 0x10, 0, 0):
+                        raise RuntimeError('Cannot close isolated portable trial')
             elif now - startup_state['started'] > 10:
                 raise RuntimeError('Development window did not become ready for startup defaults')
 
@@ -383,6 +400,59 @@ def main(plan_file, expected):
                 outputs=[dict(path=str(file),bytes=file.stat().st_size,sha256=sha(file)) for file in all_outputs])
             write(target/'build.json', manifest)
             receipt['build'] = manifest
+        elif plan['action'] in ('trial','trial-test'):
+            profile = target/'data'; profile.mkdir()
+            exe = target/'Pulse.exe'
+            artifact = plan['artifact']
+            if sha(safe(artifact['path'])) != artifact['sha256']:
+                raise RuntimeError('CI executable drift')
+            with exe.open('xb') as destination:
+                destination.write(Path(artifact['path']).read_bytes())
+            (target/'pulse-portable.ini').write_text('',encoding='utf-8')
+            defaults = safe(root/'tools/development-defaults.ini')
+            with (profile/'settings.ini').open('xb') as destination:
+                destination.write(defaults.read_bytes())
+            startup_state = dict(profile=profile,sha256=sha(defaults),started=time.monotonic(),
+                                 window_class='Pulse.Portable.Main.v1',expect_saved_click_through=True)
+            visible = input_desktop()
+            desktop_name = None
+            if plan['action'] == 'trial-test':
+                name = 'PulseTrial-' + plan['id'].replace('-','')
+                desktop = U.CreateDesktopW(name, None, None, 0, 0x00C7, None)
+                if not desktop:
+                    raise C.WinError(C.get_last_error())
+                desktop_name = 'winsta0\\' + name
+                receipt['desktop'] = dict(name=name,inputBefore=visible,switchRequested=False)
+            normal_mutex = None
+            if plan['action'] == 'trial-test':
+                api(K,'CreateMutexW',W.HANDLE,[C.c_void_p,W.BOOL,W.LPCWSTR])
+                normal_mutex = K.CreateMutexW(None, False, 'Local\\Pulse.Native.SingleInstance.v1')
+                if not normal_mutex:
+                    raise C.WinError(C.get_last_error())
+            try:
+                run([exe], 'downloaded CI portable trial', desktop_name,
+                    maximum_seconds=1800 if plan['action'] == 'trial' else 20)
+                if plan['action'] == 'trial-test':
+                    if not startup_state.get('applied'):
+                        raise RuntimeError('Portable first launch not verified')
+                    saved_hash = sha(profile/'settings.ini')
+                    startup_state.update(applied=False,started=time.monotonic(),pid=None,
+                                         receipt_name='startup-defaults-resume.json')
+                    run([exe], 'portable restart with existing native-instance mutex', desktop_name, maximum_seconds=20)
+                    if sha(profile/'settings.ini') != saved_hash:
+                        raise RuntimeError('Portable settings changed on identical restart')
+                    receipt['portableRestart'] = True
+                    receipt['nativeMutexCoexistence'] = True
+            finally:
+                if normal_mutex:
+                    K.CloseHandle(normal_mutex)
+            if not startup_state.get('applied') or sha(exe) != artifact['sha256']:
+                raise RuntimeError('Portable trial not verified')
+            if input_desktop() != visible:
+                raise RuntimeError('Input desktop changed')
+            receipt['artifact'] = artifact
+            receipt['portableSettings'] = dict(path=str(profile/'settings.ini'),sha256=sha(profile/'settings.ini'))
+            receipt['portableLogs'] = [str(file) for file in profile.glob('*.log')]
         else:
             profile = target/'profile'; profile.mkdir()
             write(target/'pulse-dev-session.json', dict(id=plan['id'],owner=plan['owner'],action=plan['action']))

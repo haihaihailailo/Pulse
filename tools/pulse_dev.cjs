@@ -66,10 +66,13 @@ function child(planFile, expectedHash, timeout) {
   });
 }
 async function main() {
-  const [action = 'test', profile = 'daily', consent] = process.argv.slice(2);
-  if (!['build','test','debug','run'].includes(action)) fail('Use build, test, debug or run');
-  if (action === 'run' && consent !== '--interactive') fail('Visible development use requires -Action Run -Interactive');
-  if (consent && !(action === 'run' && consent === '--interactive')) fail('Unexpected interactive flag');
+  const [action = 'test', profile = 'daily', consent, artifactExe] = process.argv.slice(2);
+  const trial = ['trial','trial-test'].includes(action);
+  if (!['build','test','debug','run','trial','trial-test'].includes(action)) fail('Unknown action');
+  if (['run','trial'].includes(action) && consent !== '--interactive') fail('Visible use requires -Interactive');
+  if (consent && !(['run','trial'].includes(action) && consent === '--interactive') &&
+      !(action === 'trial-test' && consent === '--isolated')) fail('Unexpected interactive flag');
+  if (Boolean(artifactExe) !== trial) fail('Trial requires an exact downloaded ArtifactExe');
   for (const item of config.identities) {
     if (fileHash(item.path) !== item.sha256) fail('Shared tool identity changed: ' + item.path);
   }
@@ -77,6 +80,18 @@ async function main() {
   const sources = fs.readdirSync(path.join(root,'src')).filter(x => /\.(cpp|h)$/.test(x)).sort().map(x => ownFile(path.join(root,'src',x)));
   const inputs = [...sources, ...['app.rc','app.manifest','pulse.ico','tools/pulse_dev_worker.py','tools/pulse_dev.cjs',
     'local-artifact-policy.json','tools/dev-environment.local.json','tools/development-defaults.ini'].map(x => ownFile(path.join(root,x)))];
+  let artifact = null;
+  if (trial) {
+    const exact = path.resolve(artifactExe);
+    if (!exact.startsWith(path.join(root,'dev-work','ci') + path.sep) || path.basename(exact) !== 'Pulse.exe')
+      fail('Trial must use an admitted CI Pulse.exe under dev-work/ci');
+    artifact = ownFile(exact);
+    const manifestPath = path.join(path.dirname(exact),'artifact.json');
+    const manifest = json(manifestPath);
+    if (manifest.status !== 'PASS' || manifest.executableSha256 !== artifact.sha256 ||
+        manifest.repository !== 'haihaihailailo/Pulse') fail('CI artifact identity is not verified');
+    inputs.push(artifact, ownFile(manifestPath));
+  }
   const executionKey = sha(JSON.stringify(inputs)).slice(0,24);
   let buildKey = executionKey;
   let buildDir = path.join(root,'dev-work','builds',buildKey);
@@ -108,7 +123,7 @@ async function main() {
       if (fileHash(storage.safe(root,item.path)) !== item.sha256) fail('Build output drift: ' + item.path);
     }
   }
-  if (action !== 'build' && !build) fail('No verified build for these inputs. Run -Action Build first');
+  if (action !== 'build' && !build && !trial) fail('No verified build for these inputs. Run -Action Build first');
   const id = crypto.randomUUID();
   const evidence = path.join(root,'dev-work','evidence');
   const planFile = path.join(evidence, id + '-plan.json');
@@ -116,9 +131,9 @@ async function main() {
   const managed = path.join(root,'dev-work',action === 'build' ? 'builds' : 'sessions');
   const owner = action === 'build' ? 'pulse-development-builds' : 'pulse-development-sessions';
   const sessionDir = path.join(root,'dev-work','sessions',id);
-  const wallSeconds = action === 'build' ? 240 : action === 'run' ? 1800 : action === 'debug' ? 120 : 90;
+  const wallSeconds = action === 'build' ? 240 : ['run','trial'].includes(action) ? 1800 : action === 'debug' ? 120 : 90;
   const plan = {schema:1, root, action, id, owner, parentPid:process.pid, executionKey, buildKey, buildDir, build,
-    sessionDir, receiptFile, config, inputs, policy, wallSeconds,
+    sessionDir, receiptFile, config, inputs, policy, wallSeconds, artifact,
     jobMiB:action === 'build' ? 2048 : 512, outputLimitBytes:262144,
     targetDirectory:action === 'build' ? buildDir : sessionDir,
     purpose:'Isolated development only; no installation, production writes or publication'};
