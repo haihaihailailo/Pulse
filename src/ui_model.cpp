@@ -8,6 +8,9 @@
 
 namespace pulse::ui {
 namespace {
+// Both the floating window and the taskbar own a Model. All model updates are
+// on the UI thread; share this lifetime flag across modes, components and models.
+bool gpuTempSeen = false;
 bool Known(double v) { return std::isfinite(v) && v >= 0; }
 float Fraction(double v) {
     return Known(v) ? static_cast<float>(std::round(std::clamp(v, 0.0, 100.0)) / 100.0) : -1.0f;
@@ -37,15 +40,6 @@ std::wstring Bytes(uint64_t bytes) {
 }
 std::wstring Percent(double v, int decimals) {
     return Known(v) ? Number(std::clamp(v, 0.0, 100.0), decimals) + L"%" : L"--";
-}
-std::wstring PowerSchemeText(PowerSchemeKind scheme) {
-    switch (scheme) {
-    case PowerSchemeKind::Balanced: return T(Key::Balanced);
-    case PowerSchemeKind::BestPerformance: return T(Key::BestPerformance);
-    case PowerSchemeKind::BestEfficiency: return T(Key::BestEfficiency);
-    case PowerSchemeKind::LongerBattery: return T(Key::LongerBattery);
-    default: return {};
-    }
 }
 std::wstring Clock(std::int64_t unixTime) {
     const auto now = static_cast<std::time_t>(unixTime);
@@ -113,18 +107,22 @@ std::wstring NetworkEventText(const NetEvent& event) {
 }
 
 void Components::Reset() {
+    compactOrder = DefaultCompactOrder;
+    taskbarOrder = DefaultTaskbarOrder;
     for (size_t i = 0; i < full.size(); ++i) full[i] = FullComponents[i].enabled;
     for (size_t i = 0; i < compact.size(); ++i) compact[i] = CompactComponents[i].enabled;
     for (size_t i = 0; i < taskbar.size(); ++i) taskbar[i] = TaskbarComponents[i].enabled;
 }
-Wants CollectionWants(const Components& components, DisplayMode display, bool details, PowerMode mode) {
+Wants CollectionWants(const Components& components, DisplayMode display, bool details, PowerTrace trace) {
     Components c = components;
     const bool compact = display != DisplayMode::Full && !details;
     if (display == DisplayMode::Taskbar) c.compact = c.taskbar;
+    const bool package = NeedsPackagePower(trace);
     Wants w;
-    w.chip_power = compact ? c.Enabled(CompactComponent::Power) && mode != PowerMode::Discharging :
-        c.Enabled(FullComponent::Hardware) || (c.Enabled(FullComponent::PowerChart) && mode != PowerMode::Discharging);
+    w.chip_power = compact ? c.Enabled(CompactComponent::Power) && package :
+        c.Enabled(FullComponent::Hardware) || (c.Enabled(FullComponent::PowerChart) && package);
     w.gpu_usage = compact ? c.Enabled(CompactComponent::Gpu) : c.Enabled(FullComponent::Hardware);
+    w.dgpu_power = display == DisplayMode::Full && c.Enabled(FullComponent::Hardware);
     w.processes = !compact && c.Enabled(FullComponent::Processes);
     w.process_count = !compact && c.Enabled(FullComponent::SystemInfo);
     w.power_scheme = !compact && c.Enabled(FullComponent::Battery);
@@ -134,16 +132,18 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
     w.cpu_freq = compact ? c.Enabled(CompactComponent::CpuFrequency) : c.Enabled(FullComponent::SystemInfo);
     w.uptime = !compact && c.Enabled(FullComponent::SystemInfo);
     w.gpu_memory = !compact && c.Enabled(FullComponent::GpuMemory);
+    w.gpu_temp = compact ? c.Enabled(CompactComponent::GpuTemp) : c.Enabled(FullComponent::GpuMemory);
     w.wifi = !compact && c.Enabled(FullComponent::Wifi);
     w.battery_health = !compact && c.Enabled(FullComponent::BatteryHealth);
     w.fps = compact ? c.Enabled(CompactComponent::Fps) : c.Enabled(FullComponent::Fps);
     if (display == DisplayMode::Taskbar && details) {
-        const auto strip = CollectionWants(components, DisplayMode::Taskbar, false, mode);
+        const auto strip = CollectionWants(components, DisplayMode::Taskbar, false, trace);
         w.chip_power = w.chip_power || strip.chip_power;
         w.gpu_usage = w.gpu_usage || strip.gpu_usage;
         w.disk_io = w.disk_io || strip.disk_io;
         w.cpu_freq = w.cpu_freq || strip.cpu_freq;
         w.fps = w.fps || strip.fps;
+        w.gpu_temp = w.gpu_temp || strip.gpu_temp;
     }
 #ifdef PULSE_DEVELOPMENT
     w.fps = false;
@@ -154,7 +154,8 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
 bool View::Equals(const View& r, bool compact, const Components& c) const {
     if (compact) {
         if (c.Enabled(CompactComponent::Battery) &&
-            std::tie(mode, battery, percent) != std::tie(r.mode, r.battery, r.percent)) return false;
+            std::tie(mode, supplemental, acOnline, battery, percent) !=
+            std::tie(r.mode, r.supplemental, r.acOnline, r.battery, r.percent)) return false;
         if (c.Enabled(CompactComponent::Eta)) {
             if (compactEtaVisible != r.compactEtaVisible) return false;
             if (compactEtaVisible &&
@@ -162,11 +163,13 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
                 std::tie(r.mode, r.compactEtaLabel, r.compactEtaValue, r.compactEtaFromSystem)) return false;
         }
         if (c.Enabled(CompactComponent::Power) &&
-            std::tie(mode, low, powerLabel, powerValue) !=
-            std::tie(r.mode, r.low, r.powerLabel, r.powerValue)) return false;
+            std::tie(mode, supplemental, low, powerTrace, powerLabel, powerValue) !=
+            std::tie(r.mode, r.supplemental, r.low, r.powerTrace, r.powerLabel, r.powerValue)) return false;
         if (c.Enabled(CompactComponent::Cpu) && cpuValue != r.cpuValue) return false;
         if (c.Enabled(CompactComponent::Memory) && memoryValue != r.memoryValue) return false;
         if (c.Enabled(CompactComponent::Gpu) && gpuUsage != r.gpuUsage) return false;
+        if (c.Enabled(CompactComponent::GpuTemp) &&
+            std::tie(gpuTemp, gpuTempLevel) != std::tie(r.gpuTemp, r.gpuTempLevel)) return false;
         if (c.Enabled(CompactComponent::Network) &&
             std::tie(compactUp, compactDown) != std::tie(r.compactUp, r.compactDown)) return false;
         if (c.Enabled(CompactComponent::Latency) &&
@@ -180,16 +183,16 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
     }
     if (clock != r.clock) return false; // Always-visible title clock.
     if (c.Enabled(FullComponent::Hardware) &&
-        std::tie(cpu, gpu, memory, cpuValue, gpuUsage, memoryValue, packageW, cpuW, gpuW, memW) !=
-        std::tie(r.cpu, r.gpu, r.memory, r.cpuValue, r.gpuUsage, r.memoryValue, r.packageW, r.cpuW, r.gpuW, r.memW)) return false;
+        std::tie(cpu, gpu, memory, cpuValue, gpuUsage, memoryValue, packageW, packageNote, cpuW, gpuW, memW) !=
+        std::tie(r.cpu, r.gpu, r.memory, r.cpuValue, r.gpuUsage, r.memoryValue, r.packageW, r.packageNote, r.cpuW, r.gpuW, r.memW)) return false;
     if (c.Enabled(FullComponent::Battery) &&
-        std::tie(mode, low, battery, percent, chip, scheme, etaLabel, heroWord, hero, wattLabel,
+        std::tie(mode, supplemental, low, battery, percent, chip, scheme, saverLabel, etaLabel, heroWord, hero, wattLabel,
                  watt, pphLabel, pph, eta20, foot) !=
-        std::tie(r.mode, r.low, r.battery, r.percent, r.chip, r.scheme, r.etaLabel, r.heroWord, r.hero, r.wattLabel,
+        std::tie(r.mode, r.supplemental, r.low, r.battery, r.percent, r.chip, r.scheme, r.saverLabel, r.etaLabel, r.heroWord, r.hero, r.wattLabel,
                  r.watt, r.pphLabel, r.pph, r.eta20, r.foot)) return false;
     if (c.Enabled(FullComponent::PowerChart) &&
-        std::tie(mode, powerLabel, powerValue, powerHistory) !=
-        std::tie(r.mode, r.powerLabel, r.powerValue, r.powerHistory)) return false;
+        std::tie(mode, powerTrace, powerLabel, powerValue, powerHistory) !=
+        std::tie(r.mode, r.powerTrace, r.powerLabel, r.powerValue, r.powerHistory)) return false;
     if (c.Enabled(FullComponent::Network) &&
         std::tie(netState, down, up, totals, latency, netHint) !=
         std::tie(r.netState, r.down, r.up, r.totals, r.latency, r.netHint)) return false;
@@ -202,7 +205,8 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
         std::tie(cpuFrequency, memoryDetail, processCount, uptime) !=
         std::tie(r.cpuFrequency, r.memoryDetail, r.processCount, r.uptime)) return false;
     if (c.Enabled(FullComponent::GpuMemory) &&
-        std::tie(sharedMemory, dedicatedMemory) != std::tie(r.sharedMemory, r.dedicatedMemory)) return false;
+        std::tie(sharedMemory, dedicatedMemory, gpuTempVisible, gpuTemp, gpuTempLevel, gpuName) !=
+        std::tie(r.sharedMemory, r.dedicatedMemory, r.gpuTempVisible, r.gpuTemp, r.gpuTempLevel, r.gpuName)) return false;
     if (c.Enabled(FullComponent::Wifi) &&
         std::tie(wifi, wifiSsid, wifiSignal) != std::tie(r.wifi, r.wifiSsid, r.wifiSignal)) return false;
     if (c.Enabled(FullComponent::BatteryHealth) &&
@@ -231,6 +235,22 @@ std::wstring CompactSpeed(double bps) {
     if (value >= 1024) { value /= 1024; suffix = &T(Key::CompactG); }
     return Number(value, value < 100 ? 1 : 0) + *suffix;
 }
+std::wstring MeterText(MeterStatus status, double watts) {
+    if (status == MeterStatus::Valid && std::isfinite(watts) && watts >= 0.0 && watts < 1.0e6) {
+        const auto number = Number(watts, watts >= 100 ? 0 : 1);
+        // EMI graphics-domain power remains the fallback for unavailable NVML.
+        return number + T(Key::WattSuffix);
+    }
+    switch (status) {
+    case MeterStatus::Warmup: return T(Key::MeterWarmup);
+    case MeterStatus::CounterUnavailable: return T(Key::NotReported);
+    case MeterStatus::NoMatch: return T(Key::NotReported);
+    case MeterStatus::ReadFailed: return T(Key::MeterReadFailed);
+    case MeterStatus::Inconsistent: return T(Key::MeterInconsistent);
+    default: return L"--";
+    }
+}
+bool PositivePower(double watts) { return std::isfinite(watts) && watts > 0.0 && watts < 1.0e6; }
 std::wstring Uptime(double seconds) {
     if (!Known(seconds)) return L"--";
     const auto minutes = static_cast<unsigned long long>(std::min(seconds, 3.0e11) / 60);
@@ -245,6 +265,16 @@ void Model::BreakHistory() {
 }
 bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool taskbar) {
     View v;
+    v.gpuName = s.gpu_name.empty() ? T(Key::GpuUnavailable) : s.gpu_name;
+    const bool validTemp = std::isfinite(s.gpu_temp_c) && s.gpu_temp_c > 0 && s.gpu_temp_c < 150;
+    if (validTemp) gpuTempSeen = true;
+    if (compact ? c.Enabled(CompactComponent::GpuTemp) : c.Enabled(FullComponent::GpuMemory)) {
+        v.gpuTempVisible = gpuTempSeen;
+        if (compact || v.gpuTempVisible) {
+            v.gpuTemp = validTemp ? Number(s.gpu_temp_c, 0) + L"°C" : L"--";
+            v.gpuTempLevel = validTemp ? (s.gpu_temp_c >= 85 ? 2 : s.gpu_temp_c >= 70 ? 1 : 0) : 0;
+        }
+    }
     const bool battery = compact ? c.Enabled(CompactComponent::Battery) : c.Enabled(FullComponent::Battery);
     const bool eta = compact && c.Enabled(CompactComponent::Eta);
     const bool power = compact && c.Enabled(CompactComponent::Power);
@@ -252,18 +282,46 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
     const bool hardware = !compact && c.Enabled(FullComponent::Hardware);
     const bool network = !compact && c.Enabled(FullComponent::Network);
     const bool latency = network || (compact && c.Enabled(CompactComponent::Latency));
+    const bool whole = s.power_trace == PowerTrace::BatteryWhole;
+    const bool side = s.power_trace == PowerTrace::BatterySide;
+    const bool supplemental = s.battery_supplemental && !whole;
     const bool discharging = s.mode == PowerMode::Discharging;
     const bool charging = s.mode == PowerMode::Charging;
-    if (battery || eta || power || chart) v.mode = s.mode;
-    if (battery || power) v.low = discharging && s.percent >= 0 && s.percent <= 20;
+    const bool showDischargeEta = whole && discharging && !s.power_contested &&
+        s.ac_known && !s.ac_online && (s.battery_rate_valid || (s.eta_from_system && Known(s.eta_s)));
+    const bool showChargeEta = charging && s.battery_rate_valid && !supplemental;
+    const bool batteryWatts = s.battery_rate_valid && PositivePower(s.power_w);
+    if (battery || eta || power || chart) {
+        v.mode = s.mode;
+        v.supplemental = supplemental;
+        v.acOnline = s.ac_known && s.ac_online;
+    }
+    if (battery || power) v.low = whole && s.percent >= 0 && s.percent <= 20;
     if (battery) {
         v.battery = s.percent < 0 || s.mode == PowerMode::NoBattery ? -1 : Fraction(s.percent);
         v.percent = v.battery < 0 ? L"--" : std::to_wstring(std::clamp(s.percent, 0, 100));
     }
     if (power || chart) {
-        const double watts = discharging ? s.power_w : s.pkg_w;
-        v.powerLabel = discharging ? T(Key::System) : compact ? T(Key::CompactProcessor) : T(Key::Processor);
-        v.powerValue = Number(watts, watts >= 100 ? 0 : 1);
+        // A failed battery read keeps the previous trace so one miss does not join
+        // package history to a later battery trace, and does not draw a new point.
+        if (s.power_trace == PowerTrace::Unknown && haveSample_ && view_.powerTrace != PowerTrace::Unknown) {
+            v.powerTrace = view_.powerTrace;
+            v.powerLabel = T(Key::Power);
+            v.powerValue = L"--";
+        } else if (s.power_trace == PowerTrace::Unknown) {
+            v.powerTrace = PowerTrace::Unknown;
+            v.powerLabel = T(Key::Power);
+            v.powerValue = L"--";
+        } else if (whole || side) {
+            v.powerTrace = s.power_trace;
+            v.powerLabel = whole ? T(Key::System) : T(Key::Battery);
+            v.powerValue = batteryWatts ? Number(s.power_w, s.power_w >= 100 ? 0 : 1) : L"--";
+        } else {
+            v.powerTrace = s.power_trace;
+            v.powerLabel = compact ? T(Key::CompactProcessor) : T(Key::Processor);
+            v.powerValue = std::isfinite(s.pkg_w) && s.pkg_w >= 0.0 && s.pkg_w < 1.0e6
+                ? Number(s.pkg_w, s.pkg_w >= 100 ? 0 : 1) : L"--";
+        }
     }
     if (hardware || (compact && c.Enabled(CompactComponent::Cpu))) v.cpuValue = Percent(s.cpu_percent, 0);
     if (hardware || (compact && c.Enabled(CompactComponent::Memory))) v.memoryValue = Percent(s.mem_percent, 0);
@@ -277,12 +335,18 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
     if (compact) {
         if (eta && s.mode != PowerMode::NoBattery) {
             v.compactEtaVisible = true;
-            if (s.mode == PowerMode::AcIdle) {
+            if (supplemental) {
+                v.compactEtaValue = T(Key::AssistChip);
+            } else if (s.mode == PowerMode::AcIdle && v.acOnline) {
                 v.compactEtaValue = s.percent >= 95 ? T(Key::FullyCharged) : T(Key::NotCharging);
+            } else if (s.mode == PowerMode::AcIdle) {
+                v.compactEtaValue = T(Key::NotCharging);
+            } else if (showDischargeEta || showChargeEta) {
+                v.compactEtaLabel = showChargeEta ? T(Key::FullIn) : T(Key::TimeLeft);
+                v.compactEtaValue = CompactEtaDuration(s.eta_s);
+                v.compactEtaFromSystem = showDischargeEta && Known(s.eta_s) && s.eta_from_system;
             } else {
-                v.compactEtaLabel = charging ? T(Key::FullIn) : T(Key::TimeLeft);
-                v.compactEtaValue = discharging || charging ? CompactEtaDuration(s.eta_s) : L"--";
-                v.compactEtaFromSystem = discharging && Known(s.eta_s) && s.eta_from_system;
+                v.compactEtaValue = L"--";
             }
         }
         if (c.Enabled(CompactComponent::Network)) {
@@ -313,39 +377,96 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
     } else {
         if (hardware) {
             v.cpu = Fraction(s.cpu_percent); v.gpu = Fraction(s.gpu_percent); v.memory = Fraction(s.mem_percent);
-            v.packageW = Number(s.pkg_w); v.cpuW = Number(s.cpu_w); v.gpuW = Number(s.gpu_w); v.memW = Number(s.mem_w);
+            const bool packageKnown = s.pkg_meter == MeterStatus::Valid && std::isfinite(s.pkg_w) && s.pkg_w >= 0.0 && s.pkg_w < 1.0e6;
+            v.packageW = packageKnown ? Number(s.pkg_w, s.pkg_w >= 100 ? 0 : 1) : L"--";
+            v.packageNote = packageKnown ? T(Key::WholeChip) : MeterText(s.pkg_meter, NAN);
+            v.cpuW = MeterText(s.cpu_meter, s.cpu_w);
+            v.gpuW = s.gpu_vendor == 0x10de ? (s.dgpu_status == DgpuStatus::Valid && PositivePower(s.dgpu_w)
+                ? T(Key::DgpuPrefix) + Number(s.dgpu_w, s.dgpu_w >= 10 ? 0 : 1) + T(Key::WattSuffix)
+                : s.dgpu_status == DgpuStatus::Sleeping ? T(Key::DgpuSleeping)
+                : s.dgpu_status == DgpuStatus::Glitch || s.dgpu_status == DgpuStatus::ReadFailed ? T(Key::SensorReadFailed)
+                : T(Key::NotReported)) : s.gpu_vendor ? MeterText(s.gpu_meter, s.gpu_w) : T(Key::GpuUnavailable);
+            v.memW = MeterText(s.mem_meter, s.mem_w);
         }
         if (battery) {
-            v.chip = v.low ? T(Key::LowBattery) : discharging ? T(Key::Discharging) : charging ? T(Key::Charging) :
-                     s.mode == PowerMode::AcIdle ? T(Key::OnAc) : s.mode == PowerMode::NoBattery ? T(Key::NoBattery) : T(Key::Reading);
-            const auto scheme = PowerSchemeText(s.power_scheme_kind);
-            v.scheme = s.battery_saver ? T(Key::BatterySaver) : scheme.empty() ? L"" : T(Key::PowerModePrefix) + scheme;
-            v.etaLabel = discharging ? T(Key::EtaLeft) : charging ? T(Key::EtaFull) : T(Key::BatteryStatus);
-            if (s.eta_from_system && discharging) v.etaLabel += T(Key::SystemEstimate);
-            if (discharging || charging) {
-                v.hero = Parts(s.eta_s);
+            v.chip = v.low ? T(Key::LowBattery) : supplemental ? T(Key::AssistChip) :
+                     discharging ? T(Key::Discharging) : charging ? T(Key::Charging) :
+                     s.mode == PowerMode::AcIdle && v.acOnline ? T(Key::OnAc) :
+                     s.mode == PowerMode::AcIdle ? T(Key::NotCharging) :
+                     s.mode == PowerMode::NoBattery ? T(Key::NoBattery) : T(Key::Reading);
+            const std::wstring plan = s.active_plan_valid && !s.active_plan_name.empty()
+                ? s.active_plan_name : T(Key::PowerPlanUnknown);
+            Key overlay = Key::Balanced;
+            switch (s.power_scheme_kind) {
+            case PowerSchemeKind::BestPerformance: overlay = Key::BestPerformance; break;
+            case PowerSchemeKind::BestEfficiency: overlay = Key::BestEfficiency; break;
+            case PowerSchemeKind::LongerBattery: overlay = Key::LongerBattery; break;
+            default: break;
+            }
+            v.scheme = s.active_plan_valid && s.active_plan_balanced && overlay != Key::Balanced
+                ? T(Key::PowerModePrefix) + T(overlay) : T(Key::PowerPlanPrefix) + plan;
+            v.batterySaver = s.battery_saver;
+            v.saverLabel = s.battery_saver ? T(Key::BatterySaverShort) : L"";
+            v.etaLabel = T(Key::BatteryStatus);
+            if (supplemental) {
+                v.heroWord = T(Key::ExternalDischarge);
+            } else if (showDischargeEta || showChargeEta) {
+                v.etaLabel = showDischargeEta ? T(Key::EtaLeft) : T(Key::EtaFull);
+                if (showDischargeEta && s.eta_from_system && Known(s.eta_s)) v.etaLabel += T(Key::SystemEstimate);
+                v.hero = Parts(showDischargeEta || showChargeEta ? s.eta_s : NAN);
                 if (v.hero.empty()) v.heroWord = T(Key::Calculating);
-            } else if (s.mode == PowerMode::AcIdle) v.heroWord = s.percent >= 99 ? T(Key::FullyCharged) : T(Key::AcPower);
-            else v.heroWord = s.mode == PowerMode::NoBattery ? T(Key::NoBatteryDetected) : T(Key::Reading);
-            v.wattLabel = charging ? T(Key::ChargePower) : discharging ? T(Key::LivePower) :
-                          s.mode == PowerMode::NoBattery ? T(Key::Power) : T(Key::BatteryPower);
-            v.watt = Number(s.power_w, s.power_w >= 100 ? 0 : 1);
-            v.pphLabel = charging ? T(Key::ChargePerHour) : discharging ? T(Key::DrainPerHour) : T(Key::PerHour);
-            v.pph = Number(s.pct_per_hour, s.pct_per_hour >= 10 ? 0 : 1);
-            v.eta20 = discharging && Known(s.eta20_s) ? ShortDuration(s.eta20_s) : L"";
-            if (discharging && Known(s.on_battery_s)) {
+            } else if (s.mode == PowerMode::AcIdle && v.acOnline) {
+                v.heroWord = s.percent >= 99 ? T(Key::FullyCharged) : T(Key::AcPower);
+            } else if (s.mode == PowerMode::AcIdle) {
+                v.heroWord = T(Key::NotCharging);
+            } else if (s.mode == PowerMode::NoBattery) {
+                v.heroWord = T(Key::NoBatteryDetected);
+            } else if (discharging) {
+                v.heroWord = L"--";
+            } else {
+                v.heroWord = T(Key::Reading);
+            }
+            if (charging) v.wattLabel = T(Key::ChargePower);
+            else if (supplemental) v.wattLabel = T(Key::NetDischarge);
+            else if (whole) v.wattLabel = T(Key::LivePower);
+            else if (side) v.wattLabel = T(Key::BatteryPower);
+            else if (s.mode == PowerMode::NoBattery) v.wattLabel = T(Key::Power);
+            else v.wattLabel = T(Key::BatteryPower);
+            v.watt = batteryWatts && (charging || supplemental || whole || side)
+                ? Number(s.power_w, s.power_w >= 100 ? 0 : 1) : L"--";
+            const bool idleZero = s.mode == PowerMode::AcIdle && s.battery_rate_valid &&
+                s.battery_rate_mw == 0.0 && !s.power_contested;
+            if (idleZero) v.watt = L"0.0";
+            else if (v.watt == L"--") v.watt = T(Key::NotReported);
+            if (showChargeEta || showDischargeEta) {
+                v.pphLabel = showChargeEta ? T(Key::ChargePerHour) : T(Key::DrainPerHour);
+                v.pph = Number(s.pct_per_hour, s.pct_per_hour >= 10 ? 0 : 1);
+                v.eta20 = showDischargeEta && Known(s.eta20_s) ? ShortDuration(s.eta20_s) : L"";
+            } else {
+                v.pphLabel = T(Key::PerHour);
+                v.pph = L"--";
+            }
+            if (idleZero && Known(s.full_wh) && s.full_wh > 0) v.pph = L"0.0";
+            else if (v.pph == L"--") v.pph = T(Key::NotReported);
+            if (whole && Known(s.on_battery_s)) {
                 v.foot = (s.on_battery_since_start ? T(Key::SinceLaunch) : T(Key::SinceUnplugged)) + Duration(s.on_battery_s);
                 if (Known(s.avg_w)) v.foot += T(Key::AveragePrefix) + Number(s.avg_w) + T(Key::WattSuffix);
             } else if (Known(s.remaining_wh) && Known(s.full_wh) && s.full_wh > 0)
                 v.foot = T(Key::RemainingPrefix) + Number(s.remaining_wh) + T(Key::FullCapacityPrefix) + Number(s.full_wh) + T(Key::WhSuffix);
         }
         if (chart) {
-            const bool sameSource = (view_.mode == PowerMode::Discharging) == discharging;
-            if (components_.Enabled(FullComponent::PowerChart) && !compact_ && sameSource && view_.powerHistory.size() == 120)
-                v.powerHistory = view_.powerHistory;
-            else v.powerHistory.assign(120, -1);
-            std::move(v.powerHistory.begin() + 1, v.powerHistory.end(), v.powerHistory.begin());
-            v.powerHistory.back() = ChartValue(discharging ? s.power_w : s.pkg_w);
+            if (s.power_trace == PowerTrace::Unknown) {
+                if (view_.powerHistory.size() == 120) v.powerHistory = view_.powerHistory;
+            } else {
+                const bool sameSource = haveSample_ && !historyBroken_ && !compact_ &&
+                    components_.Enabled(FullComponent::PowerChart) &&
+                    view_.powerTrace == s.power_trace && view_.powerHistory.size() == 120;
+                if (sameSource) v.powerHistory = view_.powerHistory;
+                else v.powerHistory.assign(120, -1);
+                std::move(v.powerHistory.begin() + 1, v.powerHistory.end(), v.powerHistory.begin());
+                const double point = (whole || side) ? s.power_w : s.pkg_w;
+                v.powerHistory.back() = ChartValue(point);
+            }
         }
         if (network) {
             v.down = FormatSpeed(s.down_bps); v.up = FormatSpeed(s.up_bps);
@@ -386,13 +507,17 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             v.dedicatedMemory = Number(s.gpu_dedicated_mem_mb / 1024, 2) + T(Key::GbSuffix);
         }
         if (c.Enabled(FullComponent::Wifi)) {
-            v.wifiSsid = s.wifi_ssid.empty() ? L"--" : s.wifi_ssid;
+            const Key status = s.wifi_status == WifiStatus::PermissionRequired ? Key::WifiPermissionRequired :
+                s.wifi_status == WifiStatus::Disconnected ? Key::WifiDisconnected :
+                s.wifi_status == WifiStatus::Unavailable ? Key::WifiUnavailable :
+                s.wifi_status == WifiStatus::Error ? Key::SensorReadFailed : Key::Reading;
+            v.wifiSsid = s.wifi_status == WifiStatus::Connected ? s.wifi_ssid : T(status);
             v.wifi = s.wifi_signal < 0 ? -1 : Fraction(s.wifi_signal);
-            v.wifiSignal = s.wifi_signal < 0 ? L"--" : Percent(s.wifi_signal, 0);
+            v.wifiSignal = s.wifi_signal < 0 ? T(status) : Percent(s.wifi_signal, 0);
         }
         if (c.Enabled(FullComponent::BatteryHealth)) {
             v.health = Known(s.battery_health_percent) ? Number(s.battery_health_percent, 1) + L"%" : L"--";
-            v.cycles = s.battery_cycles < 0 ? L"--" : std::to_wstring(s.battery_cycles);
+            v.cycles = s.battery_cycles < 0 ? T(Key::NotReported) : std::to_wstring(s.battery_cycles);
         }
         if (c.Enabled(FullComponent::Fps)) {
             v.fpsAdmin = s.fps_status == 2;
@@ -416,7 +541,9 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
     const bool selectionChanged = compact_ != compact ||
         (compact ? components_.compact != c.compact : components_.full != c.full);
     const bool changed = !haveSample_ || historyBroken_ || selectionChanged || !v.Equals(view_, compact, c);
-    view_ = std::move(v); components_ = c; compact_ = compact;
+    view_ = std::move(v);
+    // History and change detection need selections only, never order or appearance.
+    components_.full = c.full; components_.compact = c.compact; compact_ = compact;
     haveSample_ = true; historyBroken_ = false;
     return changed;
 }

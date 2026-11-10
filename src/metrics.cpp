@@ -22,6 +22,7 @@
 #endif
 
 #include "metrics.h"
+#include "power_diagnostics.h"
 #include "netprobe.h"
 
 #include <winsock2.h>
@@ -40,6 +41,8 @@
 #include <psapi.h>
 #include <batclass.h>
 #include <wlanapi.h>
+#include <dxgi.h>
+#include <cfgmgr32.h>
 
 #include <algorithm>
 #include <array>
@@ -83,9 +86,13 @@ constexpr unsigned long long kPdhRetryMs = 30000;
 constexpr unsigned long long kDiskEveryMs = 1000;
 constexpr unsigned long long kSysDiskEveryMs = 30000;
 constexpr unsigned long long kGpuMemEveryMs = 3000;
+constexpr unsigned long long kGpuTempEveryMs = 2000;
+constexpr unsigned long long kGpuTempRetryMs = 30000;
+constexpr unsigned long long kGpuTempRediscoverMs = 60000;
+constexpr unsigned long long kDgpuRetryMs = 30000;
+constexpr unsigned long long kDgpuRediscoverMs = 60000;
 constexpr unsigned long long kWifiEveryMs = 10000;
 constexpr unsigned long long kBatteryHealthEveryMs = 600000;
-constexpr long kRateUnknownAbs = 500000;
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr double kMiB = 1024.0 * 1024.0;
 bool IsPhysicalNic(const MIB_IF_ROW2& row) {
@@ -108,6 +115,8 @@ constexpr unsigned kWantBattery = 1u << 10;
 constexpr unsigned kWantFps = 1u << 11;
 constexpr unsigned kWantScheme = 1u << 12;
 constexpr unsigned kWantCount = 1u << 13;
+constexpr unsigned kWantGpuTemp = 1u << 14;
+constexpr unsigned kWantDgpuPower = 1u << 15;
 constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc;
 
 static_assert(sizeof(void*) == 8, "x64 only");
@@ -116,11 +125,588 @@ static_assert(offsetof(BATTERY_INFORMATION, DesignedCapacity) == 12, "DesignedCa
 static_assert(offsetof(BATTERY_INFORMATION, CycleCount) == 32, "CycleCount offset");
 static_assert(sizeof(BATTERY_QUERY_INFORMATION) == 12, "BATTERY_QUERY_INFORMATION size");
 
+// Windows SDK shared/d3dkmthk.h (Microsoft win32metadata, RecompiledIdlHeaders):
+// https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/shared/d3dkmthk.h
+// Local x64 ABI declarations: MinGW's SDK does not provide these newer types.
+// KMTQUERYADAPTERINFOTYPE: ADAPTERTYPE = 15, ADAPTERPERFDATA = 62 (WDDM 2.4+).
+constexpr UINT kPulseKmtAdapterType = 15;
+constexpr UINT kPulseKmtAdapterPerfData = 62;
+// ADAPTERTYPE's UINT bitfield: RenderSupported is bit 0; SoftwareDevice is
+// the third bit (zero-based bit 2), not bit 3. Read masks to avoid bitfield ABI issues.
+constexpr UINT kPulseKmtRenderSupported = 1u << 0;
+constexpr UINT kPulseKmtSoftwareDevice = 1u << 2;
+struct PulseKmtAdapterInfo {
+    UINT hAdapter; // D3DKMT_HANDLE is a 32-bit UINT, not a Win32 HANDLE.
+    LUID AdapterLuid;
+    ULONG NumOfSources;
+    BOOL bPrecisePresentRegionsPreferred;
+};
+struct PulseKmtEnumAdapters2 {
+    ULONG NumAdapters;
+    PulseKmtAdapterInfo* pAdapters;
+};
+struct PulseKmtQueryAdapterInfo {
+    UINT hAdapter;
+    UINT Type;
+    void* pPrivateDriverData;
+    UINT PrivateDriverDataSize;
+};
+struct PulseKmtCloseAdapter { UINT hAdapter; };
+struct PulseKmtAdapterAddress { UINT bus, device, function; };
+struct PulseKmtAdapterType { UINT Value; };
+struct PulseKmtAdapterPerfData {
+    UINT32 PhysicalAdapterIndex;
+    alignas(8) ULONGLONG MemoryFrequency;
+    ULONGLONG MaxMemoryFrequency;
+    ULONGLONG MaxMemoryFrequencyOC;
+    ULONGLONG MemoryBandwidth;
+    ULONGLONG PCIEBandwidth;
+    ULONG FanRPM;      // Adapter fan only. This is not a general CPU or chassis fan.
+    ULONG Power;       // 1 = 0.1% of the adapter's own scale. Never convert this to watts.
+    ULONG Temperature; // 1 = 0.1 degrees Celsius; 0 means unavailable.
+    UCHAR PowerStateOverride;
+};
+static_assert(sizeof(PulseKmtAdapterInfo) == 20, "D3DKMT_ADAPTERINFO size");
+static_assert(offsetof(PulseKmtAdapterInfo, AdapterLuid) == 4, "AdapterLuid offset");
+static_assert(offsetof(PulseKmtAdapterInfo, NumOfSources) == 12, "NumOfSources offset");
+static_assert(offsetof(PulseKmtAdapterInfo, bPrecisePresentRegionsPreferred) == 16, "PrecisePresent offset");
+static_assert(sizeof(PulseKmtEnumAdapters2) == 16, "D3DKMT_ENUMADAPTERS2 size");
+static_assert(offsetof(PulseKmtEnumAdapters2, pAdapters) == 8, "pAdapters offset");
+static_assert(sizeof(PulseKmtQueryAdapterInfo) == 24, "D3DKMT_QUERYADAPTERINFO size");
+static_assert(offsetof(PulseKmtQueryAdapterInfo, Type) == 4, "Query Type offset");
+static_assert(offsetof(PulseKmtQueryAdapterInfo, pPrivateDriverData) == 8, "PrivateDriverData offset");
+static_assert(offsetof(PulseKmtQueryAdapterInfo, PrivateDriverDataSize) == 16, "PrivateDriverDataSize offset");
+static_assert(sizeof(PulseKmtCloseAdapter) == 4, "D3DKMT_CLOSEADAPTER size");
+static_assert(sizeof(PulseKmtAdapterType) == 4, "D3DKMT_ADAPTERTYPE size");
+static_assert(sizeof(PulseKmtAdapterPerfData) == 64, "D3DKMT_ADAPTER_PERFDATA size");
+static_assert(alignof(PulseKmtAdapterPerfData) == 8, "ADAPTER_PERFDATA alignment");
+static_assert(offsetof(PulseKmtAdapterPerfData, MemoryFrequency) == 8, "MemoryFrequency offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, PCIEBandwidth) == 40, "PCIEBandwidth offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, FanRPM) == 48, "FanRPM offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, Power) == 52, "Power offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, Temperature) == 56, "Temperature offset");
+static_assert(offsetof(PulseKmtAdapterPerfData, PowerStateOverride) == 60, "PowerStateOverride offset");
+
+struct PulseKmtApi {
+    // NTSTATUS is a signed 32-bit LONG; NT_SUCCESS(status) means status >= 0.
+    using EnumFn = LONG(WINAPI*)(const PulseKmtEnumAdapters2*);
+    using QueryFn = LONG(WINAPI*)(const PulseKmtQueryAdapterInfo*);
+    using CloseFn = LONG(WINAPI*)(const PulseKmtCloseAdapter*);
+    HMODULE module = nullptr;
+    EnumFn enumerate = nullptr;
+    QueryFn query = nullptr;
+    CloseFn close = nullptr;
+    PulseKmtApi() = default;
+    PulseKmtApi(const PulseKmtApi&) = delete;
+    PulseKmtApi& operator=(const PulseKmtApi&) = delete;
+    ~PulseKmtApi() { Reset(); }
+    bool Load() {
+        if (module) return true;
+        module = LoadLibraryExW(L"gdi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) return false;
+        enumerate = reinterpret_cast<EnumFn>(GetProcAddress(module, "D3DKMTEnumAdapters2"));
+        query = reinterpret_cast<QueryFn>(GetProcAddress(module, "D3DKMTQueryAdapterInfo"));
+        close = reinterpret_cast<CloseFn>(GetProcAddress(module, "D3DKMTCloseAdapter"));
+        if (enumerate && query && close) return true;
+        Reset();
+        return false;
+    }
+    void Reset() {
+        if (module) FreeLibrary(module);
+        module = nullptr;
+        enumerate = nullptr;
+        query = nullptr;
+        close = nullptr;
+    }
+};
+
+void PulseKmtCloseAdapters(const PulseKmtApi& api, std::vector<PulseKmtAdapterInfo>& adapters) {
+    for (auto& adapter : adapters) {
+        if (adapter.hAdapter && api.close) {
+            const PulseKmtCloseAdapter request{adapter.hAdapter};
+            api.close(&request);
+        }
+        adapter.hAdapter = 0;
+    }
+    adapters.clear();
+}
+
+// CfgMgr ABI and property keys from the Windows SDK cfgmgr32.h/devpkey.h/winnt.h.
+// https://github.com/microsoft/win32metadata/tree/main/generation/WinSDK/RecompiledIdlHeaders
+constexpr DEVPROPKEY kPulseBusNumber = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 23};
+constexpr DEVPROPKEY kPulseAddress = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 30};
+constexpr DEVPROPKEY kPulsePowerData = {
+    {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 32};
+constexpr ULONG kPulseCmFilter = 0x00000200 | 0x00000100; // CLASS | PRESENT.
+#if defined(CM_GETIDLIST_FILTER_CLASS) && defined(CM_GETIDLIST_FILTER_PRESENT)
+static_assert(kPulseCmFilter == (CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT), "CM list flags");
+#endif
+static_assert(DN_STARTED == 0x00000008, "DN_STARTED value");
+static_assert(PowerDeviceD0 == kDgpuPowerD0, "PowerDeviceD0 value");
+static_assert(sizeof(DEVICE_POWER_STATE) == 4 && sizeof(SYSTEM_POWER_STATE) == 4, "Power enum sizes");
+// All fields are 32 bits; no pointer-sized fields in CM_POWER_DATA.
+struct PulseCmPowerData {
+    DWORD PD_Size, PD_MostRecentPowerState, PD_Capabilities;
+    DWORD PD_D1Latency, PD_D2Latency, PD_D3Latency;
+    DWORD PD_PowerStateMapping[7], PD_DeepestSystemWake;
+};
+static_assert(sizeof(DEVPROPKEY) == 20 && offsetof(DEVPROPKEY, pid) == 16, "DEVPROPKEY layout");
+static_assert(sizeof(PulseCmPowerData) == 56, "CM_POWER_DATA size");
+static_assert(offsetof(PulseCmPowerData, PD_MostRecentPowerState) == 4, "CM power state offset");
+static_assert(offsetof(PulseCmPowerData, PD_PowerStateMapping) == 24, "CM power mapping offset");
+static_assert(offsetof(PulseCmPowerData, PD_DeepestSystemWake) == 52, "CM wake state offset");
+
+struct PulseCmApi {
+    HMODULE module = nullptr;
+    decltype(&CM_Get_Device_ID_List_SizeW) size = nullptr;
+    decltype(&CM_Get_Device_ID_ListW) list = nullptr;
+    decltype(&CM_Locate_DevNodeW) locate = nullptr;
+    decltype(&CM_Get_DevNode_Status) status = nullptr;
+    decltype(&CM_Get_DevNode_PropertyW) property = nullptr;
+    DWORD load_error = 0;
+    PulseCmApi() = default;
+    PulseCmApi(const PulseCmApi&) = delete;
+    PulseCmApi& operator=(const PulseCmApi&) = delete;
+    ~PulseCmApi() { Reset(); }
+    void Reset() {
+        if (module) FreeLibrary(module);
+        module = nullptr;
+        size = nullptr; list = nullptr; locate = nullptr; status = nullptr; property = nullptr;
+    }
+    bool Load() {
+        if (module) return true;
+        load_error = 0;
+        module = LoadLibraryExW(L"cfgmgr32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) { load_error = GetLastError(); return false; }
+        size = reinterpret_cast<decltype(size)>(GetProcAddress(module, "CM_Get_Device_ID_List_SizeW"));
+        list = reinterpret_cast<decltype(list)>(GetProcAddress(module, "CM_Get_Device_ID_ListW"));
+        locate = reinterpret_cast<decltype(locate)>(GetProcAddress(module, "CM_Locate_DevNodeW"));
+        status = reinterpret_cast<decltype(status)>(GetProcAddress(module, "CM_Get_DevNode_Status"));
+        property = reinterpret_cast<decltype(property)>(GetProcAddress(module, "CM_Get_DevNode_PropertyW"));
+        if (size && list && locate && status && property) return true;
+        load_error = ERROR_PROC_NOT_FOUND;
+        Reset();
+        return false;
+    }
+};
+struct PulseCmNode {
+    std::wstring id;
+    DEVINST devinst = 0;
+    ULONG flags = 0, problem = 0, bus = 0, address = 0;
+    CONFIGRET locate_rc = CR_CALL_NOT_IMPLEMENTED, status_rc = CR_CALL_NOT_IMPLEMENTED;
+    CONFIGRET bus_rc = CR_CALL_NOT_IMPLEMENTED, address_rc = CR_CALL_NOT_IMPLEMENTED;
+    CONFIGRET power_rc = CR_CALL_NOT_IMPLEMENTED;
+    bool eligible = false;
+};
+struct DgpuGate {
+    PulseCmApi api;
+    std::vector<PulseCmNode> nodes;
+    std::vector<DgpuAdapter> adapters;
+    bool ready = false;
+    unsigned long long retry_at = 0, enum_at = 0;
+    CONFIGRET enum_rc = CR_CALL_NOT_IMPLEMENTED;
+    void Reset() {
+        api.Reset();
+        std::vector<PulseCmNode>().swap(nodes);
+        std::vector<DgpuAdapter>().swap(adapters);
+        ready = false;
+        retry_at = enum_at = 0;
+        enum_rc = CR_CALL_NOT_IMPLEMENTED;
+    }
+    bool Fail(unsigned long long now) {
+        ready = false;
+        retry_at = now + kDgpuRetryMs;
+        return false;
+    }
+    CONFIGRET ReadUint(DEVINST devinst, const DEVPROPKEY& key, ULONG& value) {
+        DEVPROPTYPE type = 0;
+        ULONG bytes = sizeof(value);
+        const CONFIGRET rc = api.property(devinst, &key, &type, reinterpret_cast<PBYTE>(&value), &bytes, 0);
+        if (rc != CR_SUCCESS) return rc;
+        return type == DEVPROP_TYPE_UINT32 && bytes == sizeof(value) ? CR_SUCCESS : CR_INVALID_DATA;
+    }
+    bool Ensure(unsigned long long now) {
+        if (ready) return true;
+        if (now < retry_at) return false;
+        nodes.clear(); adapters.clear();
+        if (!api.Load()) { enum_rc = CR_CALL_NOT_IMPLEMENTED; return Fail(now); }
+        const wchar_t* display_class = L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+        std::vector<wchar_t> ids;
+        // Device arrival can grow the MULTI_SZ between the two calls.
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            ULONG count = 0;
+            enum_rc = api.size(&count, display_class, kPulseCmFilter);
+            if (enum_rc != CR_SUCCESS) return Fail(now);
+            if (!count || count > (1u << 20)) { enum_rc = CR_INVALID_DATA; return Fail(now); }
+            ids.assign(count, L'\0');
+            enum_rc = api.list(display_class, ids.data(), count, kPulseCmFilter);
+            if (enum_rc == CR_SUCCESS) break;
+            if (enum_rc != CR_BUFFER_SMALL) return Fail(now);
+        }
+        if (enum_rc != CR_SUCCESS) return Fail(now);
+        bool failed = false;
+        for (std::size_t pos = 0; pos < ids.size() && ids[pos];) {
+            const wchar_t* end = std::wmemchr(ids.data() + pos, L'\0', ids.size() - pos);
+            if (!end) { enum_rc = CR_INVALID_DATA; return Fail(now); }
+            PulseCmNode node;
+            node.id.assign(ids.data() + pos, static_cast<std::size_t>(end - (ids.data() + pos)));
+            pos += node.id.size() + 1;
+            if (node.id.size() < 12 || _wcsnicmp(node.id.c_str(), L"PCI\\VEN_10DE", 12) != 0) continue;
+            node.locate_rc = api.locate(&node.devinst, node.id.data(), 0);
+            if (node.locate_rc == CR_SUCCESS)
+                node.status_rc = api.status(&node.flags, &node.problem, node.devinst, 0);
+            if (node.status_rc == CR_SUCCESS && (node.flags & DN_STARTED)) {
+                node.bus_rc = ReadUint(node.devinst, kPulseBusNumber, node.bus);
+                node.address_rc = ReadUint(node.devinst, kPulseAddress, node.address);
+                node.eligible = node.bus_rc == CR_SUCCESS && node.address_rc == CR_SUCCESS;
+                failed = failed || !node.eligible;
+            }
+            failed = failed || node.locate_rc != CR_SUCCESS || node.status_rc != CR_SUCCESS;
+            adapters.push_back({0x10DE, node.bus, node.address >> 16, 0, false});
+            nodes.push_back(std::move(node));
+        }
+        if (failed) return Fail(now);
+        ready = true;
+        enum_at = now;
+        retry_at = 0;
+        return true;
+    }
+    DgpuStatus Read(unsigned long long now) {
+        diagnostics::ScopedTiming timing(L"CfgMgr dGPU gate");
+        // Empty/disabled lists need discovery after a MUX or PnP change.
+        bool have_started = false;
+        for (const auto& node : nodes) have_started = have_started || node.eligible;
+        if (ready && !have_started && now - enum_at >= kDgpuRediscoverMs) ready = false;
+        if (!Ensure(now)) return DgpuStatus::ReadFailed;
+        bool failed = false;
+        for (std::size_t i = 0; i < nodes.size(); ++i) {
+            auto& node = nodes[i];
+            auto& adapter = adapters[i];
+            adapter.power_state = 0;
+            adapter.power_read_ok = false;
+            if (!node.eligible) continue;
+            PulseCmPowerData data{};
+            data.PD_Size = sizeof(data);
+            DEVPROPTYPE type = 0;
+            ULONG bytes = sizeof(data);
+            node.power_rc = api.property(node.devinst, &kPulsePowerData, &type,
+                reinterpret_cast<PBYTE>(&data), &bytes, 0);
+            if (node.power_rc == CR_SUCCESS && (type != DEVPROP_TYPE_BINARY || bytes != sizeof(data) ||
+                data.PD_Size != sizeof(data))) node.power_rc = CR_INVALID_DATA;
+            if (node.power_rc != CR_SUCCESS) { failed = true; continue; }
+            adapter.power_state = data.PD_MostRecentPowerState;
+            adapter.power_read_ok = true;
+        }
+        if (failed) { Fail(now); return DgpuStatus::ReadFailed; }
+        return DgpuGateStatus(adapters);
+    }
+};
+
+const wchar_t* DgpuPowerStateName(const DgpuAdapter& adapter) {
+    if (!adapter.power_read_ok) return L"unknown";
+    switch (adapter.power_state) {
+    case 1: return L"D0";
+    case 2: return L"D1";
+    case 3: return L"D2";
+    case 4: return L"D3";
+    default: return L"Unspecified";
+    }
+}
+std::wstring DgpuCrText(CONFIGRET rc) {
+    const wchar_t* name = L"CR_OTHER";
+    switch (rc) {
+    case CR_SUCCESS: name = L"CR_SUCCESS"; break;
+    case CR_NO_SUCH_DEVINST: name = L"CR_NO_SUCH_DEVINST"; break;
+    case CR_BUFFER_SMALL: name = L"CR_BUFFER_SMALL"; break;
+    case CR_INVALID_DATA: name = L"CR_INVALID_DATA"; break;
+    case CR_INVALID_DEVNODE: name = L"CR_INVALID_DEVNODE"; break;
+    case CR_NO_SUCH_VALUE: name = L"CR_NO_SUCH_VALUE"; break;
+    case CR_CALL_NOT_IMPLEMENTED: name = L"CR_CALL_NOT_IMPLEMENTED"; break;
+    case CR_DEVICE_NOT_THERE: name = L"CR_DEVICE_NOT_THERE"; break;
+    case CR_ACCESS_DENIED: name = L"CR_ACCESS_DENIED"; break;
+    }
+    wchar_t text[96]{};
+    std::swprintf(text, 96, L"%ls (0x%08lX)", name, static_cast<unsigned long>(rc));
+    return text;
+}
+std::wstring DgpuGateReport(const DgpuGate& gate, DgpuStatus status) {
+    std::wstring report = std::wstring(L"CfgMgr D-state gate: ") + DgpuStatusName(status) + L"\r\n";
+    report += L"  enumeration=" + DgpuCrText(gate.enum_rc) + L" load_error=" +
+        std::to_wstring(gate.api.load_error) + L"\r\n";
+    report += L"  CR_CALL_NOT_IMPLEMENTED also marks skipped calls; CR_INVALID_DATA includes invalid property type/size.\r\n";
+    for (std::size_t i = 0; i < gate.nodes.size(); ++i) {
+        const auto& node = gate.nodes[i];
+        const auto& adapter = gate.adapters[i];
+        report += L"  Instance ID: " + node.id + L"\r\n";
+        report += L"    locate=" + DgpuCrText(node.locate_rc) + L" status=" + DgpuCrText(node.status_rc) + L"\r\n";
+        report += std::wstring(L"    DN_STARTED=") + ((node.flags & DN_STARTED) ? L"yes" : L"no") +
+            L" flags=" + std::to_wstring(node.flags) + L" problem=" + std::to_wstring(node.problem) + L"\r\n";
+        report += L"    Bus=" + std::to_wstring(node.bus) + L" Device=" + std::to_wstring(node.address >> 16) +
+            L" Function=" + std::to_wstring(node.address & 0xffff) + L" Address=" + std::to_wstring(node.address) + L"\r\n";
+        report += L"    Bus_rc=" + DgpuCrText(node.bus_rc) + L" Address_rc=" + DgpuCrText(node.address_rc) + L"\r\n";
+        report += std::wstring(L"    PowerState=") + DgpuPowerStateName(adapter) + L" raw=" +
+            std::to_wstring(adapter.power_state) + L" PowerData_rc=" + DgpuCrText(node.power_rc) + L"\r\n";
+    }
+    return report;
+}
+
+// NVML ABI only; no NVIDIA headers, import library, or default DLL search path.
+// https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nvml.h (nvmlPciInfo_st)
+using nvmlReturn_t = int;
+struct nvmlDevice_st;
+using nvmlDevice_t = nvmlDevice_st*;
+struct nvmlPciInfo_t {
+    char busIdLegacy[16];
+    unsigned domain, bus, device, pciDeviceId, pciSubSystemId;
+    char busId[32];
+};
+static_assert(sizeof(nvmlPciInfo_t) == 68, "nvmlPciInfo_t size");
+static_assert(offsetof(nvmlPciInfo_t, domain) == 16, "NVML domain offset");
+static_assert(offsetof(nvmlPciInfo_t, bus) == 20, "NVML bus offset");
+static_assert(offsetof(nvmlPciInfo_t, device) == 24, "NVML device offset");
+static_assert(offsetof(nvmlPciInfo_t, pciDeviceId) == 28, "NVML pciDeviceId offset");
+static_assert(offsetof(nvmlPciInfo_t, pciSubSystemId) == 32, "NVML pciSubSystemId offset");
+static_assert(offsetof(nvmlPciInfo_t, busId) == 36, "NVML busId offset");
+constexpr nvmlReturn_t kNvmlSuccess = kDgpuNvmlSuccess;
+
+struct NvmlApi {
+    using InitFn = nvmlReturn_t(*)();
+    using ShutdownFn = nvmlReturn_t(*)();
+    using CountFn = nvmlReturn_t(*)(unsigned*);
+    using HandleFn = nvmlReturn_t(*)(unsigned, nvmlDevice_t*);
+    using PciFn = nvmlReturn_t(*)(nvmlDevice_t, nvmlPciInfo_t*);
+    using PowerFn = nvmlReturn_t(*)(nvmlDevice_t, unsigned*);
+    using NameFn = nvmlReturn_t(*)(nvmlDevice_t, char*, unsigned);
+    HMODULE module = nullptr;
+    InitFn init = nullptr;
+    ShutdownFn shutdown = nullptr;
+    CountFn count = nullptr;
+    HandleFn handle = nullptr;
+    PciFn pci = nullptr;
+    PowerFn power = nullptr;
+    PowerFn enforced_limit = nullptr;
+    NameFn name = nullptr;
+    bool initialized = false;
+    nvmlReturn_t init_result = -1;
+    DWORD load_error = 0;
+    std::wstring path;
+    NvmlApi() = default;
+    NvmlApi(const NvmlApi&) = delete;
+    NvmlApi& operator=(const NvmlApi&) = delete;
+    ~NvmlApi() { Reset(); }
+    void Reset() {
+        if (initialized && shutdown) shutdown();
+        initialized = false;
+        if (module) FreeLibrary(module);
+        module = nullptr;
+        init = nullptr; shutdown = nullptr; count = nullptr; handle = nullptr;
+        pci = nullptr; power = nullptr; enforced_limit = nullptr; name = nullptr;
+    }
+    bool Open() {
+        diagnostics::ScopedTiming timing(L"NVML init");
+        Reset();
+        path = L"System32\\nvml.dll";
+        init_result = -1;
+        load_error = 0;
+        module = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!module) {
+            wchar_t root[32768]{};
+            const DWORD length = GetEnvironmentVariableW(L"ProgramW6432", root, 32768);
+            // Accept only an absolute drive path, never an expanded relative path.
+            if (length >= 3 && length < 32768 && root[1] == L':' && root[2] == L'\\') {
+                path = std::wstring(root) + L"\\NVIDIA Corporation\\NVSMI\\nvml.dll";
+                module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            }
+        }
+        if (!module) { load_error = GetLastError(); return false; }
+        wchar_t actual[32768]{};
+        const DWORD length = GetModuleFileNameW(module, actual, 32768);
+        if (length > 0 && length < 32768) path.assign(actual, length);
+        init = reinterpret_cast<InitFn>(GetProcAddress(module, "nvmlInit_v2"));
+        shutdown = reinterpret_cast<ShutdownFn>(GetProcAddress(module, "nvmlShutdown"));
+        count = reinterpret_cast<CountFn>(GetProcAddress(module, "nvmlDeviceGetCount_v2"));
+        handle = reinterpret_cast<HandleFn>(GetProcAddress(module, "nvmlDeviceGetHandleByIndex_v2"));
+        pci = reinterpret_cast<PciFn>(GetProcAddress(module, "nvmlDeviceGetPciInfo_v3"));
+        power = reinterpret_cast<PowerFn>(GetProcAddress(module, "nvmlDeviceGetPowerUsage"));
+        enforced_limit = reinterpret_cast<PowerFn>(GetProcAddress(module, "nvmlDeviceGetEnforcedPowerLimit"));
+        name = reinterpret_cast<NameFn>(GetProcAddress(module, "nvmlDeviceGetName"));
+        if (!init || !shutdown || !count || !handle || !pci || !power || !name) {
+            load_error = ERROR_PROC_NOT_FOUND;
+            Reset();
+            return false;
+        }
+        init_result = init();
+        initialized = init_result == kNvmlSuccess;
+        if (!initialized) { Reset(); return false; }
+        return true;
+    }
+};
+
+struct NvmlBoard {
+    nvmlDevice_t handle = nullptr;
+    nvmlPciInfo_t pci{};
+    unsigned limit_mw = 0;
+    bool limit_known = false;
+    bool selected = false;
+};
+
+struct DgpuPower {
+    DgpuGate gate;
+    NvmlApi nvml;
+    std::vector<NvmlBoard> boards;
+    std::vector<DgpuDevice> readings;
+    unsigned long long retry_at = 0;
+    DgpuStatus last_gate = DgpuStatus::Off;
+    DgpuHistory history;
+    bool glitch_logged = false;
+    unsigned long long glitch_log_at = 0;
+    DgpuStatus logged_status = DgpuStatus::Off;
+    std::size_t logged_matched = static_cast<std::size_t>(-1);
+    std::wstring logged_init;
+    std::wstring logged_devices;
+    DgpuStatus retry_status = DgpuStatus::NvmlUnavailable;
+    void CloseNvml() {
+        nvml.Reset();
+        boards.clear();
+        readings.clear();
+        history.Reset();
+    }
+    void Reset() {
+        CloseNvml();
+        std::vector<NvmlBoard>().swap(boards);
+        std::vector<DgpuDevice>().swap(readings);
+        gate.Reset();
+        retry_at = 0;
+        last_gate = DgpuStatus::Off;
+        glitch_logged = false;
+        glitch_log_at = 0;
+        logged_status = DgpuStatus::Off;
+        logged_matched = static_cast<std::size_t>(-1);
+        logged_init.clear();
+        logged_devices.clear();
+    }
+    DgpuResult Publish(DgpuResult result) {
+        // Sleep transitions have their own gate log; glitches use the rate-limited raw log.
+        if (result.status != DgpuStatus::Sleeping && result.status != DgpuStatus::Valid &&
+            result.status != DgpuStatus::Glitch &&
+            (result.status != logged_status || result.matched != logged_matched)) {
+            diagnostics::WriteLog(L"GPU", std::wstring(L"dGPU status=") + DgpuStatusName(result.status) +
+                L" matched=" + std::to_wstring(result.matched));
+        }
+        logged_status = result.status;
+        logged_matched = result.matched;
+        return result;
+    }
+    bool Enumerate() {
+        boards.clear();
+        unsigned count = 0;
+        const nvmlReturn_t count_rc = nvml.count(&count);
+        bool ok = count_rc == kNvmlSuccess && count <= 4096;
+        std::wstring message = L"NVML devices=" + std::to_wstring(count) + L" count_rc=" + std::to_wstring(count_rc);
+        if (ok) {
+            for (unsigned i = 0; i < count; ++i) {
+                NvmlBoard board;
+                const nvmlReturn_t handle_rc = nvml.handle(i, &board.handle);
+                const nvmlReturn_t pci_rc = handle_rc == kNvmlSuccess && board.handle ?
+                    nvml.pci(board.handle, &board.pci) : -1;
+                message += L" [" + std::to_wstring(i) + L" handle_rc=" + std::to_wstring(handle_rc) +
+                    L" pci_rc=" + std::to_wstring(pci_rc) + L" bus=" + std::to_wstring(board.pci.bus) +
+                    L" device=" + std::to_wstring(board.pci.device) + L"]";
+                if (handle_rc != kNvmlSuccess || pci_rc != kNvmlSuccess) { ok = false; continue; }
+                // CfgMgr exposes bus/device without a PCI domain; require domain 0.
+                if (board.pci.domain == 0) {
+                    if (DgpuMatches(gate.adapters, board.pci.bus, board.pci.device) && nvml.enforced_limit) {
+                        unsigned limit = 0;
+                        if (nvml.enforced_limit(board.handle, &limit) == kNvmlSuccess) {
+                            board.limit_mw = limit;
+                            board.limit_known = true;
+                        }
+                    }
+                    boards.push_back(board);
+                }
+            }
+        }
+        if (message != logged_devices) { diagnostics::WriteLog(L"GPU", message); logged_devices = message; }
+        return ok;
+    }
+    DgpuResult Read(unsigned long long now, unsigned bus = ~0u, unsigned device = ~0u) {
+        DgpuStatus status = gate.Read(now);
+        auto selectedAdapters = gate.adapters;
+        if (bus != ~0u) {
+            selectedAdapters.erase(std::remove_if(selectedAdapters.begin(), selectedAdapters.end(),
+                [=](const DgpuAdapter& a) { return a.bus != bus || a.device != device; }), selectedAdapters.end());
+            status = DgpuGateStatus(selectedAdapters);
+        }
+        if (status == DgpuStatus::Sleeping && last_gate != DgpuStatus::Sleeping)
+            diagnostics::WriteLog(L"GPU", L"dGPU asleep: NVML idle, no calls");
+        else if (status == DgpuStatus::Valid && last_gate != DgpuStatus::Valid)
+            diagnostics::WriteLog(L"GPU", L"dGPU awake");
+        last_gate = status;
+        const auto action = DgpuNextAction(status == DgpuStatus::Valid, nvml.initialized, now, retry_at);
+        if (status != DgpuStatus::Valid) {
+            // Sleeping keeps the session untouched, including nvmlShutdown.
+            // Missing/failed PnP devices invalidate the session on this exceptional path.
+            if (status != DgpuStatus::Sleeping) CloseNvml();
+            return Publish({status, NAN, 0});
+        }
+        if (action == DgpuAction::None) return Publish({retry_status, NAN, 0});
+        if (action == DgpuAction::Init) {
+            retry_at = now + kDgpuRetryMs;
+            const bool opened = nvml.Open();
+            const std::wstring message = L"NVML path=" + nvml.path + L" init_rc=" +
+                std::to_wstring(nvml.init_result) + L" load_error=" + std::to_wstring(nvml.load_error);
+            if (message != logged_init) { diagnostics::WriteLog(L"GPU", message); logged_init = message; }
+            if (!opened) {
+                retry_status = DgpuStatus::NvmlUnavailable;
+                return Publish({retry_status, NAN, 0});
+            }
+            if (!Enumerate()) {
+                CloseNvml();
+                retry_status = DgpuStatus::ReadFailed;
+                return Publish({retry_status, NAN, 0});
+            }
+        }
+        readings.clear();
+        {
+            diagnostics::ScopedTiming timing(L"NVML power");
+            for (auto& board : boards) {
+                const bool selected = DgpuMatches(selectedAdapters, board.pci.bus, board.pci.device);
+                if (selected != board.selected) history.Reset();
+                board.selected = selected;
+                if (!selected) continue;
+                unsigned mw = 0;
+                const nvmlReturn_t rc = nvml.power(board.handle, &mw);
+                readings.push_back({board.pci.bus, board.pci.device, rc, mw, board.limit_mw, board.limit_known});
+                if (rc == kNvmlSuccess && DgpuPowerGlitch(mw, board.limit_mw, board.limit_known) &&
+                    (!glitch_logged || now - glitch_log_at >= 60000)) {
+                    diagnostics::WriteLog(L"GPU", L"dGPU power glitch: raw_mW=" + std::to_wstring(mw) +
+                        L" limit_mW=" + std::to_wstring(board.limit_mw) +
+                        L" limit_known=" + (board.limit_known ? L"yes" : L"no"));
+                    glitch_logged = true;
+                    glitch_log_at = now;
+                }
+            }
+        }
+        const DgpuResult result = history.Apply(InterpretDgpu(selectedAdapters, readings), now);
+        if (result.status == DgpuStatus::ReadFailed || result.status == DgpuStatus::NoMatch) {
+            // A driver reset/hotplug may invalidate cached handles or PCI identities.
+            CloseNvml();
+            retry_at = now + kDgpuRetryMs;
+            retry_status = result.status;
+        }
+        return Publish(result);
+    }
+};
+
 struct BatteryReading {
     bool present = false;
+    bool ac_known = false;
     bool ac = false;
     bool charging = false;
     bool discharging = false;
+    bool rate_known = false;
     double rate_mw = 0;
     double remaining_mwh = 0;
     double full_mwh = 0;
@@ -148,11 +734,6 @@ static_assert(sizeof(RawBatteryState) == 32, "SYSTEM_BATTERY_STATE size");
 static_assert(offsetof(RawBatteryState, MaxCapacity) == 8, "MaxCapacity offset");
 static_assert(offsetof(RawBatteryState, Rate) == 16, "Rate offset");
 
-double SanitizeRate(long rate) {
-    if (rate >= kRateUnknownAbs || rate <= -kRateUnknownAbs) return 0.0;
-    return static_cast<double>(rate);
-}
-
 bool ReadBattery(BatteryReading& out) {
     RawBatteryState bs{};
     SYSTEM_POWER_STATUS ps{};
@@ -161,10 +742,19 @@ bool ReadBattery(BatteryReading& out) {
     if (rc != 0) return false;
     if (!GetSystemPowerStatus(&ps)) return false;
     out.present = bs.BatteryPresent != 0;
-    out.ac = bs.AcOnLine != 0;
+    // ACLineStatus 255 is unknown. If it disagrees with SYSTEM_BATTERY_STATE,
+    // do not pick a side: the sample must not claim a confirmed AC line.
+    const bool nt_ac = bs.AcOnLine != 0;
+    if (ps.ACLineStatus == 0 || ps.ACLineStatus == 1) {
+        const bool status_ac = ps.ACLineStatus == 1;
+        out.ac_known = status_ac == nt_ac;
+        out.ac = out.ac_known && status_ac;
+    }
     out.charging = bs.Charging != 0;
     out.discharging = bs.Discharging != 0;
-    out.rate_mw = SanitizeRate(bs.Rate);
+    // Unknown sentinels stay unknown. Do not publish them as 0 W.
+    out.rate_known = BatteryRateKnown(bs.Rate);
+    out.rate_mw = out.rate_known ? static_cast<double>(bs.Rate) : 0.0;
     out.remaining_mwh = static_cast<double>(bs.RemainingCapacity);
     out.full_mwh = static_cast<double>(bs.MaxCapacity);
     out.percent = ps.BatteryLifePercent <= 100 ? static_cast<int>(ps.BatteryLifePercent) : -1;
@@ -174,6 +764,29 @@ bool ReadBattery(BatteryReading& out) {
 }
 
 using OverlayFn = DWORD(WINAPI*)(GUID*);
+using ActiveSchemeFn = DWORD(WINAPI*)(HKEY, GUID**);
+using FriendlyNameFn = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, UCHAR*, DWORD*);
+
+// Byte-capped Unicode read. A failed or empty name must not keep a previous plan.
+bool ReadPlanName(FriendlyNameFn fn, const GUID& guid, std::wstring& out) {
+    out.clear();
+    if (!fn) return false;
+    DWORD bytes = 0;
+    const DWORD first = fn(nullptr, &guid, nullptr, nullptr, nullptr, &bytes);
+    if ((first != ERROR_SUCCESS && first != ERROR_MORE_DATA) ||
+        bytes < sizeof(wchar_t) || bytes > 2048 || (bytes % sizeof(wchar_t)) != 0) return false;
+    std::vector<unsigned char> buffer(static_cast<std::size_t>(bytes) + sizeof(wchar_t), 0);
+    DWORD got = bytes;
+    if (fn(nullptr, &guid, nullptr, nullptr, buffer.data(), &got) != ERROR_SUCCESS) return false;
+    if (got > bytes) got = bytes;
+    const auto* text = reinterpret_cast<const wchar_t*>(buffer.data());
+    const std::size_t chars = got / sizeof(wchar_t);
+    std::size_t length = 0;
+    while (length < chars && text[length] != L'\0') ++length;
+    if (length == 0) return false;
+    out.assign(text, length);
+    return true;
+}
 
 bool SameGuid(const GUID& a, const GUID& b) {
     return std::memcmp(&a, &b, sizeof(GUID)) == 0;
@@ -255,13 +868,15 @@ int MatchScore(const wchar_t* name, const wchar_t* token) {
 }
 
 bool FormatArray(PDH_HCOUNTER counter, std::vector<unsigned char>& buffer, DWORD& count,
-                 DWORD format = PDH_FMT_DOUBLE) {
+                 DWORD format = PDH_FMT_DOUBLE, long* error = nullptr) {
+    if (error) *error = PDH_INVALID_HANDLE;
     if (!counter) return false;
     for (int attempt = 0; attempt < 3; ++attempt) {
         DWORD need = static_cast<DWORD>(buffer.size());
         count = 0;
         const PDH_STATUS status = PdhGetFormattedCounterArrayW(counter, format, &need, &count,
             reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data()));
+        if (error) *error = status;
         if (status == ERROR_SUCCESS) return true;
         if (static_cast<DWORD>(status) != static_cast<DWORD>(PDH_MORE_DATA) ||
             need == 0 || need > (16u << 20)) return false;
@@ -351,6 +966,50 @@ struct EnergyPoint {
     uint64_t meter_time = 0; // Raw freshness marker; never used as the power denominator.
     bool have_meter_time = false, aligned = false;
 };
+struct CoreEnergyPoint { EnergyPoint point; double watts = NAN; };
+bool IsCoreMeter(const wchar_t* name) {
+    if (!name) return false;
+    unsigned core = 0;
+    int end = 0;
+    return std::swscanf(name, L"RAPL_Package0_Core%u_CORE%n", &core, &end) == 1 &&
+        end > 0 && !name[end] && core < 4096;
+}
+MeterStatus SumCoreEnergy(std::vector<EnergyPoint> current, std::vector<CoreEnergyPoint>& previous, double& watts) {
+    watts = NAN;
+    if (current.empty()) { previous.clear(); return MeterStatus::NoMatch; }
+    std::sort(current.begin(), current.end(), [](const EnergyPoint& a, const EnergyPoint& b) { return a.name < b.name; });
+    bool same = current.size() == previous.size();
+    if (same) for (size_t i = 0; i < current.size(); ++i) same = same && current[i].name == previous[i].point.name;
+    std::vector<CoreEnergyPoint> next;
+    double total = 0;
+    bool valid = same;
+    bool failed = false;
+    for (size_t i = 0; i < current.size(); ++i) {
+        auto cur = current[i];
+        double value = NAN;
+        if (same) {
+            const auto& prev = previous[i];
+            const double seconds = QpcSeconds(cur.qpc, prev.point.qpc);
+            if (cur.pwh >= prev.point.pwh && seconds > 0) {
+                if (cur.have_meter_time && prev.point.have_meter_time && cur.meter_time == prev.point.meter_time) {
+                    cur = prev.point;
+                    if (seconds <= kEnergyStaleSec) value = prev.watts;
+                    else failed = true;
+                } else if (!cur.have_meter_time || (prev.point.have_meter_time && cur.meter_time > prev.point.meter_time)) {
+                    cur.aligned = true;
+                    if (!cur.have_meter_time || prev.point.aligned)
+                        value = static_cast<double>(cur.pwh - prev.point.pwh) * 3.6e-9 / seconds;
+                }
+            }
+        }
+        if (!std::isfinite(value) || value < 0 || value > 1.0e6) valid = false;
+        else total += value;
+        next.push_back({std::move(cur), value});
+    }
+    previous = std::move(next);
+    if (valid && total < 1.0e6) { watts = total; return MeterStatus::Valid; }
+    return failed ? MeterStatus::ReadFailed : MeterStatus::Warmup;
+}
 
 // Domain identity is kept with the raw baseline: reordering/renaming instances
 // must never subtract energy reported by a different meter.
@@ -378,6 +1037,75 @@ struct GpuBucket {
     std::wstring adapter, engine;
     double usage = 0;
 };
+
+std::uint64_t LuidValue(LUID luid) {
+    return (static_cast<std::uint64_t>(static_cast<unsigned long>(luid.HighPart)) << 32) | luid.LowPart;
+}
+std::uint64_t CounterLuid(const std::wstring& name) {
+    const auto start = name.find(L"luid_");
+    unsigned long high = 0, low = 0;
+    if (start == std::wstring::npos || std::swscanf(name.c_str() + start, L"luid_%lx_%lx", &high, &low) != 2) return 0;
+    return (static_cast<std::uint64_t>(high) << 32) | low;
+}
+
+std::vector<GpuAdapter> EnumeratePhysicalGpus() {
+    std::vector<GpuAdapter> result;
+    HMODULE module = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) return result;
+    using CreateFn = HRESULT(WINAPI*)(REFIID, void**);
+    auto create = reinterpret_cast<CreateFn>(GetProcAddress(module, "CreateDXGIFactory1"));
+    IDXGIFactory1* factory = nullptr;
+    if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+        PulseKmtApi kmt;
+        std::vector<PulseKmtAdapterInfo> handles;
+        PulseKmtEnumAdapters2 request{};
+        if (kmt.Load() && kmt.enumerate(&request) >= 0 && request.NumAdapters <= 64) {
+            handles.resize(request.NumAdapters);
+            request.pAdapters = handles.data();
+            if (!handles.empty() && (kmt.enumerate(&request) < 0 || request.NumAdapters > handles.size()))
+                PulseKmtCloseAdapters(kmt, handles);
+        }
+        for (UINT i = 0; i < 64; ++i) {
+            IDXGIAdapter1* adapter = nullptr;
+            if (FAILED(factory->EnumAdapters1(i, &adapter))) break;
+            DXGI_ADAPTER_DESC1 desc{};
+            const HRESULT rc = adapter->GetDesc1(&desc);
+            adapter->Release();
+            if (FAILED(rc) || (desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE | DXGI_ADAPTER_FLAG_REMOTE)) ||
+                (desc.VendorId != 0x1002 && desc.VendorId != 0x10de && desc.VendorId != 0x8086)) continue;
+            GpuAdapter gpu;
+            gpu.name = desc.Description;
+            gpu.vendor = desc.VendorId;
+            gpu.luid = LuidValue(desc.AdapterLuid);
+            unsigned function = ~0u;
+            for (const auto& h : handles) {
+                if (!h.hAdapter || LuidValue(h.AdapterLuid) != gpu.luid) continue;
+                PulseKmtAdapterAddress address{};
+                const PulseKmtQueryAdapterInfo query{h.hAdapter, 6, &address, sizeof(address)};
+                if (kmt.query(&query) >= 0 && address.bus <= 255 && address.device <= 31 && address.function <= 7) {
+                    gpu.bus = address.bus; gpu.device = address.device; function = address.function;
+                }
+            }
+            // Remote/indirect adapters can mirror a physical GPU description and
+            // vendor ID. A real PCI location is required for selection/power routing.
+            if (gpu.bus == ~0u) continue;
+            wchar_t id[128]{};
+            std::swprintf(id, 128, L"pci_%04x_%04x_%08x_%u_%u_%u", desc.VendorId, desc.DeviceId,
+                desc.SubSysId, gpu.bus, gpu.device, function);
+            gpu.id = id;
+            result.push_back(std::move(gpu));
+        }
+        PulseKmtCloseAdapters(kmt, handles);
+        factory->Release();
+    }
+    FreeLibrary(module);
+    // Ambiguous identities must never silently pick a different identical card.
+    const auto all = result;
+    result.erase(std::remove_if(result.begin(), result.end(), [&](const GpuAdapter& gpu) {
+        return std::count_if(all.begin(), all.end(), [&](const GpuAdapter& other) { return other.id == gpu.id; }) != 1;
+    }), result.end());
+    return result;
+}
 
 bool GpuIdentity(const wchar_t* name, std::wstring& adapter, std::wstring& engine) {
     if (!name) return false;
@@ -663,6 +1391,8 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.fps) bits |= kWantFps;
     if (w.power_scheme) bits |= kWantScheme;
     if (w.process_count) bits |= kWantCount;
+    if (w.gpu_temp) bits |= kWantGpuTemp;
+    if (w.dgpu_power) bits |= kWantDgpuPower;
     return bits;
 }
 
@@ -682,6 +1412,8 @@ constexpr Wants UnpackWants(unsigned bits) {
     w.fps = (bits & kWantFps) != 0;
     w.power_scheme = (bits & kWantScheme) != 0;
     w.process_count = (bits & kWantCount) != 0;
+    w.gpu_temp = (bits & kWantGpuTemp) != 0;
+    w.dgpu_power = (bits & kWantDgpuPower) != 0;
     return w;
 }
 
@@ -698,6 +1430,13 @@ constexpr Wants FpsWantOnly() {
 static_assert(PackWants(FpsWantOnly()) == kWantFps, "fps want bit");
 static_assert(UnpackWants(kWantFps).fps, "unpack fps");
 static_assert(!UnpackWants(kWantDefault).fps, "default fps off");
+static_assert(UnpackWants(kWantGpuTemp).gpu_temp, "unpack gpu temperature");
+static_assert(PackWants(UnpackWants(kWantGpuTemp)) == kWantGpuTemp, "gpu temperature want bit");
+static_assert(!UnpackWants(kWantDefault).gpu_temp, "default gpu temperature off");
+
+static_assert(UnpackWants(kWantDgpuPower).dgpu_power, "unpack dgpu power");
+static_assert(PackWants(UnpackWants(kWantDgpuPower)) == kWantDgpuPower, "dgpu power want bit");
+static_assert(!UnpackWants(kWantDefault).dgpu_power, "default dgpu power off");
 
 using WlanOpenHandleFn = DWORD(WINAPI*)(DWORD, PVOID, PDWORD, PHANDLE);
 using WlanCloseHandleFn = DWORD(WINAPI*)(HANDLE, PVOID);
@@ -1102,6 +1841,11 @@ struct Metrics::Impl {
     bool prev_valid_ = false;
     PowerMode prev_mode_ = PowerMode::Unknown;
     bool prev_ok_ = false;
+    bool prev_ac_known_ = false;
+    bool prev_ac_online_ = false;
+    bool prev_contested_ = false;
+    bool prev_pure_ = false;
+    AcDischargeDebounce ac_discharge_;
     bool have_ema_ = false;
     double ema_ = 0;
     unsigned long long unplug_tick_ = 0;
@@ -1114,7 +1858,14 @@ struct Metrics::Impl {
     bool scheme_ready_ = false;
     unsigned long long scheme_tick_ = 0;
     OverlayFn overlay_fn_ = nullptr;
-    bool overlay_tried_ = false;
+    ActiveSchemeFn active_fn_ = nullptr;
+    FriendlyNameFn friendly_fn_ = nullptr;
+    bool power_api_tried_ = false;
+    GUID active_guid_{};
+    bool have_active_guid_ = false;
+    bool active_valid_ = false;
+    std::wstring active_name_;
+    unsigned long long active_name_tick_ = 0;
 
     static void CALLBACK NicChanged(PVOID context, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
         auto* self = static_cast<Impl*>(context);
@@ -1169,6 +1920,7 @@ struct Metrics::Impl {
     double cpu_w_ = NAN;
     double gpu_w_ = NAN;
     double mem_w_ = NAN;
+    std::array<MeterStatus, 4> meter_status_{};
 
     bool gpu_ok_ = false;
     bool gpu_warmed_ = false;
@@ -1178,6 +1930,29 @@ struct Metrics::Impl {
     PDH_HCOUNTER gpu_counter_ = nullptr;
     double gpu_percent_ = NAN;
     std::vector<GpuBucket> gpu_buckets_;
+    std::vector<CoreEnergyPoint> core_energy_prev_;
+    int core_meter_count_ = 0;
+    double core_power_reference_ = NAN;
+    std::vector<GpuAdapter> adapters_;
+    std::wstring selected_gpu_;
+    std::uint64_t active_gpu_ = 0;
+    unsigned long long adapter_due_ = 0;
+    void RefreshAdapters(unsigned long long now) {
+        if (now < adapter_due_) return;
+        adapters_ = EnumeratePhysicalGpus();
+        adapter_due_ = now + 30000;
+    }
+    const GpuAdapter* ActiveGpu() const {
+        for (const auto& gpu : adapters_) if (gpu.luid == active_gpu_) return &gpu;
+        return nullptr;
+    }
+    void ChooseGpu(std::uint64_t luid) {
+        if (active_gpu_ == luid) return;
+        active_gpu_ = luid;
+        have_gpu_mem_due_ = have_gpu_temp_due_ = false;
+        gpu_shared_mb_ = gpu_dedicated_mb_ = gpu_temp_c_ = NAN;
+        dgpu_.history.Reset();
+    }
 
     std::atomic<unsigned> want_bits_{kWantDefault};
     bool procs_buffers_ = true;
@@ -1218,6 +1993,15 @@ struct Metrics::Impl {
     double gpu_shared_mb_ = NAN;
     double gpu_dedicated_mb_ = NAN;
 
+    DgpuPower dgpu_;
+
+    PulseKmtApi gpu_temp_api_;
+    std::vector<PulseKmtAdapterInfo> gpu_temp_adapters_;
+    bool gpu_temp_ready_ = false, have_gpu_temp_due_ = false;
+    bool gpu_temp_seen_ = false;
+    unsigned long long gpu_temp_due_ = 0, gpu_temp_retry_at_ = 0, gpu_temp_enum_at_ = 0;
+    double gpu_temp_c_ = NAN;
+
     HMODULE wifi_mod_ = nullptr;
     HANDLE wifi_client_ = nullptr;
     WlanOpenHandleFn wifi_open_ = nullptr;
@@ -1231,6 +2015,8 @@ struct Metrics::Impl {
     unsigned long long wifi_retry_at_ = 0;
     std::wstring wifi_ssid_;
     int wifi_signal_ = -1;
+    WifiStatus wifi_status_ = WifiStatus::Reading;
+    unsigned wifi_error_ = 0;
 
     bool have_battery_due_ = false;
     unsigned long long battery_due_ = 0;
@@ -1259,6 +2045,7 @@ private:
     void ReleaseCpuQuery();
     void ReleaseCpuFreq();
     void ReleaseGpuMem();
+    void ReleaseGpuTemp();
     void ReleaseWifi();
     void ReleaseSysDisk();
     void ReleaseBatteryHealth();
@@ -1271,6 +2058,8 @@ private:
     void UpdateMem(Snapshot& s, bool detail);
     void UpdateBattery(Snapshot& s, unsigned long long now, double dt, bool has_dt);
     void UpdateScheme(unsigned long long now);
+    void UpdateActivePlan(unsigned long long now);
+    void LoadPowerApi();
     void UpdateEnergy(bool full, unsigned long long now);
     void UpdateGpu(bool full, unsigned long long now);
     void UpdateProcs(Snapshot& s, unsigned long long now);
@@ -1279,6 +2068,7 @@ private:
     void UpdateCpuFreq(Snapshot& s);
     void UpdateUptime(Snapshot& s);
     void UpdateGpuMemory(unsigned long long now, Snapshot& s);
+    void UpdateGpuTemp(unsigned long long now, Snapshot& s);
     void UpdateWifi(unsigned long long now, Snapshot& s);
     void UpdateBatteryHealth(unsigned long long now, Snapshot& s);
     void UpdateFps(Snapshot& s, unsigned long long now);
@@ -1289,6 +2079,7 @@ private:
     bool EnsureCpuUtility(unsigned long long now);
     bool EnsureCpuFreq(unsigned long long now);
     bool EnsureGpuMem(unsigned long long now);
+    bool EnsureGpuTemp(unsigned long long now);
     bool EnsureWifi(unsigned long long now);
     bool ReadEnergy(bool full);
     bool ReadGpu(double& out);
@@ -1301,13 +2092,19 @@ private:
     OverlayFn Overlay();
 };
 
-OverlayFn Metrics::Impl::Overlay() {
-    if (overlay_tried_) return overlay_fn_;
-    overlay_tried_ = true;
+void Metrics::Impl::LoadPowerApi() {
+    if (power_api_tried_) return;
+    power_api_tried_ = true;
     HMODULE mod = GetModuleHandleW(L"powrprof.dll");
-    if (!mod) mod = LoadLibraryW(L"powrprof.dll");
-    if (!mod) return nullptr;
+    if (!mod) mod = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!mod) return;
     overlay_fn_ = reinterpret_cast<OverlayFn>(GetProcAddress(mod, "PowerGetEffectiveOverlayScheme"));
+    active_fn_ = reinterpret_cast<ActiveSchemeFn>(GetProcAddress(mod, "PowerGetActiveScheme"));
+    friendly_fn_ = reinterpret_cast<FriendlyNameFn>(GetProcAddress(mod, "PowerReadFriendlyName"));
+}
+
+OverlayFn Metrics::Impl::Overlay() {
+    LoadPowerApi();
     return overlay_fn_;
 }
 
@@ -1463,91 +2260,137 @@ void Metrics::Impl::UpdateBattery(Snapshot& s, unsigned long long now, double dt
     diagnostics::ScopedTiming timing(L"Battery");
     BatteryReading cur{};
     const bool read_ok = ReadBattery(cur);
-    if (read_ok) {
-        bat_ = cur;
-        have_bat_ = true;
+    // A failed read must not keep claiming the previous AC line or rate.
+    // The pure-battery session itself stays put so one miss does not reset it;
+    // prev_ok_ blocks that gap from entering the average. Wake has no dt.
+    if (!read_ok) {
+        ac_discharge_.Update(false, true, now);
+        have_ema_ = false;
+        ema_ = 0.0;
+        prev_ok_ = false;
+        s.mode = PowerMode::Unknown;
+        s.percent = -1;
+        s.power_trace = PowerTrace::Unknown;
+        s.battery_rate_mw = NAN;
+        return;
     }
-    if (!have_bat_) return;
+    bat_ = cur;
+    have_bat_ = true;
+    BatterySample sample;
+    sample.read_ok = true;
+    sample.present = cur.present;
+    sample.ac_known = cur.ac_known;
+    sample.ac_online = cur.ac;
+    sample.charging = cur.charging;
+    sample.discharging = cur.discharging;
+    sample.rate_known = cur.rate_known;
+    sample.rate_mw = cur.rate_mw;
+    BatteryClassification classified = ClassifyBattery(sample);
+    const bool raw_supplemental = classified.supplemental;
+    const bool hard_exit = !cur.present || !classified.ac_known || !classified.ac_online ||
+        cur.charging || (classified.rate_valid && classified.rate_mw > 0.0);
+    const bool supplemental = ac_discharge_.Update(raw_supplemental, hard_exit, now);
+    if (supplemental) {
+        classified.mode = PowerMode::Discharging;
+        classified.supplemental = true;
+        classified.pure_battery = false;
+        classified.show_watts = classified.rate_valid && classified.rate_mw < 0.0;
+        classified.eta_discharge = classified.eta_charge = false;
+        classified.trace = PowerTrace::Package;
+    } else if (raw_supplemental) {
+        // Keep pending AC discharge out of watts, ETA and unplug statistics.
+        classified.mode = PowerMode::AcIdle;
+        classified.supplemental = false;
+        classified.show_watts = false;
+        classified.trace = PowerTrace::Package;
+    }
+    const bool session_changed = !prev_valid_ || !prev_ok_ || prev_mode_ != classified.mode ||
+        prev_ac_known_ != classified.ac_known || prev_ac_online_ != classified.ac_online ||
+        prev_contested_ != classified.contested || prev_pure_ != classified.pure_battery;
+    const double magnitude = classified.show_watts ? std::fabs(classified.rate_mw) : 0.0;
 
-    const double rate = bat_.rate_mw;
-    const double p = rate < 0.0 ? -rate : rate;
-    PowerMode mode = PowerMode::AcIdle;
-    if (!bat_.present) mode = PowerMode::NoBattery;
-    else if (rate < 0.0 || (bat_.discharging && !bat_.ac)) mode = PowerMode::Discharging;
-    else if (bat_.charging && rate > 0.0) mode = PowerMode::Charging;
-
-    if ((mode == PowerMode::Discharging || mode == PowerMode::Charging) && p > 0.0) {
-        if (!prev_valid_ || prev_mode_ != mode || !have_ema_ || !has_dt || !(dt > 0.0)) {
-            ema_ = p;
-            have_ema_ = true;
-        } else {
-            const double alpha = 1.0 - std::exp(-dt / kTauSec);
-            ema_ += alpha * (p - ema_);
-        }
+    if (classified.show_watts && (session_changed || !have_ema_ || !has_dt || !(dt > 0.0))) {
+        ema_ = magnitude;
+        have_ema_ = true;
+    } else if (classified.show_watts) {
+        const double alpha = 1.0 - std::exp(-dt / kTauSec);
+        ema_ += alpha * (magnitude - ema_);
     } else {
         have_ema_ = false;
         ema_ = 0.0;
     }
 
-    if (mode == PowerMode::Discharging) {
-        if (!prev_valid_ || prev_mode_ != PowerMode::Discharging) {
+    if (classified.pure_battery) {
+        if (!prev_pure_) {
             unplug_tick_ = now;
             since_start_ = !prev_valid_;
             energy_wh_ = 0.0;
             measured_s_ = 0.0;
-        } else if (has_dt && dt > 0.0 && dt <= kMaxGapSec && p > 0.0 && read_ok && prev_ok_) {
-            energy_wh_ += (p / 1000.0) * dt / 3600.0;
+        } else if (prev_ok_ && has_dt && dt > 0.0 && dt <= kMaxGapSec && classified.show_watts) {
+            energy_wh_ += (magnitude / 1000.0) * dt / 3600.0;
             measured_s_ += dt;
         }
     } else {
         unplug_tick_ = 0;
     }
-    prev_mode_ = mode;
-    prev_ok_ = read_ok;
-    prev_valid_ = true;
 
     double eta = NAN;
     double eta20 = NAN;
     double pph = NAN;
     bool from_system = false;
-    if (have_ema_ && ema_ > 0.0) {
-        if (mode == PowerMode::Discharging) {
-            eta = bat_.remaining_mwh / ema_ * 3600.0;
-            if (bat_.full_mwh > 0.0) {
-                pph = ema_ / bat_.full_mwh * 100.0;
-                if (bat_.percent > 20) {
-                    const double remain = (bat_.remaining_mwh - 0.2 * bat_.full_mwh) / ema_ * 3600.0;
+    if (have_ema_ && ema_ > 0.0 && cur.present) {
+        if (classified.eta_discharge) {
+            eta = cur.remaining_mwh / ema_ * 3600.0;
+            if (cur.full_mwh > 0.0) {
+                pph = ema_ / cur.full_mwh * 100.0;
+                if (cur.percent > 20) {
+                    const double remain = (cur.remaining_mwh - 0.2 * cur.full_mwh) / ema_ * 3600.0;
                     if (remain >= 0.0) eta20 = remain;
                 }
             }
-        } else if (mode == PowerMode::Charging && bat_.full_mwh > bat_.remaining_mwh) {
-            eta = (bat_.full_mwh - bat_.remaining_mwh) / ema_ * 3600.0;
-            if (bat_.full_mwh > 0.0) pph = ema_ / bat_.full_mwh * 100.0;
+        } else if (classified.eta_charge && cur.full_mwh > cur.remaining_mwh) {
+            eta = (cur.full_mwh - cur.remaining_mwh) / ema_ * 3600.0;
+            if (cur.full_mwh > 0.0) pph = ema_ / cur.full_mwh * 100.0;
         }
     }
-    if (mode == PowerMode::Discharging && !(eta >= 0.0) && bat_.life_s >= 0.0) {
-        eta = bat_.life_s;
+    if (UseSystemBatteryEta(classified, eta, cur.life_s)) {
+        eta = cur.life_s;
         from_system = true;
     }
-    if (mode == PowerMode::Discharging && bat_.percent >= 0 && bat_.percent <= 20) eta20 = 0.0;
+    if (classified.pure_battery && cur.percent >= 0 && cur.percent <= 20) eta20 = 0.0;
 
-    s.mode = mode;
-    s.percent = bat_.percent;
-    if ((mode == PowerMode::Discharging || mode == PowerMode::Charging) && p > 0.0) s.power_w = p / 1000.0;
+    s.mode = classified.mode;
+    s.percent = cur.percent;
+    s.power_w = classified.show_watts ? magnitude / 1000.0 : NAN;
     s.eta_s = eta;
     s.eta_from_system = from_system;
     s.eta20_s = eta20;
     s.pct_per_hour = pph;
-    s.battery_saver = bat_.saver;
-    if (bat_.present) s.remaining_wh = bat_.remaining_mwh / 1000.0;
-    if (bat_.present && bat_.full_mwh > 0.0) s.full_wh = bat_.full_mwh / 1000.0;
-    if (unplug_tick_ != 0) {
+    s.battery_saver = cur.saver;
+    if (cur.present) s.remaining_wh = cur.remaining_mwh / 1000.0;
+    if (cur.present && cur.full_mwh > 0.0) s.full_wh = cur.full_mwh / 1000.0;
+    if (classified.pure_battery && unplug_tick_ != 0) {
         s.on_battery_s = static_cast<double>(now - unplug_tick_) / 1000.0;
         s.on_battery_since_start = since_start_;
         if (s.on_battery_s > 0.0 && measured_s_ > kAvgMinSec) {
             s.avg_w = energy_wh_ / (measured_s_ / 3600.0);
         }
     }
+    s.ac_known = classified.ac_known;
+    s.ac_online = classified.ac_online;
+    s.battery_rate_valid = classified.rate_valid;
+    s.battery_rate_mw = classified.rate_mw;
+    s.battery_supplemental = classified.supplemental;
+    s.power_contested = classified.contested;
+    s.power_trace = classified.trace;
+
+    prev_mode_ = classified.mode;
+    prev_ac_known_ = classified.ac_known;
+    prev_ac_online_ = classified.ac_online;
+    prev_contested_ = classified.contested;
+    prev_pure_ = classified.pure_battery;
+    prev_ok_ = true;
+    prev_valid_ = true;
 }
 
 void Metrics::Impl::UpdateScheme(unsigned long long now) {
@@ -1557,9 +2400,43 @@ void Metrics::Impl::UpdateScheme(unsigned long long now) {
     scheme_tick_ = now;
     OverlayFn fn = Overlay();
     GUID guid{};
-    if (!fn || fn(&guid) != 0) return;
+    if (!fn || fn(&guid) != 0) {
+        scheme_kind_ = PowerSchemeKind::Unknown;
+        scheme_.clear();
+        return;
+    }
     scheme_kind_ = SchemeKind(guid);
     scheme_ = SchemeName(scheme_kind_);
+}
+
+void Metrics::Impl::UpdateActivePlan(unsigned long long now) {
+    diagnostics::ScopedTiming timing(L"Active power plan");
+    LoadPowerApi();
+    GUID* heap = nullptr;
+    if (!active_fn_ || active_fn_(nullptr, &heap) != ERROR_SUCCESS || !heap) {
+        if (heap) LocalFree(heap);
+        active_valid_ = false;
+        active_name_.clear();
+        have_active_guid_ = false;
+        return;
+    }
+    const GUID guid = *heap;
+    LocalFree(heap);
+    const bool changed = !have_active_guid_ || !SameGuid(guid, active_guid_);
+    active_guid_ = guid;
+    have_active_guid_ = true;
+    // The GUID is checked every full sample. The friendly name follows a rename
+    // on the same GUID at the existing five-second cadence.
+    if (!changed && active_valid_ && now - active_name_tick_ < kSchemeEveryMs) return;
+    active_name_tick_ = now;
+    std::wstring name;
+    if (!ReadPlanName(friendly_fn_, guid, name)) {
+        active_valid_ = false;
+        active_name_.clear();
+        return;
+    }
+    active_valid_ = true;
+    active_name_ = std::move(name);
 }
 
 bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
@@ -1571,6 +2448,7 @@ bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
     energy_counter_ = power_counter_ = energy_time_counter_ = nullptr;
     if (PdhOpenQueryW(nullptr, 0, &energy_query_) != ERROR_SUCCESS) {
         energy_query_ = nullptr;
+        meter_status_.fill(MeterStatus::CounterUnavailable);
         return false;
     }
     // Preserve compact mode's single Power counter and its existing cadence.
@@ -1587,6 +2465,7 @@ bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
     if (!energy_counter_ && !power_counter_) {
         PdhCloseQuery(energy_query_);
         energy_query_ = nullptr;
+        meter_status_.fill(MeterStatus::CounterUnavailable);
         return false;
     }
     energy_ok_ = true;
@@ -1594,6 +2473,8 @@ bool Metrics::Impl::EnsureEnergy(bool full, unsigned long long now) {
 }
 
 bool Metrics::Impl::ReadEnergy(bool full) {
+    core_meter_count_ = 0;
+    core_power_reference_ = NAN;
     const std::array<double, 4> cached{{pkg_w_, cpu_w_, gpu_w_, mem_w_}};
     const bool cached_source = pkg_from_energy_;
     const double cached_delta = pkg_delta_pwh_, cached_seconds = pkg_interval_s_;
@@ -1602,22 +2483,34 @@ bool Metrics::Impl::ReadEnergy(bool full) {
     pkg_power_counter_w_ = NAN;
     if (PdhCollectQueryData(energy_query_) != ERROR_SUCCESS) {
         energy_prev_ = {};
+        core_energy_prev_.clear();
+        meter_status_.fill(MeterStatus::ReadFailed);
         return false;
     }
     const std::int64_t qpc = QpcNow();
     std::array<EnergyPoint, 4> current{};
+    std::vector<EnergyPoint> core_current;
+    bool core_failed = false;
     std::array<int, 4> best{};
     std::array<double, 4> watts{{NAN, NAN, NAN, NAN}};
+    std::array<bool, 4> energy_named{}, power_named{};
     DWORD count = 0;
-    if (full && RawArray(energy_counter_, pdh_buf_, count)) {
+    const bool energy_array_ok = full && RawArray(energy_counter_, pdh_buf_, count);
+    if (energy_array_ok) {
         const auto* items = reinterpret_cast<const PDH_RAW_COUNTER_ITEM_W*>(pdh_buf_.data());
         count = std::min(count, static_cast<DWORD>(pdh_buf_.size() / sizeof(PDH_RAW_COUNTER_ITEM_W)));
         for (DWORD i = 0; i < count; ++i) {
             const auto& item = items[i];
-            if (!item.szName || (item.RawValue.CStatus != PDH_CSTATUS_VALID_DATA &&
-                                item.RawValue.CStatus != PDH_CSTATUS_NEW_DATA)) continue;
+            if (!item.szName) continue;
+            if (IsCoreMeter(item.szName)) {
+                if (MeterDataValid(item.RawValue.CStatus))
+                    core_current.push_back({item.szName, static_cast<uint64_t>(item.RawValue.FirstValue), qpc});
+                else core_failed = true;
+            }
             for (std::size_t d = 0; d < current.size(); ++d) {
                 const int score = EnergyScore(item.szName, d);
+                if (score > 0) energy_named[d] = true;
+                if (!MeterDataValid(item.RawValue.CStatus)) continue;
                 if (score <= best[d]) continue;
                 best[d] = score;
                 current[d] = {item.szName, static_cast<uint64_t>(item.RawValue.FirstValue), qpc};
@@ -1637,6 +2530,11 @@ bool Metrics::Impl::ReadEnergy(bool full) {
                                 item.RawValue.CStatus != PDH_CSTATUS_NEW_DATA)) continue;
             for (auto& cur : current) {
                 if (!cur.qpc || cur.name != item.szName) continue;
+                cur.meter_time = static_cast<uint64_t>(item.RawValue.FirstValue);
+                cur.have_meter_time = true;
+            }
+            for (auto& cur : core_current) {
+                if (cur.name != item.szName) continue;
                 cur.meter_time = static_cast<uint64_t>(item.RawValue.FirstValue);
                 cur.have_meter_time = true;
             }
@@ -1687,19 +2585,26 @@ bool Metrics::Impl::ReadEnergy(bool full) {
     energy_prev_ = std::move(current);
     // Full mode also exposes a same-collection Power reference for unit checks.
     // Compact mode keeps its existing single formatted Power-array read.
-    if (FormatArray(power_counter_, pdh_buf_, count)) {
+    std::array<int, 4> power_best{};
+    double core_power_sum = 0;
+    int core_power_count = 0;
+    const bool power_format_ok = FormatArray(power_counter_, pdh_buf_, count);
+    if (power_format_ok) {
         const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(pdh_buf_.data());
         count = std::min(count, static_cast<DWORD>(pdh_buf_.size() / sizeof(PDH_FMT_COUNTERVALUE_ITEM_W)));
-        std::array<int, 4> power_best{};
         std::array<double, 4> power_watts{{NAN, NAN, NAN, NAN}};
         for (DWORD i = 0; i < count; ++i) {
             const auto& item = items[i];
             const double value = item.FmtValue.doubleValue;
-            if (!item.szName || (item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA &&
-                                item.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA) ||
-                !std::isfinite(value) || value < 0 || value > 1.0e9) continue;
+            if (!item.szName) continue;
+            if (IsCoreMeter(item.szName) && MeterDataValid(item.FmtValue.CStatus) && MeterPowerValid(value)) {
+                core_power_sum += value / 1000.0;
+                ++core_power_count;
+            }
             for (std::size_t d = 0; d < watts.size(); ++d) {
                 const int score = EnergyScore(item.szName, d);
+                if (score > 0) power_named[d] = true;
+                if (!MeterDataValid(item.FmtValue.CStatus) || !MeterPowerValid(value)) continue;
                 if (score <= power_best[d]) continue;
                 power_best[d] = score;
                 power_watts[d] = value / 1000.0; // Power is mW.
@@ -1711,6 +2616,22 @@ bool Metrics::Impl::ReadEnergy(bool full) {
             if (use_power[d]) watts[d] = power_watts[d];
         }
     }
+    for (std::size_t d = 0; d < watts.size(); ++d) {
+        meter_status_[d] = ResolveMeterStatus(
+            {full && energy_counter_ != nullptr, energy_array_ok, energy_named[d]},
+            {power_counter_ != nullptr, power_format_ok, power_named[d]}, watts[d],
+            full && best[d] > 0 && !use_power[d]);
+        if (meter_status_[d] == MeterStatus::Valid) have_meter = true;
+    }
+    if (full && !energy_named[1] && !power_named[1] && (!core_current.empty() || core_failed)) {
+        core_meter_count_ = static_cast<int>(core_current.size());
+        if (core_power_count == core_meter_count_) core_power_reference_ = core_power_sum;
+        if (core_failed) { core_energy_prev_.clear(); meter_status_[1] = MeterStatus::ReadFailed; }
+        else meter_status_[1] = SumCoreEnergy(std::move(core_current), core_energy_prev_, watts[1]);
+        if (meter_status_[1] == MeterStatus::Valid && meter_status_[0] == MeterStatus::Valid &&
+            !CorePowerConsistent(watts[1], watts[0])) meter_status_[1] = MeterStatus::Inconsistent;
+        have_meter = true;
+    } else core_energy_prev_.clear();
     pkg_w_ = watts[0]; cpu_w_ = watts[1]; gpu_w_ = watts[2]; mem_w_ = watts[3];
     return have_meter;
 }
@@ -1768,6 +2689,10 @@ bool Metrics::Impl::ReadGpu(double& out) {
         if (item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA && item.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA) continue;
         const double value = item.FmtValue.doubleValue;
         if (!std::isfinite(value) || value < 0 || !GpuIdentity(item.szName, adapter, engine)) continue;
+        const auto luid = CounterLuid(adapter);
+        const auto physical = std::find_if(adapters_.begin(), adapters_.end(),
+            [&](const GpuAdapter& gpu) { return gpu.luid == luid; });
+        if (physical == adapters_.end() || (!selected_gpu_.empty() && physical->id != selected_gpu_)) continue;
         auto bucket = std::find_if(gpu_buckets_.begin(), gpu_buckets_.end(), [&](const GpuBucket& b) {
             return b.adapter == adapter && b.engine == engine;
         });
@@ -1775,8 +2700,15 @@ bool Metrics::Impl::ReadGpu(double& out) {
         else bucket->usage += value;
     }
     if (gpu_buckets_.empty()) return false;
-    double busiest = 0;
-    for (const auto& bucket : gpu_buckets_) busiest = std::max(busiest, bucket.usage);
+    double busiest = -1;
+    std::uint64_t busiest_luid = active_gpu_;
+    for (const auto& bucket : gpu_buckets_) {
+        if (bucket.usage > busiest || (bucket.usage == busiest && CounterLuid(bucket.adapter) == active_gpu_)) {
+            busiest = bucket.usage;
+            busiest_luid = CounterLuid(bucket.adapter);
+        }
+    }
+    ChooseGpu(busiest_luid);
     // Max across engine types AND adapters: independent GPUs/types cannot add
     // together. Instances of the same type on the same LUID have already summed.
     out = std::clamp(busiest, 0.0, 100.0);
@@ -1811,6 +2743,8 @@ void Metrics::Impl::CloseQueries() {
     ReleaseDisk();
     ReleaseCpuQuery();
     ReleaseGpuMem();
+    ReleaseGpuTemp();
+    dgpu_.Reset();
     ReleaseWifi();
     ReleaseProcs();
     ReleaseSysDisk();
@@ -1830,6 +2764,7 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
         s.pkg_power_from_energy = false;
         s.pkg_energy_delta_pwh = s.pkg_energy_interval_s = NAN;
         s.pkg_power_counter_w = NAN;
+        s.pkg_meter = s.cpu_meter = s.gpu_meter = s.mem_meter = MeterStatus::Off;
     }
     if (!w.gpu_usage) s.gpu_percent = NAN;
     if (!w.processes) {
@@ -1837,7 +2772,13 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
         s.self_cpu_percent = NAN;
     }
     if (!w.processes && !w.process_count) s.process_count = -1;
-    if (!w.power_scheme) { s.power_scheme.clear(); s.power_scheme_kind = PowerSchemeKind::Unknown; }
+    if (!w.power_scheme) {
+        s.power_scheme.clear();
+        s.power_scheme_kind = PowerSchemeKind::Unknown;
+        s.active_plan_valid = false;
+        s.active_plan_name.clear();
+        s.active_plan_balanced = false;
+    }
     if (!w.memory_detail) {
         s.mem_used_gb = NAN;
         s.mem_total_gb = NAN;
@@ -1852,6 +2793,12 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
     }
     if (!w.cpu_freq) s.cpu_mhz = NAN;
     if (!w.uptime) s.uptime_s = NAN;
+    if (!w.gpu_temp) s.gpu_temp_c = NAN;
+    if (!w.dgpu_power) {
+        s.dgpu_status = DgpuStatus::Off;
+        s.dgpu_w = NAN;
+        dgpu_.Reset();
+    }
     if (!w.gpu_memory) {
         s.gpu_shared_mem_mb = NAN;
         s.gpu_dedicated_mem_mb = NAN;
@@ -1873,6 +2820,8 @@ void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
 }
 
 void Metrics::Impl::ReleaseEnergy() {
+    core_energy_prev_.clear();
+    meter_status_.fill(MeterStatus::Off);
     if (!energy_query_ && !energy_ok_ && !have_energy_due_ && !energy_retry_at_ &&
         std::isnan(pkg_w_) && std::isnan(cpu_w_) && std::isnan(gpu_w_) && std::isnan(mem_w_)) return;
     if (energy_query_) PdhCloseQuery(energy_query_);
@@ -1968,6 +2917,17 @@ void Metrics::Impl::ReleaseGpuMem() {
     gpu_mem_retry_at_ = 0;
     gpu_shared_mb_ = NAN;
     gpu_dedicated_mb_ = NAN;
+}
+
+void Metrics::Impl::ReleaseGpuTemp() {
+    if (!gpu_temp_api_.module && !gpu_temp_ready_ && !have_gpu_temp_due_ &&
+        gpu_temp_adapters_.empty() && gpu_temp_retry_at_ == 0) return;
+    PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+    std::vector<PulseKmtAdapterInfo>().swap(gpu_temp_adapters_);
+    gpu_temp_api_.Reset();
+    gpu_temp_ready_ = have_gpu_temp_due_ = gpu_temp_seen_ = false;
+    gpu_temp_due_ = gpu_temp_retry_at_ = gpu_temp_enum_at_ = 0;
+    gpu_temp_c_ = NAN;
 }
 
 void Metrics::Impl::ReleaseWifi() {
@@ -2077,13 +3037,55 @@ bool Metrics::Impl::EnsureGpuMem(unsigned long long now) {
     return gpu_mem_ok_;
 }
 
+bool Metrics::Impl::EnsureGpuTemp(unsigned long long now) {
+    if (gpu_temp_ready_) return true;
+    if (now < gpu_temp_retry_at_) return false;
+    diagnostics::ScopedTiming timing(L"D3DKMT GPU adapters");
+    gpu_temp_retry_at_ = now + kGpuTempRetryMs;
+    if (!gpu_temp_api_.Load()) return false;
+    PulseKmtEnumAdapters2 request{};
+    // The first call returns the supported capacity without opening handles.
+    if (gpu_temp_api_.enumerate(&request) < 0 || request.NumAdapters > 4096) return false;
+    gpu_temp_adapters_.assign(request.NumAdapters, PulseKmtAdapterInfo{});
+    if (request.NumAdapters != 0) {
+        request.pAdapters = gpu_temp_adapters_.data();
+        const LONG status = gpu_temp_api_.enumerate(&request);
+        // NumAdapters is undefined on failure: inspect only our zero-initialized
+        // allocation when closing any partially returned handles.
+        if (status < 0 || request.NumAdapters > gpu_temp_adapters_.size()) {
+            PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+            return false;
+        }
+        for (auto& adapter : gpu_temp_adapters_) {
+            if (!adapter.hAdapter) continue;
+            PulseKmtAdapterType type{};
+            const PulseKmtQueryAdapterInfo query{adapter.hAdapter, kPulseKmtAdapterType,
+                &type, static_cast<UINT>(sizeof(type))};
+            if (gpu_temp_api_.query(&query) < 0) {
+                PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+                return false;
+            }
+            if ((type.Value & kPulseKmtSoftwareDevice) || !(type.Value & kPulseKmtRenderSupported)) {
+                const PulseKmtCloseAdapter close{adapter.hAdapter};
+                gpu_temp_api_.close(&close);
+                adapter.hAdapter = 0;
+            }
+        }
+        gpu_temp_adapters_.erase(std::remove_if(gpu_temp_adapters_.begin(), gpu_temp_adapters_.end(),
+            [](const PulseKmtAdapterInfo& adapter) { return adapter.hAdapter == 0; }), gpu_temp_adapters_.end());
+    }
+    gpu_temp_ready_ = true;
+    gpu_temp_enum_at_ = now;
+    return true;
+}
+
 bool Metrics::Impl::EnsureWifi(unsigned long long now) {
     if (wifi_client_) return true;
     if (wifi_tried_ && now < wifi_retry_at_) return false;
     wifi_tried_ = true;
     wifi_retry_at_ = now + kPdhRetryMs;
     if (!wifi_mod_) {
-        wifi_mod_ = LoadLibraryW(L"wlanapi.dll");
+        wifi_mod_ = LoadLibraryExW(L"wlanapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!wifi_mod_) return false;
         wifi_open_ = reinterpret_cast<WlanOpenHandleFn>(GetProcAddress(wifi_mod_, "WlanOpenHandle"));
         wifi_close_ = reinterpret_cast<WlanCloseHandleFn>(GetProcAddress(wifi_mod_, "WlanCloseHandle"));
@@ -2206,6 +3208,7 @@ bool Metrics::Impl::ReadGpuMemory(double& shared_mb, double& dedicated_mb) {
     bool any_shared = false;
     double dedicated_max = 0.0;
     for (const Row& row : rows) {
+        if (row.luid != active_gpu_) continue;
         if (row.shared >= 0.0) {
             any_shared = true;
             shared_sum += row.shared;
@@ -2215,14 +3218,26 @@ bool Metrics::Impl::ReadGpuMemory(double& shared_mb, double& dedicated_mb) {
         }
     }
     shared_mb = any_shared ? shared_sum / kMiB : NAN;
-    dedicated_mb = (rows.size() >= 2 && dedicated_max > 0.0) ? dedicated_max / kMiB : NAN;
+    const bool any_dedicated = std::any_of(rows.begin(), rows.end(), [&](const Row& r) {
+        return r.luid == active_gpu_ && r.dedicated >= 0;
+    });
+    dedicated_mb = any_dedicated ? dedicated_max / kMiB : NAN;
     return true;
 }
 
 bool Metrics::Impl::ReadWifi(std::wstring& ssid, int& signal) {
+    wifi_status_ = WifiStatus::Unavailable;
+    wifi_error_ = 0;
     if (!wifi_client_ || !wifi_enum_ || !wifi_query_ || !wifi_free_) return false;
     PWLAN_INTERFACE_INFO_LIST list = nullptr;
-    if (wifi_enum_(wifi_client_, nullptr, &list) != ERROR_SUCCESS || !list) return false;
+    const DWORD enum_rc = wifi_enum_(wifi_client_, nullptr, &list);
+    if (enum_rc != ERROR_SUCCESS || !list) {
+        if (list) wifi_free_(list);
+        wifi_error_ = enum_rc;
+        wifi_status_ = enum_rc == ERROR_ACCESS_DENIED ? WifiStatus::PermissionRequired : WifiStatus::Error;
+        return false;
+    }
+    wifi_status_ = list->dwNumberOfItems ? WifiStatus::Disconnected : WifiStatus::Unavailable;
     bool connected = false;
     bool query_failed = false;
     std::wstring found;
@@ -2235,9 +3250,11 @@ bool Metrics::Impl::ReadWifi(std::wstring& ssid, int& signal) {
         WLAN_OPCODE_VALUE_TYPE kind{};
         const DWORD rc = wifi_query_(wifi_client_, &info.InterfaceGuid, wlan_intf_opcode_current_connection, nullptr,
                                       &size, &data, &kind);
-        if (rc != ERROR_SUCCESS || !data) {
+        if (rc != ERROR_SUCCESS || !data || size < sizeof(WLAN_CONNECTION_ATTRIBUTES)) {
             if (data) wifi_free_(data);
             query_failed = true;
+            if (wifi_error_ != ERROR_ACCESS_DENIED) wifi_error_ = rc == ERROR_SUCCESS ? ERROR_INVALID_DATA : rc;
+            wifi_status_ = wifi_error_ == ERROR_ACCESS_DENIED ? WifiStatus::PermissionRequired : WifiStatus::Error;
             continue;
         }
         const auto* attr = static_cast<const WLAN_CONNECTION_ATTRIBUTES*>(data);
@@ -2260,6 +3277,8 @@ bool Metrics::Impl::ReadWifi(std::wstring& ssid, int& signal) {
     }
     ssid = std::move(found);
     signal = quality;
+    wifi_status_ = WifiStatus::Connected;
+    wifi_error_ = 0;
     return true;
 }
 
@@ -2381,7 +3400,55 @@ void Metrics::Impl::UpdateGpuMemory(unsigned long long now, Snapshot& s) {
     s.gpu_dedicated_mem_mb = gpu_dedicated_mb_;
 }
 
+void Metrics::Impl::UpdateGpuTemp(unsigned long long now, Snapshot& s) {
+    if ((have_gpu_temp_due_ && now < gpu_temp_due_) ||
+        (!gpu_temp_ready_ && now < gpu_temp_retry_at_)) {
+        s.gpu_temp_c = gpu_temp_c_;
+        return;
+    }
+    gpu_temp_due_ = NextDue(have_gpu_temp_due_, gpu_temp_due_, now, kGpuTempEveryMs);
+    have_gpu_temp_due_ = true;
+    // An unsupported/sleeping GPU may become available later. Keep handles for
+    // two-second samples; only rediscover once a minute until any value is valid.
+    if (gpu_temp_ready_ && !gpu_temp_seen_ && now - gpu_temp_enum_at_ >= kGpuTempRediscoverMs) {
+        PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+        gpu_temp_ready_ = false;
+    }
+    gpu_temp_c_ = NAN;
+    if (EnsureGpuTemp(now)) {
+        diagnostics::ScopedTiming timing(L"D3DKMT GPU temperature");
+        ULONG hottest = 0;
+        bool failed = false;
+        for (const auto& adapter : gpu_temp_adapters_) {
+            if (LuidValue(adapter.AdapterLuid) != active_gpu_) continue;
+            PulseKmtAdapterPerfData data{};
+            data.PhysicalAdapterIndex = 0;
+            const PulseKmtQueryAdapterInfo query{adapter.hAdapter, kPulseKmtAdapterPerfData,
+                &data, static_cast<UINT>(sizeof(data))};
+            if (gpu_temp_api_.query(&query) < 0) {
+                failed = true;
+                break;
+            }
+            if (data.Temperature > 0 && data.Temperature < 1500)
+                hottest = std::max(hottest, data.Temperature);
+        }
+        if (failed) {
+            // Driver resets/hotplug invalidate the whole enumeration. Discard
+            // this round, even if another adapter already returned a value.
+            PulseKmtCloseAdapters(gpu_temp_api_, gpu_temp_adapters_);
+            gpu_temp_ready_ = false;
+            gpu_temp_retry_at_ = GetTickCount64() + kGpuTempRetryMs;
+        } else if (hottest != 0) {
+            gpu_temp_c_ = hottest / 10.0;
+            gpu_temp_seen_ = true;
+        }
+    }
+    s.gpu_temp_c = gpu_temp_c_;
+}
+
 void Metrics::Impl::UpdateWifi(unsigned long long now, Snapshot& s) {
+    s.wifi_status = wifi_status_;
+    s.wifi_error = wifi_error_;
     if (have_wifi_due_ && now < wifi_due_) {
         s.wifi_ssid = wifi_ssid_;
         s.wifi_signal = wifi_signal_;
@@ -2398,16 +3465,22 @@ void Metrics::Impl::UpdateWifi(unsigned long long now, Snapshot& s) {
     if (!EnsureWifi(now)) {
         wifi_ssid_.clear();
         wifi_signal_ = -1;
+        wifi_status_ = WifiStatus::Unavailable;
     } else {
         std::wstring ssid;
         int signal = -1;
         if (ReadWifi(ssid, signal)) {
             wifi_ssid_ = std::move(ssid);
             wifi_signal_ = signal;
+        } else {
+            wifi_ssid_.clear();
+            wifi_signal_ = -1;
         }
     }
     s.wifi_ssid = wifi_ssid_;
     s.wifi_signal = wifi_signal_;
+    s.wifi_status = wifi_status_;
+    s.wifi_error = wifi_error_;
 }
 
 void Metrics::Impl::UpdateBatteryHealth(unsigned long long now, Snapshot& s) {
@@ -2549,13 +3622,17 @@ void Metrics::Impl::UpdateProcs(Snapshot& s, unsigned long long now) {
 
 Snapshot Metrics::Impl::Take(bool full) {
     Wants wants = CurrentWants();
-    if (!full) { wants.processes = false; wants.power_scheme = false; }
+    if (!full) { wants.processes = false; wants.power_scheme = false; wants.dgpu_power = false; }
+    if (wants.gpu_memory || wants.gpu_temp || wants.dgpu_power) wants.gpu_usage = true;
     if (!wants.chip_power) ReleaseEnergy();
     if (!wants.gpu_usage) ReleaseGpu();
     if (!wants.processes) ReleaseProcs();
     if (!wants.disk_io) ReleaseDisk();
     if (!wants.cpu_freq) ReleaseCpuFreq();
     if (!wants.gpu_memory) ReleaseGpuMem();
+    if (!wants.gpu_temp) ReleaseGpuTemp();
+    if (!wants.dgpu_power && (dgpu_.gate.api.module || dgpu_.gate.retry_at || dgpu_.last_gate != DgpuStatus::Off ||
+        dgpu_.logged_status != DgpuStatus::Off)) dgpu_.Reset();
     if (!wants.wifi) ReleaseWifi();
     if (!wants.sys_disk) ReleaseSysDisk();
     if (!wants.battery_health) ReleaseBatteryHealth();
@@ -2580,6 +3657,9 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (paused_.load(std::memory_order_relaxed)) {
         // A hidden widget must not keep a system-wide Present consumer.
         ReleaseFps(L"paused");
+        dgpu_.Reset();
+        last_.dgpu_status = DgpuStatus::Off;
+        last_.dgpu_w = NAN;
         ClearTurnedOff(last_, wants);
         last_.fps = NAN;
         last_.fps_status = 0;
@@ -2606,25 +3686,47 @@ Snapshot Metrics::Impl::Take(bool full) {
     have_tick_ = true;
 
     Snapshot s;
+    if (wants.gpu_usage || wants.gpu_memory || wants.gpu_temp || wants.dgpu_power) {
+        RefreshAdapters(now);
+        if (!selected_gpu_.empty()) {
+            auto gpu = std::find_if(adapters_.begin(), adapters_.end(), [&](const GpuAdapter& a) { return a.id == selected_gpu_; });
+            ChooseGpu(gpu == adapters_.end() ? 0 : gpu->luid);
+        } else if (!ActiveGpu()) ChooseGpu(adapters_.empty() ? 0 : adapters_.front().luid);
+    }
     UpdateNet(s, now);
     UpdateCpu(s, now, wants.cpu_freq);
     UpdateMem(s, wants.memory_detail);
     UpdateBattery(s, now, dt, has_dt);
     if (wants.power_scheme) {
         UpdateScheme(now);
+        UpdateActivePlan(now);
         s.power_scheme = scheme_;
         s.power_scheme_kind = scheme_kind_;
-    } else scheme_ready_ = false;
+        s.active_plan_valid = active_valid_;
+        s.active_plan_name = active_name_;
+        const GUID balanced = MakeGuid(0x381b4222, 0xf694, 0x41f0,
+            0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e);
+        s.active_plan_balanced = active_valid_ && have_active_guid_ && SameGuid(active_guid_, balanced);
+    } else {
+        scheme_ready_ = false;
+        active_name_tick_ = 0;
+    }
     if (wants.chip_power) {
         UpdateEnergy(full, now);
         s.pkg_w = pkg_w_;
         s.cpu_w = cpu_w_;
+        s.cpu_core_meter_count = core_meter_count_;
+        s.cpu_core_power_counter_w = core_power_reference_;
         s.gpu_w = gpu_w_;
         s.mem_w = mem_w_;
         s.pkg_power_from_energy = pkg_from_energy_;
         s.pkg_energy_delta_pwh = pkg_delta_pwh_;
         s.pkg_energy_interval_s = pkg_interval_s_;
         s.pkg_power_counter_w = pkg_power_counter_w_;
+        s.pkg_meter = meter_status_[0];
+        s.cpu_meter = meter_status_[1];
+        s.gpu_meter = meter_status_[2];
+        s.mem_meter = meter_status_[3];
     }
     if (wants.gpu_usage) {
         UpdateGpu(full, now);
@@ -2644,6 +3746,14 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (wants.sys_disk) UpdateSysDisk(now, s);
     if (wants.uptime) UpdateUptime(s);
     if (wants.gpu_memory) UpdateGpuMemory(now, s);
+    if (wants.gpu_temp) UpdateGpuTemp(now, s);
+    const auto* active = ActiveGpu();
+    if (active) { s.gpu_name = active->name; s.gpu_vendor = active->vendor; }
+    if (full && wants.dgpu_power && active && active->vendor == 0x10de && active->bus != ~0u) {
+        const auto result = dgpu_.Read(now, active->bus, active->device);
+        s.dgpu_status = result.status;
+        s.dgpu_w = result.watts;
+    }
     if (wants.wifi) UpdateWifi(now, s);
     if (wants.battery_health) UpdateBatteryHealth(now, s);
     if (wants.fps) UpdateFps(s, now);
@@ -2672,6 +3782,47 @@ void Metrics::Start(const Settings& s, EventCallback cb, void* user) { impl_->pr
 Snapshot Metrics::Sample(bool full) { return impl_->Take(full); }
 
 void Metrics::SetWants(const Wants& w) { impl_->ApplyWants(w); }
+#ifdef PULSE_DEVELOPMENT
+bool diagnostics::SensorContracts() {
+    BatterySample battery{true, true, true, true, false, false, true, 0};
+    auto idle = ClassifyBattery(battery);
+    if (idle.mode != PowerMode::AcIdle || !idle.rate_valid || idle.rate_mw != 0 || idle.show_watts) return false;
+    battery.rate_known = false;
+    if (ClassifyBattery(battery).rate_valid || !std::isnan(ClassifyBattery(battery).rate_mw)) return false;
+    if (BatteryRateKnown(0x7fffffff) || IsCoreMeter(L"RAPL_Package0_PKG") ||
+        IsCoreMeter(L"RAPL_Package0_Core0_CORE_extra") || !IsCoreMeter(L"RAPL_Package0_Core7_CORE")) return false;
+    if (CorePowerConsistent(35, 29) || !CorePowerConsistent(8, 13) || !CorePowerConsistent(10, NAN)) return false;
+    LARGE_INTEGER freq{}; if (!QueryPerformanceFrequency(&freq)) return false;
+    std::vector<CoreEnergyPoint> prev;
+    double watts = NAN;
+    std::vector<EnergyPoint> cores{{L"core0", 10000000000ULL, freq.QuadPart}, {L"core1", 20000000000ULL, freq.QuadPart}};
+    if (SumCoreEnergy(cores, prev, watts) != MeterStatus::Warmup || !std::isnan(watts)) return false;
+    for (auto& core : cores) { core.pwh += 1000000000ULL; core.qpc += freq.QuadPart; }
+    std::reverse(cores.begin(), cores.end());
+    if (SumCoreEnergy(cores, prev, watts) != MeterStatus::Valid || std::fabs(watts - 7.2) > 1e-6) return false;
+    cores[0].pwh = 1;
+    for (auto& core : cores) core.qpc += freq.QuadPart;
+    if (SumCoreEnergy(cores, prev, watts) == MeterStatus::Valid || !std::isnan(watts)) return false;
+    cores.pop_back();
+    if (SumCoreEnergy(cores, prev, watts) != MeterStatus::Warmup) return false;
+    if (CounterLuid(L"pid_1_luid_0x00000002_0x00000003_phys_0") != 0x200000003ULL) return false;
+    std::vector<DgpuAdapter> cards{{0x10de, 1, 0, 4, true}, {0x10de, 2, 0, 1, true}};
+    if (DgpuGateStatus({cards[0]}) != DgpuStatus::Sleeping || DgpuMatches(cards, 1, 0) || !DgpuMatches(cards, 2, 0)) return false;
+    return true;
+}
+#endif
+std::vector<GpuAdapter> Metrics::GpuAdapters() {
+    impl_->adapter_due_ = 0;
+    impl_->RefreshAdapters(GetTickCount64());
+    return impl_->adapters_;
+}
+void Metrics::SetGpuAdapter(const std::wstring& id) {
+    if (impl_->selected_gpu_ == id) return;
+    impl_->selected_gpu_ = id;
+    impl_->ChooseGpu(0);
+    impl_->gpu_percent_ = NAN;
+    impl_->gpu_due_ = 0;
+}
 
 void Metrics::SetPaused(bool paused) {
     const bool was_paused = impl_->paused_.exchange(paused, std::memory_order_relaxed);
@@ -2687,8 +3838,495 @@ void Metrics::SetSlowThreshold(int slow_ms) { impl_->probe.SetSlowThreshold(slow
 void Metrics::OnSuspend() { impl_->probe.OnSuspend(); }
 
 void Metrics::OnResume() {
+    impl_->dgpu_.Reset();
     impl_->reset_intervals_.store(true, std::memory_order_release);
     impl_->probe.OnResume();
+}
+
+namespace {
+
+std::wstring DiagStatus(long status) {
+    wchar_t buffer[48]{};
+    std::swprintf(buffer, 48, L"%ld (0x%08lX)", status, static_cast<unsigned long>(status));
+    return buffer;
+}
+
+std::wstring DiagGuid(const GUID& guid) {
+    wchar_t buffer[64]{};
+    std::swprintf(buffer, 64, L"%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+        static_cast<unsigned long>(guid.Data1), static_cast<unsigned>(guid.Data2),
+        static_cast<unsigned>(guid.Data3), guid.Data4[0], guid.Data4[1], guid.Data4[2],
+        guid.Data4[3], guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+    return buffer;
+}
+
+std::wstring DiagVersion() {
+    wchar_t path[1024]{};
+    const DWORD length = GetModuleFileNameW(nullptr, path, 1024);
+    if (!length || length >= 1024) return L"unknown";
+    HMODULE library = LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!library) return L"unknown";
+    using SizeFn = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+    using ReadFn = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+    using QueryFn = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+    const auto sizeFn = reinterpret_cast<SizeFn>(GetProcAddress(library, "GetFileVersionInfoSizeW"));
+    const auto readFn = reinterpret_cast<ReadFn>(GetProcAddress(library, "GetFileVersionInfoW"));
+    const auto queryFn = reinterpret_cast<QueryFn>(GetProcAddress(library, "VerQueryValueW"));
+    std::wstring version = L"unknown";
+    DWORD handle = 0;
+    const DWORD bytes = sizeFn ? sizeFn(path, &handle) : 0;
+    if (bytes > 0 && bytes < (4u << 20) && readFn && queryFn) {
+        std::vector<unsigned char> block(bytes);
+        if (readFn(path, 0, bytes, block.data())) {
+            struct Head { DWORD signature, structVersion, fileMs, fileLs; };
+            void* value = nullptr;
+            UINT valueLen = 0;
+            if (queryFn(block.data(), L"\\", &value, &valueLen) && value && valueLen >= sizeof(Head)) {
+                Head head{};
+                std::memcpy(&head, value, sizeof(head));
+                if (head.signature == 0xFEEF04BDu) {
+                    wchar_t text[64]{};
+                    std::swprintf(text, 64, L"%u.%u.%u.%u",
+                        static_cast<unsigned>(HIWORD(head.fileMs)), static_cast<unsigned>(LOWORD(head.fileMs)),
+                        static_cast<unsigned>(HIWORD(head.fileLs)), static_cast<unsigned>(LOWORD(head.fileLs)));
+                    version = text;
+                }
+            }
+        }
+    }
+    FreeLibrary(library);
+    return version;
+}
+
+const wchar_t* TraceName(PowerTrace trace) {
+    switch (trace) {
+    case PowerTrace::Package: return L"package";
+    case PowerTrace::BatteryWhole: return L"battery-whole";
+    case PowerTrace::BatterySide: return L"battery-side";
+    default: return L"unknown";
+    }
+}
+
+struct DiagRaw {
+    std::wstring name;
+    long status = 0;
+    long long first = 0;
+    long long second = 0;
+    double power_mw = NAN; // Preserve formatted double, including NaN/Inf; never cast to integer.
+};
+
+bool CollectRaw(PDH_HCOUNTER counter, std::vector<DiagRaw>& out, long& array_status) {
+    out.clear();
+    array_status = PDH_INVALID_HANDLE;
+    if (!counter) {
+        return false;
+    }
+    std::vector<unsigned char> buffer(65536);
+    DWORD count = 0;
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DWORD need = static_cast<DWORD>(buffer.size());
+        count = 0;
+        const PDH_STATUS status = PdhGetRawCounterArrayW(counter, &need, &count,
+            reinterpret_cast<PDH_RAW_COUNTER_ITEM_W*>(buffer.data()));
+        array_status = status;
+        if (status == ERROR_SUCCESS) { ok = true; break; }
+        if (static_cast<DWORD>(status) != static_cast<DWORD>(PDH_MORE_DATA) || need == 0 || need > (16u << 20))
+            return false;
+        buffer.resize(std::max(static_cast<std::size_t>(need), buffer.size() * 2));
+    }
+    if (!ok) return false;
+    const auto* items = reinterpret_cast<const PDH_RAW_COUNTER_ITEM_W*>(buffer.data());
+    count = std::min(count, static_cast<DWORD>(buffer.size() / sizeof(PDH_RAW_COUNTER_ITEM_W)));
+    for (DWORD i = 0; i < count; ++i) {
+        DiagRaw row;
+        row.name = items[i].szName ? items[i].szName : L"";
+        row.status = items[i].RawValue.CStatus;
+        row.first = items[i].RawValue.FirstValue;
+        row.second = items[i].RawValue.SecondValue;
+        out.push_back(std::move(row));
+    }
+    return true;
+}
+
+}  // namespace
+
+std::wstring BuildDgpuGateDiagnosticsReport() {
+    DgpuGate gate;
+    const auto status = gate.Read(GetTickCount64());
+    return DgpuGateReport(gate, status); // CfgMgr only; never loads NVML.
+}
+
+std::wstring BuildDgpuDiagnosticsReport(bool allow_wake, void (*before_nvml)(const std::wstring&)) {
+    std::wstring report;
+    auto line = [&](const std::wstring& text) { report += text; report += L"\r\n"; };
+    DgpuGate gate;
+    const DgpuStatus status = gate.Read(GetTickCount64());
+    line(L"[NVIDIA dGPU]");
+    report += DgpuGateReport(gate, status);
+    line(L"Only system-reported D0 opens the normal NVML gate; temperature is not used.");
+    if (status != DgpuStatus::Valid && !allow_wake) {
+        if (status == DgpuStatus::Sleeping) line(L"asleep; NVML not called to avoid waking it");
+        else if (status == DgpuStatus::NoNvidia) line(L"No NVIDIA display adapter; NVML not called to avoid waking it");
+        else line(L"CfgMgr gate failed or unknown; NVML not called to avoid waking it");
+        return report;
+    }
+    if (status != DgpuStatus::Valid)
+        line(L"WARNING: dGPU looks asleep; NVML may wake it.");
+    if (before_nvml) { before_nvml(report); report.clear(); }
+    NvmlApi nvml;
+    const bool opened = nvml.Open();
+    line(L"NVML path: " + nvml.path);
+    line(L"NVML load_error=" + std::to_wstring(nvml.load_error));
+    line(L"nvmlInit_v2: " + std::to_wstring(nvml.init_result) +
+        (nvml.init_result == -1 ? L" (not called)" : L""));
+    if (!opened) { line(L"Result: NvmlUnavailable"); return report; }
+    unsigned count = 0;
+    const nvmlReturn_t count_rc = nvml.count(&count);
+    line(L"nvmlDeviceGetCount_v2: " + std::to_wstring(count_rc) + L" devices=" + std::to_wstring(count));
+    if (count_rc != kNvmlSuccess || count > 4096) { line(L"Result: ReadFailed"); return report; }
+    std::vector<DgpuDevice> readings;
+    bool failed = false;
+    for (unsigned i = 0; i < count; ++i) {
+        nvmlDevice_t handle = nullptr;
+        const nvmlReturn_t handle_rc = nvml.handle(i, &handle);
+        line(L"  device=" + std::to_wstring(i) + L" handle_rc=" + std::to_wstring(handle_rc));
+        if (handle_rc != kNvmlSuccess || !handle) { failed = true; continue; }
+        nvmlPciInfo_t pci{};
+        const nvmlReturn_t pci_rc = nvml.pci(handle, &pci);
+        char name[128]{};
+        const nvmlReturn_t name_rc = nvml.name(handle, name, static_cast<unsigned>(sizeof(name)));
+        name[sizeof(name) - 1] = '\0';
+        wchar_t wide_name[128]{};
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, wide_name, 128);
+        line(L"    name_rc=" + std::to_wstring(name_rc) + L" name=" + wide_name);
+        wchar_t text[256]{};
+        std::swprintf(text, 256, L"    pci_rc=%d PCI=%u:%u:%u (domain:bus:device)", pci_rc,
+            pci.domain, pci.bus, pci.device);
+        line(text);
+        if (pci_rc != kNvmlSuccess) { failed = true; if (!allow_wake) continue; }
+        const bool matched = pci_rc == kNvmlSuccess && pci.domain == 0 &&
+            DgpuMatches(gate.adapters, pci.bus, pci.device);
+        line(std::wstring(L"    awake_match=") + (matched ? L"yes" : L"no"));
+        if (!allow_wake && !matched) { line(L"    PowerUsage skipped: adapter is not an awake match"); continue; }
+        unsigned limit_mw = 0;
+        const nvmlReturn_t limit_rc = nvml.enforced_limit ? nvml.enforced_limit(handle, &limit_mw) : -1;
+        line(L"    nvmlDeviceGetEnforcedPowerLimit: " + std::to_wstring(limit_rc) +
+            L" mW=" + std::to_wstring(limit_mw));
+        if (limit_rc != kNvmlSuccess) limit_mw = 0;
+        unsigned mw = 0;
+        nvmlReturn_t power_rc;
+        {
+            diagnostics::ScopedTiming timing(L"NVML power");
+            power_rc = nvml.power(handle, &mw);
+        }
+        line(L"    nvmlDeviceGetPowerUsage: " + std::to_wstring(power_rc) + L" mW=" + std::to_wstring(mw));
+        if (matched) readings.push_back({pci.bus, pci.device, power_rc, mw, limit_mw, limit_rc == kNvmlSuccess});
+    }
+    const DgpuResult result = InterpretDgpu(gate.adapters, readings);
+    line(std::wstring(L"Result: ") + (failed ? L"ReadFailed" : DgpuStatusName(result.status)) +
+        L" awake_matched=" + std::to_wstring(result.matched));
+    if (!failed && result.status == DgpuStatus::Valid) line(L"dGPU watts: " + std::to_wstring(result.watts));
+    line(L"nvmlShutdown + FreeLibrary on exit");
+    return report;
+}
+
+std::wstring BuildPowerDiagnosticsReport() {
+    std::wstring report;
+    auto line = [&](const std::wstring& text) { report += text; report += L"\r\n"; };
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[64]{};
+    std::swprintf(stamp, 64, L"%04u-%02u-%02u %02u:%02u:%02u",
+        now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    wchar_t modulePath[1024]{};
+    const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, 1024);
+    modulePath[1023] = L'\0';
+    line(L"Pulse power diagnostics");
+    line(std::wstring(L"Time: ") + stamp);
+    line(std::wstring(L"Version: ") + DiagVersion());
+    line(std::wstring(L"Module: ") + (moduleLength && moduleLength < 1024 ? modulePath : L"unavailable (path failed or truncated)"));
+    line(L"Units: Energy counter raw value = picowatt-hours (pWh). watts = (delta pWh) * 3.6e-9 / QPC seconds.");
+    line(L"Units: Power counter = milliwatts (mW). watts = mW / 1000.");
+    line(L"D3DKMT_ADAPTER_PERFDATA.Power is 0.1 percent, not watts, and is not used as a fallback.");
+    line(L"D3DKMT_ADAPTER_PERFDATA.FanRPM is the adapter fan, not a general CPU fan, and is not read here.");
+    line(L"Domains: package=package0_pkg, cpu=pp0, graphics=pp1, memory=dram. pp1 is an EMI graphics domain, not discrete-GPU board power.");
+    line(L"GPU Engine utilization can come from a different adapter than pp1. NVIDIA board power uses NVML only after a system-reported D0 CfgMgr gate; ADLX is not used.");
+    line(L"");
+
+    HMODULE powerLib = GetModuleHandleW(L"powrprof.dll");
+    const bool loadedPower = powerLib == nullptr;
+    if (!powerLib) powerLib = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto activeFn = powerLib ? reinterpret_cast<ActiveSchemeFn>(GetProcAddress(powerLib, "PowerGetActiveScheme")) : nullptr;
+    const auto friendlyFn = powerLib ? reinterpret_cast<FriendlyNameFn>(GetProcAddress(powerLib, "PowerReadFriendlyName")) : nullptr;
+    const auto overlayFn = powerLib ? reinterpret_cast<OverlayFn>(GetProcAddress(powerLib, "PowerGetEffectiveOverlayScheme")) : nullptr;
+    line(L"[Power plan]");
+    GUID* active = nullptr;
+    const DWORD activeStatus = activeFn ? activeFn(nullptr, &active) : ERROR_PROC_NOT_FOUND;
+    line(std::wstring(L"PowerGetActiveScheme: ") + DiagStatus(static_cast<long>(activeStatus)));
+    if (activeStatus == ERROR_SUCCESS && active) {
+        const GUID guid = *active;
+        LocalFree(active);
+        line(std::wstring(L"Active scheme GUID: ") + DiagGuid(guid));
+        std::wstring plan;
+        if (ReadPlanName(friendlyFn, guid, plan)) line(std::wstring(L"Friendly name: ") + plan);
+        else line(L"Friendly name: unavailable (query failed; no previous name is kept)");
+    } else {
+        if (active) LocalFree(active);
+        line(L"Friendly name: unavailable");
+    }
+    GUID overlay{};
+    const DWORD overlayStatus = overlayFn ? overlayFn(&overlay) : ERROR_PROC_NOT_FOUND;
+    line(std::wstring(L"PowerGetEffectiveOverlayScheme: ") + DiagStatus(static_cast<long>(overlayStatus)));
+    if (overlayStatus == ERROR_SUCCESS) {
+        line(std::wstring(L"Overlay GUID: ") + DiagGuid(overlay));
+        line(std::wstring(L"Overlay kind: ") + SchemeName(SchemeKind(overlay)));
+    }
+    line(L"The overlay is a performance preference. It is not the Control Panel power plan.");
+    line(L"");
+
+    line(L"[Battery]");
+    BatteryReading battery{};
+    const bool batteryOk = ReadBattery(battery);
+    line(batteryOk ? L"Read: success" : L"Read: failed; AC line and rate are not confirmed");
+    if (batteryOk) {
+        BatterySample sample;
+        sample.read_ok = true;
+        sample.present = battery.present;
+        sample.ac_known = battery.ac_known;
+        sample.ac_online = battery.ac;
+        sample.charging = battery.charging;
+        sample.discharging = battery.discharging;
+        sample.rate_known = battery.rate_known;
+        sample.rate_mw = battery.rate_mw;
+        const BatteryClassification classified = ClassifyBattery(sample);
+        line(std::wstring(L"Present: ") + (battery.present ? L"yes" : L"no"));
+        line(std::wstring(L"AC known/online: ") + (classified.ac_known ? L"yes" : L"no") +
+            L" / " + (classified.ac_online ? L"online" : L"offline"));
+        line(std::wstring(L"Charging flag: ") + (battery.charging ? L"1" : L"0"));
+        line(std::wstring(L"Discharging flag: ") + (battery.discharging ? L"1" : L"0"));
+        if (battery.rate_known) {
+            wchar_t rate[64]{};
+            std::swprintf(rate, 64, L"%.3f mW (signed; positive=charge, negative=discharge)", battery.rate_mw);
+            line(std::wstring(L"Rate: ") + rate);
+        } else line(L"Rate: unknown (not treated as 0 W)");
+        line(std::wstring(L"Classified trace: ") + TraceName(classified.trace));
+        line(std::wstring(L"Supplemental: ") + (classified.supplemental ? L"yes" : L"no"));
+        line(std::wstring(L"Pure battery: ") + (classified.pure_battery ? L"yes" : L"no"));
+        line(std::wstring(L"Contested: ") + (classified.contested ? L"yes" : L"no"));
+        line(L"Pure battery requires known offline AC and uncontested discharge. AC plus battery discharge is supplemental, not whole-machine power.");
+    }
+    line(L"");
+
+    report += BuildDgpuDiagnosticsReport(false);
+    line(L"");
+    line(L"[Energy Meter]");
+    PDH_HQUERY query = nullptr;
+    const PDH_STATUS openStatus = PdhOpenQueryW(nullptr, 0, &query);
+    line(std::wstring(L"PdhOpenQuery: ") + DiagStatus(openStatus));
+    PDH_HCOUNTER energy = nullptr, power = nullptr, meterTime = nullptr;
+    PDH_STATUS energyAdd = openStatus, powerAdd = openStatus, timeAdd = openStatus;
+    if (openStatus == ERROR_SUCCESS) {
+        energyAdd = PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Energy", 0, &energy);
+        powerAdd = PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Power", 0, &power);
+        timeAdd = PdhAddEnglishCounterW(query, L"\\Energy Meter(*)\\Time", 0, &meterTime);
+    }
+    if (energyAdd != ERROR_SUCCESS) energy = nullptr;
+    if (powerAdd != ERROR_SUCCESS) power = nullptr;
+    line(std::wstring(L"Add Energy (pWh): ") + DiagStatus(energyAdd));
+    line(std::wstring(L"Add Power (mW): ") + DiagStatus(powerAdd));
+    line(std::wstring(L"Add Time: ") + DiagStatus(timeAdd));
+    std::vector<DiagRaw> firstRaw, secondRaw, secondPower;
+    long firstArray = energyAdd, secondArray = energyAdd, powerArray = powerAdd;
+    PDH_STATUS firstCollect = openStatus == ERROR_SUCCESS ? PdhCollectQueryData(query) : openStatus;
+    line(std::wstring(L"Collect 1: ") + DiagStatus(firstCollect));
+    const std::int64_t qpc1 = QpcNow();
+    if (firstCollect == ERROR_SUCCESS && energy) {
+        CollectRaw(energy, firstRaw, firstArray);
+    } else if (firstCollect != ERROR_SUCCESS) firstArray = firstCollect;
+    line(std::wstring(L"Energy array 1 (add/collect status if skipped): ") + DiagStatus(firstArray));
+    if (openStatus == ERROR_SUCCESS) Sleep(1000);
+    PDH_STATUS secondCollect = openStatus == ERROR_SUCCESS ? PdhCollectQueryData(query) : openStatus;
+    const std::int64_t qpc2 = QpcNow();
+    line(std::wstring(L"Collect 2: ") + DiagStatus(secondCollect));
+    const double seconds = QpcSeconds(qpc2, qpc1);
+    {
+        wchar_t gap[64]{};
+        std::swprintf(gap, 64, L"QPC interval: %.3f s", seconds);
+        line(gap);
+    }
+    if (secondCollect == ERROR_SUCCESS) {
+        if (energy) CollectRaw(energy, secondRaw, secondArray);
+        std::vector<unsigned char> formatted(65536);
+        DWORD count = 0;
+        if (power && FormatArray(power, formatted, count, PDH_FMT_DOUBLE, &powerArray)) {
+            const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(formatted.data());
+            count = std::min(count, static_cast<DWORD>(formatted.size() / sizeof(PDH_FMT_COUNTERVALUE_ITEM_W)));
+            for (DWORD i = 0; i < count; ++i) {
+                DiagRaw row;
+                row.name = items[i].szName ? items[i].szName : L"";
+                row.status = items[i].FmtValue.CStatus;
+                row.power_mw = items[i].FmtValue.doubleValue;
+                secondPower.push_back(std::move(row));
+            }
+        }
+    } else {
+        secondArray = powerArray = secondCollect;
+    }
+    line(std::wstring(L"Energy array 2 (add/collect status if skipped): ") + DiagStatus(secondArray));
+    line(std::wstring(L"Power array (add/collect status if skipped): ") + DiagStatus(powerArray));
+    auto listEnergy = [&](const wchar_t* title, const std::vector<DiagRaw>& rows) {
+        line(title);
+        if (rows.empty()) line(L"  (no rows; consult add/collect/array status above)");
+        for (const auto& row : rows) {
+            wchar_t text[256]{};
+            std::swprintf(text, 256, L"  status=%ld first=%lld second=%lld name=",
+                row.status, row.first, row.second);
+            line(std::wstring(text) + row.name);
+        }
+    };
+    listEnergy(L"Raw Energy instances (sample 1, pWh):", firstRaw);
+    listEnergy(L"Raw Energy instances (sample 2, pWh):", secondRaw);
+    line(L"Power instances (formatted double, mW):");
+    if (secondPower.empty()) line(L"  (no rows; consult add/collect/array status above)");
+    for (const auto& row : secondPower) {
+        wchar_t text[128]{};
+        std::swprintf(text, 128, L"  status=%ld mW=%.6g name=", row.status, row.power_mw);
+        line(std::wstring(text) + row.name);
+    }
+    const wchar_t* domainName[] = {L"package", L"cpu", L"graphics", L"memory"};
+    bool graphics_match = false;
+    std::array<unsigned, 6> outcomes{};
+    // Prefer a valid matching row, then the same domain score used by normal sampling.
+    auto choose = [&](const std::vector<DiagRaw>& rows, std::size_t domain, bool formatted) {
+        const DiagRaw* chosen = nullptr;
+        int best = 0;
+        for (const auto& row : rows) {
+            int score = EnergyScore(row.name.c_str(), domain);
+            if (!score) continue;
+            if (MeterDataValid(row.status) && (!formatted || MeterPowerValid(row.power_mw))) score += 10;
+            if (score > best) { best = score; chosen = &row; }
+        }
+        return chosen;
+    };
+    line(L"Matched domains:");
+    for (std::size_t domain = 0; domain < 4; ++domain) {
+        const DiagRaw* after = choose(secondRaw, domain, false);
+        const DiagRaw* before = after ? nullptr : choose(firstRaw, domain, false);
+        if (after) {
+            for (const auto& row : firstRaw)
+                if (row.name == after->name) { before = &row; break; }
+        }
+        const DiagRaw* fallback = choose(secondPower, domain, true);
+        const MeterEvidence e{energy != nullptr, secondArray == ERROR_SUCCESS, before || after};
+        const MeterEvidence p{power != nullptr, powerArray == ERROR_SUCCESS, fallback != nullptr};
+        MeterEnergySample b, a;
+        if (before) b = {before->name, static_cast<std::uint32_t>(before->status), static_cast<std::uint64_t>(before->first)};
+        if (after) a = {after->name, static_cast<std::uint32_t>(after->status), static_cast<std::uint64_t>(after->first)};
+        const auto result = InterpretMeterDomain(e, p,
+            firstArray == ERROR_SUCCESS && before ? &b : nullptr, after ? &a : nullptr, seconds,
+            fallback ? static_cast<std::uint32_t>(fallback->status) : static_cast<std::uint32_t>(PDH_INVALID_DATA),
+            fallback ? fallback->power_mw : NAN);
+        ++outcomes[static_cast<std::size_t>(result.status)];
+        if (domain == 2) graphics_match = e.matched || p.matched;
+        line(std::wstring(L"  ") + domainName[domain] + L":");
+        if (after || before) line(L"    Energy name: " + (after ? after->name : before->name));
+        if (fallback) line(L"    Power name: " + fallback->name);
+        if (std::isfinite(result.energy_w)) {
+            wchar_t text[160]{};
+            std::swprintf(text, 160, L"    Energy: delta_pWh=%llu -> %.3f W",
+                static_cast<unsigned long long>(result.delta_pwh), result.energy_w);
+            line(text);
+        } else if (result.interval == MeterInterval::InvalidData) {
+            line(L"    Energy: invalid CStatus; no delta calculated (see raw rows).");
+        } else if (result.interval == MeterInterval::Unchanged) {
+            line(L"    Energy: unchanged; warmup/stale provider, not evidence of 0 W.");
+        } else if (result.interval == MeterInterval::Warmup || result.interval == MeterInterval::Reset) {
+            line(L"    Energy: warmup/reset/identity change; no valid same-name interval yet.");
+        } else line(L"    Energy: unavailable; consult add/collect/array status and instance names.");
+        if (std::isfinite(result.power_w)) {
+            wchar_t text[160]{};
+            std::swprintf(text, 160, L"    Power: %.6g mW / 1000 = %.3f W%ls", fallback->power_mw,
+                result.power_w, std::isfinite(result.energy_w) ? L" (reference)" : L" (fallback available)");
+            line(text);
+        } else line(L"    Power: unavailable; consult status, CStatus and value above.");
+        switch (result.status) {
+        case MeterStatus::Valid: line(L"    Result: valid source available."); break;
+        case MeterStatus::Warmup: line(L"    Result: warmup/unchanged; retry later."); break;
+        case MeterStatus::CounterUnavailable: line(L"    Result: counters unavailable."); break;
+        case MeterStatus::NoMatch: line(L"    Result: arrays read successfully, no matching domain name."); break;
+        default: line(L"    Result: read failed or invalid data; not evidence of missing hardware."); break;
+        }
+    }
+    if (query) PdhCloseQuery(query);
+    if (loadedPower && powerLib) FreeLibrary(powerLib);
+    line(L"");
+    line(L"[Why a value may be missing]");
+    if (openStatus != ERROR_SUCCESS) {
+        line(L"The PDH query could not be opened. This sample does not prove the hardware can never report power.");
+    } else if (energyAdd != ERROR_SUCCESS && powerAdd != ERROR_SUCCESS) {
+        line(L"Neither the Energy nor the Power counter could be added. Energy Meter data is unavailable on this boot.");
+        line(L"That usually means the EMI device did not expose the counter. It does not by itself prove every other interface is impossible.");
+    } else {
+        line(L"Domain counts: valid=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::Valid)]) +
+            L", warmup/unchanged=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::Warmup)]) +
+            L", read failed/invalid=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::ReadFailed)]) +
+            L", no matching name=" + std::to_wstring(outcomes[static_cast<std::size_t>(MeterStatus::NoMatch)]));
+        line(L"Energy and Power were matched independently. A valid Power-only domain is a usable mW-to-W fallback.");
+        line(L"An add, collect, array or CStatus failure is not proof that an instance or hardware is absent.");
+    }
+    if (graphics_match) {
+        line(L"A pp1 match is EMI graphics-domain data. It is not the board power of an RTX or other discrete GPU, and it may not be the adapter shown by GPU usage.");
+    } else {
+        line(L"No pp1 name was observed in the returned Energy/Power rows; if a read failed, presence is unknown. GPU usage can still be available from GPU Engine.");
+    }
+    line(L"Normal UI keeps unknown numbers as --. It does not substitute 0 W, D3DKMT Power, or an estimated total.");
+    return report;
+}
+
+int WritePowerDiagnosticsFile(std::wstring* path_out, std::wstring* error_out) {
+    auto fail = [&](const std::wstring& message, int code) {
+        if (error_out) *error_out = message;
+        return code;
+    };
+    wchar_t local[MAX_PATH]{};
+    const DWORD localLen = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (localLen == 0 || localLen >= MAX_PATH) return fail(L"LOCALAPPDATA is unavailable.", 2);
+    const std::wstring directory = std::wstring(local) + L"\\Pulse";
+    const std::wstring path = directory + L"\\power-diagnostics.txt";
+    if (!CreateDirectoryW(directory.c_str(), nullptr)) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_ALREADY_EXISTS)
+            return fail(L"Could not create the Pulse directory. Win32 error " + std::to_wstring(error), 2);
+    }
+    std::wstring report;
+    try {
+        report = BuildPowerDiagnosticsReport();
+    } catch (...) {
+        return fail(L"Collecting the diagnostic failed.", 3);
+    }
+    if (report.empty()) return fail(L"The diagnostic report was empty.", 3);
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, report.c_str(), static_cast<int>(report.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return fail(L"Could not encode the diagnostic as UTF-8.", 3);
+    std::string encoded(static_cast<std::size_t>(bytes), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, report.c_str(), static_cast<int>(report.size()),
+        encoded.data(), bytes, nullptr, nullptr) != bytes)
+        return fail(L"Could not encode the complete diagnostic as UTF-8.", 3);
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return fail(L"Could not write power-diagnostics.txt. Win32 error " + std::to_wstring(GetLastError()), 2);
+    const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+    DWORD bomWritten = 0, bodyWritten = 0;
+    const bool bomOk = WriteFile(file, bom, sizeof(bom), &bomWritten, nullptr) && bomWritten == sizeof(bom);
+    const bool bodyOk = bomOk && WriteFile(file, encoded.data(), static_cast<DWORD>(encoded.size()), &bodyWritten, nullptr) &&
+        bodyWritten == static_cast<DWORD>(encoded.size());
+    CloseHandle(file);
+    if (!bomOk || !bodyOk) return fail(L"Writing power-diagnostics.txt failed.", 2);
+    if (path_out) *path_out = path;
+    if (error_out) error_out->clear();
+    return 0;
 }
 
 }  // namespace pulse

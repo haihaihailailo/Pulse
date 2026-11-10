@@ -17,7 +17,7 @@ enum class FullComponent : std::size_t {
     SystemInfo, GpuMemory, Wifi, BatteryHealth, Fps, Count
 };
 enum class CompactComponent : std::size_t {
-    Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, Count
+    Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, GpuTemp, Count
 };
 struct ComponentInfo {
     const wchar_t* key;
@@ -50,7 +50,8 @@ inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(CompactCompo
     {L"latency", Key::Latency, true, 75},
     {L"disk_io", Key::DiskIO, false, 0},
     {L"cpu_freq", Key::CpuFrequency, false, 89},
-    {L"fps", Key::FpsShort, false, 57}
+    {L"fps", Key::FpsShort, false, 57},
+    {L"gpu_temp", Key::GpuTemp, false, 64}
 }};
 inline constexpr std::array<FullComponent, FullComponents.size()> FullOrder{{
     FullComponent::Hardware, FullComponent::Battery, FullComponent::PowerChart,
@@ -66,17 +67,31 @@ inline constexpr auto TaskbarComponents = [] {
         items[static_cast<std::size_t>(c)].enabled = true;
     return items;
 }();
+using ComponentOrder = std::array<CompactComponent, CompactComponents.size()>;
+inline constexpr ComponentOrder DefaultCompactOrder{{
+    CompactComponent::Battery, CompactComponent::Eta, CompactComponent::Power,
+    CompactComponent::Cpu, CompactComponent::Memory, CompactComponent::Gpu,
+    CompactComponent::Network, CompactComponent::Latency, CompactComponent::DiskIO,
+    CompactComponent::CpuFrequency, CompactComponent::Fps, CompactComponent::GpuTemp
+}};
+inline constexpr ComponentOrder DefaultTaskbarOrder{{
+    CompactComponent::Network, CompactComponent::Eta, CompactComponent::Power,
+    CompactComponent::Battery, CompactComponent::Cpu, CompactComponent::Memory,
+    CompactComponent::Gpu, CompactComponent::Latency, CompactComponent::CpuFrequency,
+    CompactComponent::Fps, CompactComponent::GpuTemp, CompactComponent::DiskIO
+}};
 struct Components {
     std::array<bool, FullComponents.size()> full{};
     std::array<bool, CompactComponents.size()> compact{};
     std::array<bool, CompactComponents.size()> taskbar{};
+    ComponentOrder compactOrder = DefaultCompactOrder, taskbarOrder = DefaultTaskbarOrder;
     Components() { Reset(); }
     void Reset();
     bool Enabled(FullComponent c) const { return full[static_cast<std::size_t>(c)]; }
     bool Enabled(CompactComponent c) const { return compact[static_cast<std::size_t>(c)]; }
 };
 Wants CollectionWants(const Components& components, DisplayMode mode, bool details = false,
-                      PowerMode power = PowerMode::Unknown);
+                      PowerTrace trace = PowerTrace::Unknown);
 
 struct Speed {
     std::wstring value, unit;
@@ -97,20 +112,28 @@ struct Process {
 // Canonical display values. Only enabled components are populated or compared.
 struct View {
     PowerMode mode = PowerMode::Unknown;
+    PowerTrace powerTrace = PowerTrace::Unknown;
     NetState netState = NetState::Checking;
     bool low = false;
+    bool supplemental = false;
+    bool acOnline = false;
+    bool batterySaver = false;
     bool compactEtaVisible = false, compactEtaFromSystem = false;
     float battery = -1, cpu = -1, gpu = -1, memory = -1, disk = -1, wifi = -1;
-    std::wstring clock, chip, scheme, percent, etaLabel, heroWord;
+    std::wstring clock, chip, scheme, saverLabel, percent, etaLabel, heroWord;
     std::vector<TimePart> hero;
     std::wstring wattLabel, watt, pphLabel, pph, eta20, foot;
     std::wstring totals, selfCpu, powerLabel, powerValue; // Shared by compact power and the chart.
     std::wstring compactEtaLabel, compactEtaValue;
-    std::wstring cpuValue, memoryValue, packageW, cpuW, gpuW, memW, gpuUsage;
+    std::wstring cpuValue, memoryValue, packageW, packageNote, cpuW, gpuW, memW, gpuUsage;
     std::wstring latency, netHint, compactUp, compactDown, diskRead, diskWrite;
     std::wstring diskPercent, diskFree, cpuFrequency, memoryDetail, processCount, uptime;
     std::wstring sharedMemory, dedicatedMemory, wifiSsid, wifiSignal, health, cycles, fps;
     bool fpsAdmin = false;
+    std::wstring gpuTemp;
+    std::wstring gpuName;
+    bool gpuTempVisible = false; // Any UI model has seen a valid value in this run.
+    int gpuTempLevel = 0; // 0 normal/unknown, 1 >= 70 C, 2 >= 85 C.
     Speed down, up, read, write;
     std::vector<Process> processes;
     std::vector<float> powerHistory; // Allocated only while the chart is visible.

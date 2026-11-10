@@ -2,6 +2,8 @@
 // 后端（metrics.cpp / netprobe.cpp，由 Grok 实现）只负责采样，界面（Codex 实现）只读 Snapshot。
 // 约定：数值未知时用 NaN（double）或 -1（整数），界面显示 "--"。
 #pragma once
+#include "power_state.h"
+#include "dgpu_state.h"
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -9,7 +11,6 @@
 
 namespace pulse {
 
-enum class PowerMode { Unknown, NoBattery, Discharging, Charging, AcIdle };   // AcIdle = 插着电但未充放电（已充满等）
 enum class NetState { Checking, Online, Slow, Offline };
 
 struct ProcUsage {
@@ -27,6 +28,14 @@ struct FpsRank {
 // Language-independent display metadata; legacy Chinese strings remain intact.
 enum class PowerSchemeKind { Unknown, Balanced, BestPerformance, BestEfficiency, LongerBattery };
 enum class OfflineReason { None, Timeout, HighLatency, LinkDisconnected, NoResponse };
+enum class WifiStatus { Reading, Connected, Disconnected, PermissionRequired, Unavailable, Error };
+
+struct GpuAdapter {
+    std::wstring id, name; // Stable PCI identity + description, not the boot-specific LUID.
+    std::uint64_t luid = 0;
+    unsigned vendor = 0;
+    unsigned bus = ~0u, device = ~0u;
+};
 
 struct Snapshot {
     // —— 电池 ——
@@ -69,8 +78,8 @@ struct Snapshot {
     double cpu_mhz = NAN;                 // CPU 当前频率（MHz）
     int process_count = -1;
     double uptime_s = NAN;                // 开机时长
-    double gpu_shared_mem_mb = NAN;       // 核显共享显存占用（GPU Adapter Memory）
-    double gpu_dedicated_mem_mb = NAN;    // 独显专用显存占用（无独显则 NaN）
+    double gpu_shared_mem_mb = NAN;       // 所选 GPU 的共享显存占用（GPU Adapter Memory）
+    double gpu_dedicated_mem_mb = NAN;    // 所选 GPU 的专用显存占用；未知为 NaN
     std::wstring wifi_ssid;               // 未连 Wi-Fi 为空
     int wifi_signal = -1;                 // 0..100
     double battery_health_percent = NAN;  // 满充容量 / 设计容量 × 100
@@ -95,6 +104,38 @@ struct Snapshot {
     PowerSchemeKind power_scheme_kind = PowerSchemeKind::Unknown;
     OfflineReason offline_reason = OfflineReason::None;
     double offline_latency_ms = NAN;
+    double gpu_temp_c = NAN;   // 显卡温度（°C），同任务管理器口径（D3DKMT 适配器性能数据）；多块显卡取最高；不支持/显卡休眠/未启用为 NaN
+
+    // Appended fields. power_scheme / power_scheme_kind stay the overlay, not the plan.
+    // Active Control Panel plan. Invalid or empty after a failed query; custom names are not translated.
+    bool active_plan_valid = false;
+    std::wstring active_plan_name;
+
+    // External power and the signed battery rate. An unknown rate is never stored as 0 W.
+    bool ac_known = false;
+    bool ac_online = false;
+    bool battery_rate_valid = false;
+    double battery_rate_mw = NAN;          // Positive charges, negative discharges.
+    bool battery_supplemental = false;     // AC online while the battery is discharging.
+    bool power_contested = false;
+    PowerTrace power_trace = PowerTrace::Unknown;
+
+    // pkg / cpu (pp0) / graphics (pp1) / memory (dram). Not a sticky hardware absence.
+    MeterStatus pkg_meter = MeterStatus::Off;
+    MeterStatus cpu_meter = MeterStatus::Off;
+    MeterStatus gpu_meter = MeterStatus::Off;
+    MeterStatus mem_meter = MeterStatus::Off;
+
+    bool active_plan_balanced = false; // Confirmed system Balanced plan GUID, not its display name.
+
+    DgpuStatus dgpu_status = DgpuStatus::Off;
+    double dgpu_w = NAN; // Valid only when dgpu_status is Valid.
+    WifiStatus wifi_status = WifiStatus::Reading;
+    unsigned wifi_error = 0;
+    std::wstring gpu_name;
+    unsigned gpu_vendor = 0;
+    int cpu_core_meter_count = 0;
+    double cpu_core_power_counter_w = NAN;
 };
 
 // 网络探测事件（断网 / 恢复），由后端在探测线程里回调；界面负责弹提醒卡片、播放提示音。
@@ -133,6 +174,8 @@ struct Wants {
     bool fps = false;             // 前台帧率（ETW；关闭时不建会话）
     bool power_scheme = false;    // Only the full battery card displays this.
     bool process_count = false;   // Cheap count, independent of the top-three scan.
+    bool gpu_temp = false;
+    bool dgpu_power = false; // Full hardware card only; D0-gated NVML.
 };
 
 class Metrics {
@@ -162,10 +205,35 @@ public:
     void OnSuspend();
     void OnResume();
     void SetProbeEnabled(bool enabled); // Thread safe; disabled intervals never create outage events.
+    // UI/sample-thread operations. Empty id selects the busiest physical adapter.
+    std::vector<GpuAdapter> GpuAdapters();
+    void SetGpuAdapter(const std::wstring& id);
 
 private:
     struct Impl;
     Impl* impl_;
 };
 
+// Manual NVIDIA report. allow_wake is reserved for metrics_selftest --nvml.
+// CfgMgr-only display-device diagnostic; never calls or loads NVML.
+std::wstring BuildDgpuGateDiagnosticsReport();
+
+// Normal diagnostics never call NVML unless the system reports D0.
+// Optional sink flushes gate/warning text before a manual NVML call.
+std::wstring BuildDgpuDiagnosticsReport(bool allow_wake = false,
+    void (*before_nvml)(const std::wstring&) = nullptr);
+
+// Manual power diagnostic shared by metrics_selftest --power and Pulse.exe --power-diagnostics.
+// It does not start network probes, the UI sampler, settings writes, or a resident thread.
+// The report blocks for about one second so two Energy samples can be compared.
+std::wstring BuildPowerDiagnosticsReport();
+
+// Writes a UTF-8 BOM text file. path_out receives the path on success.
+// Returns 0 when the file is written. error_out receives a short reason otherwise.
+int WritePowerDiagnosticsFile(std::wstring* path_out, std::wstring* error_out);
+
 }  // namespace pulse
+
+#ifdef PULSE_DEVELOPMENT
+namespace pulse::diagnostics { bool SensorContracts(); }
+#endif

@@ -18,7 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <tuple>
-#include "ui_model.h"
+#include "ui_prefs.h"
 
 namespace pulse::ui {
 template<class T> class ComPtr {
@@ -62,6 +62,8 @@ public:
     void Resize();
     void SetComponents(const Components& components, bool compact);
     bool SetCompactEtaVisible(bool visible);
+    void SetTextColors(const TextColors& colors);
+    COLORREF DefaultValueColor(CompactComponent component, const View& view) const;
     void SetScroll(float offset) { scroll_ = offset; }
     void DiscardTarget();
     bool CanRender() const;
@@ -102,14 +104,18 @@ private:
     void ChartGrid(D2D1_RECT_F rect);
     void UpdateCompactLayout();
     void UpdateFullLayout();
-    void CompactContent(const View& v);
+    template<bool CustomColors> void CompactContent(const View& v);
     void ValueUnit(const std::wstring& value, const std::wstring& unit, float x, float y,
                    float numberSize, D2D1_COLOR_F color);
 
     Components components_;
+    TextColors textColors_{};
+    std::array<D2D1_COLOR_F, CompactComponents.size()> customInk_{};
+    bool hasTextColors_ = false;
     struct CompactCell { float width = 0, labelWidth = 0; };
     std::array<CompactCell, CompactComponents.size()> compactCells_{};
     float compactWidth_ = 51, fullWidth_ = 320;
+    float fullSchemeWidth_ = 0;
     float networkLabelWidth_ = 32, latencyLabelWidth_ = 34, systemLabelWidth_ = 84;
     float readLabelWidth_ = 20, writeLabelWidth_ = 20;
     bool chartVisible_ = false, compact_ = false, fullPanel_ = true, software_ = false;

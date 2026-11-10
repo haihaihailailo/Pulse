@@ -87,7 +87,7 @@ const Entry strings[] = {
     {L"占用最高的进程", L"Top processes"}, // TopProcesses
     {L"系统盘", L"System drive"}, // SystemDrive
     {L"系统信息", L"System info"}, // SystemInfo
-    {L"显存", L"GPU memory"}, // GpuMemory
+    {L"显卡", L"GPU"}, // GpuMemory (settings key remains gpu_memory)
     {L"Wi-Fi", L"Wi-Fi"}, // Wifi
     {L"电池健康", L"Battery health"}, // BatteryHealth
     {L"帧数", L"FPS"}, // Fps
@@ -97,8 +97,8 @@ const Entry strings[] = {
     {L"内存 已用/总量", L"Memory used / total"}, // MemoryUsedTotal
     {L"进程数", L"Processes"}, // ProcessCount
     {L"开机时长", L"Uptime"}, // Uptime
-    {L"核显共享", L"Shared"}, // SharedMemory
-    {L"独显专用", L"Dedicated"}, // DedicatedMemory
+    {L"共享显存", L"Shared"}, // SharedMemory
+    {L"专用显存", L"Dedicated"}, // DedicatedMemory
     {L"信号强度", L"Signal strength"}, // SignalStrength
     {L"循环次数", L"Cycles"}, // CycleCount
     {L"读", L"Read"}, // Read
@@ -212,8 +212,50 @@ const Entry strings[] = {
     {L"右侧", L"Right"},
     {L"左侧", L"Left"},
     {L"充满", L"Full"}, // TaskbarFull
+    {L"GPU 温度", L"GPU temp"}, // GpuTemp
+    {L"温度", L"Temp"}, // Temperature
+    {L"GPU°", L"GPU°"}, // TaskbarGpuTemp
+    {L"电源计划 · ", L"Power plan · "}, // PowerPlanPrefix
+    {L"未知", L"Unknown"}, // PowerPlanUnknown
+    {L"插电放电", L"AC + battery"}, // AssistChip
+    {L"外接电源 · 电池放电", L"External power · Battery discharging"}, // ExternalDischarge
+    {L"净放电", L"Net discharge"}, // NetDischarge
+    {L"节电", L"Saver"}, // BatterySaverShort
+    {L"采样中", L"Sampling"}, // MeterWarmup
+    {L"无计数器", L"No counter"}, // MeterNoCounter
+    {L"无此域", L"No domain"}, // MeterNoDomain
+    {L"读取失败", L"Read failed"}, // MeterReadFailed
+    {L"功耗诊断", L"Power diagnostics"}, // PowerDiagnostics
+    {L"无法写入功耗诊断：{0}", L"Could not write the power diagnostic: {0}"}, // PowerDiagnosticsFailed
+    {L"诊断已写入，但无法打开文件：{0}", L"The diagnostic was written, but the file could not be opened: {0}"}, // PowerDiagnosticsOpenFailed
+    {L"无法启动功耗诊断（错误码：{0}）。", L"Could not start power diagnostics (error {0})."}, // PowerDiagnosticsLaunchFailed
+    {L"独显 ", L"dGPU "}, // DgpuPrefix
+    {L"独显休眠", L"dGPU idle"}, // DgpuSleeping
     {L"靠边吸附", L"Snap to screen edges"},
     {L"鼠标穿透（点击托盘图标恢复）", L"Click through (click tray icon to restore)"},
+    {L"未提供", L"N/A"},
+    {L"需位置权限", L"Location access needed"},
+    {L"未连接", L"Disconnected"},
+    {L"无无线网卡", L"No Wi-Fi adapter"},
+    {L"读取失败", L"Read failed"},
+    {L"Wi-Fi 位置权限设置…", L"Wi-Fi location permissions…"},
+    {L"GPU 选择", L"GPU selection"},
+    {L"自动（最忙的显卡）", L"Automatic (busiest GPU)"},
+    {L"所选显卡不可用", L"Selected GPU unavailable"},
+    {L"计数异常", L"Inconsistent"},
+    {L"迷你 / 任务栏", L"Mini / Taskbar"}, // MiniTaskbar
+    {L"1 秒", L"1 s"}, // RefreshOnePlain
+    {L"5 秒", L"5 s"}, // RefreshFive
+    {L"迷你不透明度", L"Mini opacity"}, // MiniOpacity
+    {L"全选", L"Select all"}, // SelectAll
+    {L"全不选", L"Select none"}, // SelectNone
+    {L"文字颜色", L"Text color"}, // TextColor
+    {L"恢复默认颜色", L"Reset colors"}, // ResetColors
+    {L"调整顺序", L"Reorder"}, // Reorder
+    {L"上移", L"Move up"}, // MoveUp
+    {L"下移", L"Move down"}, // MoveDown
+    {L"移到最前", L"Move to first"}, // MoveFirst
+    {L"移到最后", L"Move to last"}, // MoveLast
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");
 Language current = Language::English;
