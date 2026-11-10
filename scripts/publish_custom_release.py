@@ -95,9 +95,12 @@ def main():
     gh('release', 'create', tag, *map(str, files), '--repo', REPO, '--target', commit,
        '--draft', '--title', 'Pulse 1.3.0 定制版 — 软件内下载更新',
        '--notes-file', str(ROOT/'dist-custom/release-notes.md'))
-    draft = api('releases/tags/'+tag)
+    # A draft's tag is not created until publication; resolve its release ID.
+    drafts = [r for r in api('releases?per_page=100') if r['tag_name'] == tag]
+    require(len(drafts) == 1, 'Expected one uploaded draft; inspect releases')
+    draft = api('releases/' + str(drafts[0]['id']))
     expected = {p.name: sha(p.read_bytes()) for p in files}
-    require(draft['draft'] and len(draft['assets']) == 3 and
+    require(draft['draft'] and draft['target_commitish'] == commit and len(draft['assets']) == 3 and
             {a['name']: a['digest'].removeprefix('sha256:') for a in draft['assets']} == expected,
             'Uploaded asset identity mismatch; draft retained')
     gh('release', 'edit', tag, '--repo', REPO, '--draft=false', '--latest')
