@@ -119,6 +119,14 @@ If these files exist, the script asks whether to remove them. Choosing Y deletes
 
 ## Usage
 
+### In-app updates
+
+The context menu's **Check for updates** entry shows the current custom version. After confirmation, Pulse downloads this repository's latest stable release, verifies SHA256, requests a normal exit, atomically replaces the executable, and restarts. The executable directory must be writable and Windows PowerShell 5.1 available; no automatic elevation is performed. Settings, portable `data`, shortcuts, and startup entries are preserved.
+
+Download/integrity failures or an application that does not exit prevent replacement. An immediate startup failure attempts to restore and restart the old executable. The previous EXE is retained beside the application as `.rollback-…`; a failed new executable is retained separately. Archive old backups when they reach the 128 MiB limit. A process remaining alive for several seconds does not prove every feature works. Releases must provide the ZIP, `release-manifest.json`, and `SHA256SUMS.txt`; the updater never switches to the original upstream channel.
+
+Checks are manual, with no startup or scheduled downloads. Close the progress window to cancel checking/downloading; once replacement starts, wait for completion. Development builds disable updates.
+
 - Drag an empty area of the window to move it. Its position is saved.
 - Double-click an empty area, or click the mode button, to switch between Full and Mini modes.
 - The pin button toggles Always on top, which is enabled by default.
@@ -224,7 +232,7 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 - This software is provided "as is", without warranty. You use it at your own risk, and the author is not liable for losses caused by its use. See [LICENSE](LICENSE) (MIT) for the governing terms.
 - Pulse reads system performance counters, battery information, processes, and network status. It changes system settings only when you choose Start with Windows. In a normal environment, runtime settings and logs are written only to `%LOCALAPPDATA%\Pulse`. Running Power diagnostics also writes `power-diagnostics.txt`; it is not uploaded. Toggling Start with Windows writes or deletes the `Pulse` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. The installer also copies the app and creates the shortcuts described above.
-- Network access is used only for latency measurement, by periodically requesting the three probe addresses listed above through the system proxy. Pulse does not collect or upload personal data over the network and has no analytics, telemetry, or automatic updates.
+- Latency measurement periodically requests the three probe addresses above through the system proxy. Manually choosing **Check for updates** also accesses this custom repository's GitHub Release metadata and assets. There is no analytics, telemetry, or upload of personal settings, and no startup or scheduled automatic update.
 - Logs are stored locally and are never uploaded.
 - Administrator privileges are used only for the FPS feature's ETW session. They are unnecessary if you do not need FPS.
 - `Pulse.exe` is not code-signed, so Windows SmartScreen may warn on first launch. You can select More info → Run anyway. Download only from this project's GitHub Releases.

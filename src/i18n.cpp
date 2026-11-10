@@ -57,6 +57,8 @@ const Entry strings[] = {
     {L"快捷方式已创建", L"Shortcut created."}, // ShortcutCreated
     {L"创建快捷方式失败（错误码：{0}）。", L"Could not create the shortcut (error code: {0})."}, // ShortcutFailed
     {L"打开日志", L"Open log"}, // OpenLog
+    {L"检查更新…", L"Check for updates…"}, // CheckUpdates
+    {L"无法启动更新检查。请确认 Windows PowerShell 可用且临时目录可写。", L"Could not start the updater. Check Windows PowerShell and temporary-folder access."}, // UpdateLaunchFailed
     {L"以管理员身份重启（显示帧数需要）", L"Restart as administrator (for FPS)"}, // RestartAdmin
     {L"退出", L"Exit"}, // Exit
     {L"恢复默认", L"Reset to defaults"}, // ResetDefaults

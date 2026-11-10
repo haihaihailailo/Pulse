@@ -42,6 +42,8 @@ enum class Key : std::size_t {
     ShortcutCreated,
     ShortcutFailed,
     OpenLog,
+    CheckUpdates,
+    UpdateLaunchFailed,
     RestartAdmin,
     Exit,
     ResetDefaults,

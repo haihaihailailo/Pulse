@@ -17,6 +17,10 @@ try {
     & $testExe
     if ($LASTEXITCODE -ne 0) { throw "feedback_selftest failed (exit $LASTEXITCODE)." }
 
+    $updateFixture = Join-Path ([IO.Path]::GetTempPath()) ('pulse-update-selftest-' + [Guid]::NewGuid().ToString('N'))
+    & $powershellExe -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'update_selftest.ps1') -FixtureRoot $updateFixture
+    if ($LASTEXITCODE -ne 0) { throw "update_selftest failed (exit $LASTEXITCODE)." }
+
     foreach ($test in @('install_params_selftest.ps1', 'uninstall_params_selftest.ps1')) {
         & $powershellExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $test)
         if ($LASTEXITCODE -ne 0) { throw "$test failed (exit $LASTEXITCODE)." }

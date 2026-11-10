@@ -7,6 +7,7 @@
 #include "window_interaction.h"
 #include "development_ui.h"
 #include "portable.h"
+#include "updater.h"
 #include <windowsx.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -66,6 +67,7 @@ constexpr UINT CmdShortcutDesktop = 111, CmdShortcutStartMenu = 112, CmdTaskbar 
 constexpr UINT CmdSnap = 114, CmdClickThrough = 115;
 constexpr UINT CmdWifiPermissions = 116, CmdGpu = 1200;
 constexpr UINT CmdPowerDiagnostics = 117;
+constexpr UINT CmdUpdate = 118;
 constexpr UINT CmdTaskbarComponent = 700;
 constexpr UINT CmdTaskbarPosition = 750;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
@@ -1013,6 +1015,16 @@ private:
         HMENU menu = BuildMenu();
         require(menu && (GetMenuState(menu, CmdSnap, MF_BYCOMMAND) & MF_CHECKED) &&
                 !(GetMenuState(menu, CmdClickThrough, MF_BYCOMMAND) & MF_GRAYED), "Interaction menu state mismatch");
+        require((GetMenuState(menu, CmdUpdate, MF_BYCOMMAND) & MF_GRAYED) != 0,
+                "Development updater must be visibly disabled");
+        wchar_t updateText[160]{};
+        GetMenuStringW(menu, CmdUpdate, updateText, 160, MF_BYCOMMAND);
+        require(std::wstring(updateText).find(update::Version) != std::wstring::npos,
+                "Update menu must show its exact release version");
+        const auto updateResource = FindResourceW(instance_, MAKEINTRESOURCEW(201), RT_RCDATA);
+        require(updateResource && SizeofResource(instance_, updateResource) > 1000,
+                "Standalone executable must embed its updater");
+        require(update::TestHelperLaunch(), "Private embedded updater extraction/PowerShell launch failed");
         DestroyMenu(menu);
 
         // Independent expected coordinates, including a monitor left of the primary display.
@@ -1900,9 +1912,11 @@ private:
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         if (FpsNeedsAdmin())
             AppendMenuW(menu, MF_STRING, CmdRestartAdmin, T(Key::RestartAdmin).c_str());
+        const auto updateLabel = T(Key::CheckUpdates) + L" (" + update::Version + L")";
+        AppendMenuW(menu, MF_STRING, CmdUpdate, updateLabel.c_str());
         AppendMenuW(menu, MF_STRING, CmdExit, T(Key::Exit).c_str());
 #ifdef PULSE_DEVELOPMENT
-        for (UINT id : {CmdPowerDiagnostics, CmdTaskbar, CmdStartup, CmdShortcutDesktop, CmdShortcutStartMenu,
+        for (UINT id : {CmdUpdate, CmdPowerDiagnostics, CmdTaskbar, CmdStartup, CmdShortcutDesktop, CmdShortcutStartMenu,
                         CmdRestartAdmin, CmdLog, CmdNetworkNotify, CmdNotifySound,
                         CmdFullComponent + static_cast<UINT>(FullComponent::Fps),
                         CmdCompactComponent + static_cast<UINT>(CompactComponent::Fps)})
@@ -1925,6 +1939,13 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if (command == CmdUpdate) {
+#ifndef PULSE_DEVELOPMENT
+            if (!update::Start(window_, i18n::CurrentLanguage() == i18n::Language::English))
+                MessageBoxW(window_, T(Key::UpdateLaunchFailed).c_str(), L"Pulse", MB_OK | MB_ICONWARNING);
+#endif
+            return;
+        }
         if (command == CmdWifiPermissions) {
 #ifndef PULSE_DEVELOPMENT
             ShellExecuteW(window_, L"open", L"ms-settings:privacy-location", nullptr, nullptr, SW_SHOWNORMAL);

@@ -3,9 +3,16 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: 'Successful Build run ID, already trial-tested locally'
+        required: true
+        type: string
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -14,6 +21,7 @@ concurrency:
 jobs:
   # Build, package and publish in sequence; there is no MSVC dependency.
   mingw:
+    if: github.event_name != 'workflow_dispatch'
     name: Release with MinGW x64
     runs-on: windows-latest
     steps:
@@ -111,3 +119,19 @@ jobs:
           }
           gh @releaseArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  custom:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'haihaihailailo/Pulse'
+    name: Publish verified custom build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify CI identity, package and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PULSE_BUILD_RUN: ${{ inputs.build_run }}
+        run: python scripts/publish_custom_release.py
