@@ -53,14 +53,15 @@ def package(out, exe, artifact, run, commit):
     files = [archive, out/'release-manifest.json']
     (out/'SHA256SUMS.txt').write_bytes(''.join(sha(p.read_bytes())+'  '+p.name+'\n' for p in files).encode())
     files.append(out/'SHA256SUMS.txt')
-    notes = ('新增软件内更新：右键检查新版，确认后直接下载、校验、正常退出、替换并重启；保留个性化设置。\n\n'
-             '- 下载及 EXE SHA256、版本、大小和来源校验；失败回退旧程序，不自动提权。\n'
-             '- 更新器嵌入 EXE，无需附加脚本；默认不在启动时或定时联网检查。\n'
-             '- 合并上游 1.3.0，保留显卡选择、自动缩放、吸附、鼠标穿透和配置兼容。\n'
-             '- 旧版没有更新入口，首次请下载此 ZIP；后续正式版本可在软件内更新。\n\n'
+    notes = ('稳定性与低占用优化，保留个性化设置和软件内下载更新。\n\n'
+             '- CPU、内存采集按显示需求启停，保留频率、内存详情和任务栏组件所需数据。\n'
+             '- 暂停时释放 CPU 查询，恢复时重新建立采样区间；未知读数显示 --，避免误报为零。\n'
+             '- 修正更新下载超时检查，已完成的异步读取也受整次下载期限约束。\n'
+             '- 保留上游 1.3.0、显卡选择、自动缩放、吸附、鼠标穿透及配置兼容；没有新增依赖。\n\n'
+             '已有 custom-2026.11.10.2 可右键「检查更新」后下载替换；更早无更新入口的版本请手动下载。\n'
              '下载 ZIP 解压运行，附来源清单和 SHA256。普通设置和便携 data 不包含在包内。\n'
-             '本地双分支构建、合成下载/替换/回退、原生菜单与独立配置重开验证通过。'
-             '真实在线升级安装及全部硬件场景未在本轮执行。\n\n'
+             '功能改动已通过本地受保护回归；本版本通过 Windows MinGW/MSVC 构建、定向回归和准确产物的独立配置重开验证。'
+             '尚未量化长期占用改善；真实在线升级安装及全部硬件场景未在本轮执行。\n\n'
              f'源码：https://github.com/{REPO}/commit/{commit}\n'
              f'CI：https://github.com/{REPO}/actions/runs/{run}\n\n'
              '旧 Release 保留供回退；回退前正常退出并备份个人设置。\n')
@@ -93,7 +94,7 @@ def main():
     existing = api('releases?per_page=100')
     require(all(r['tag_name'] != tag for r in existing), 'Release exists; inspect it before retrying')
     gh('release', 'create', tag, *map(str, files), '--repo', REPO, '--target', commit,
-       '--draft', '--title', 'Pulse 1.3.0 定制版 — 软件内下载更新',
+       '--draft', '--title', 'Pulse 1.3.0 定制版 — 稳定与低占用优化',
        '--notes-file', str(ROOT/'dist-custom/release-notes.md'))
     # A draft's tag is not created until publication; resolve its release ID.
     drafts = [r for r in api('releases?per_page=100') if r['tag_name'] == tag]
