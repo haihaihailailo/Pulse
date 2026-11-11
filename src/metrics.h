@@ -10,6 +10,9 @@
 #include <vector>
 
 namespace pulse {
+#ifdef PULSE_DEVELOPMENT
+namespace diagnostics { bool SensorContracts(); }
+#endif
 
 enum class NetState { Checking, Online, Slow, Offline };
 
@@ -67,7 +70,7 @@ struct Snapshot {
     bool offline_by_latency = false;  // 断网原因是延迟过高
 
     // —— CPU / 内存 / 进程 ——
-    double cpu_percent = 0, mem_percent = 0;
+    double cpu_percent = NAN, mem_percent = NAN;
     std::vector<ProcUsage> top_procs; // 最多 3 个，不含本程序
     double self_cpu_percent = NAN;    // 本程序自身
 
@@ -176,6 +179,8 @@ struct Wants {
     bool process_count = false;   // Cheap count, independent of the top-three scan.
     bool gpu_temp = false;
     bool dgpu_power = false; // Full hardware card only; D0-gated NVML.
+    bool cpu_usage = true;   // Defaults preserve diagnostic callers; UI opts out when hidden.
+    bool memory_usage = true;
 };
 
 class Metrics {
@@ -210,6 +215,9 @@ public:
     void SetGpuAdapter(const std::wstring& id);
 
 private:
+#ifdef PULSE_DEVELOPMENT
+    friend bool diagnostics::SensorContracts();
+#endif
     struct Impl;
     Impl* impl_;
 };

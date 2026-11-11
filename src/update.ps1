@@ -48,11 +48,14 @@ function PulseUi {
     }
 }
 function WaitTask($task,$watch) {
+    PulseUi
+    if($watch.Elapsed.TotalSeconds -gt 90){throw 'Download timed out.'}
     while(-not $task.IsCompleted) {
         PulseUi
         if($watch.Elapsed.TotalSeconds -gt 90){throw 'Download timed out.'}
         Start-Sleep -Milliseconds 50
     }
+    if($watch.Elapsed.TotalSeconds -gt 90){throw 'Download timed out.'}
     $task.GetAwaiter().GetResult()
 }
 # Redirects are explicitly bounded and constrained to GitHub's asset hosts.

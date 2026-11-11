@@ -1205,6 +1205,29 @@ void CheckUiPreferences() {
 }  // namespace
 
 int main() {
+    {
+        using namespace pulse;
+        using namespace pulse::ui;
+        Components c;
+        c.full.fill(false); c.compact.fill(false); c.taskbar.fill(false);
+        for (auto mode : {DisplayMode::Full, DisplayMode::Compact, DisplayMode::Taskbar}) {
+            const auto w = CollectionWants(c, mode);
+            Expect(!w.cpu_usage && !w.memory_usage, "hidden CPU/memory opt out of collection");
+        }
+        c.compact[static_cast<size_t>(CompactComponent::Cpu)] = true;
+        auto w = CollectionWants(c, DisplayMode::Compact);
+        Expect(w.cpu_usage && !w.memory_usage, "CPU-only strip does not collect memory");
+        c.taskbar[static_cast<size_t>(CompactComponent::Memory)] = true;
+        w = CollectionWants(c, DisplayMode::Taskbar, true);
+        Expect(!w.cpu_usage && w.memory_usage, "taskbar details retain visible strip requirements");
+        c.full[static_cast<size_t>(FullComponent::SystemInfo)] = true;
+        w = CollectionWants(c, DisplayMode::Full);
+        Expect(!w.cpu_usage && !w.memory_usage && w.cpu_freq && w.memory_detail,
+               "system details independently retain frequency and memory collection");
+        const Snapshot unavailable;
+        Expect(std::isnan(unavailable.cpu_percent) && std::isnan(unavailable.mem_percent),
+               "unavailable CPU and memory are not fabricated zero");
+    }
     CheckProbeHttpStatus();
     CheckClassifier();
     CheckAcDischargeDebounce();

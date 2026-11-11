@@ -24,6 +24,12 @@ Reject {AllowedUrl 'https://github.com.evil.test/test'} 'Host spoof'
 Reject {AllowedUrl 'https://user:pass@github.com/test'} 'Credentials'
 Reject {AllowedUrl 'https://github.com:444/test'} 'Unexpected port'
 $null=AllowedUrl 'https://release-assets.githubusercontent.com/github-production-release-asset/test?sig=test'
+# Even an already-completed read must obey the whole-download deadline.
+$completion=[Threading.Tasks.TaskCompletionSource[int]]::new()
+$completion.SetResult(7); $completed=$completion.Task
+$expired=[pscustomobject]@{Elapsed=[TimeSpan]::FromSeconds(91)}
+Reject {WaitTask $completed $expired} 'Completed read after total deadline'
+Require ((WaitTask $completed ([Diagnostics.Stopwatch]::StartNew())) -eq 7) 'Completed read within deadline.'
 # Exercise the real streaming/redirect client without issuing any network request.
 Add-Type -ReferencedAssemblies ([Net.Http.HttpMessageHandler].Assembly.Location) -TypeDefinition @'
 using System;

@@ -117,7 +117,9 @@ constexpr unsigned kWantScheme = 1u << 12;
 constexpr unsigned kWantCount = 1u << 13;
 constexpr unsigned kWantGpuTemp = 1u << 14;
 constexpr unsigned kWantDgpuPower = 1u << 15;
-constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc;
+constexpr unsigned kWantCpuUsage = 1u << 16;
+constexpr unsigned kWantMemUsage = 1u << 17;
+constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc | kWantCpuUsage | kWantMemUsage;
 
 static_assert(sizeof(void*) == 8, "x64 only");
 static_assert(sizeof(BATTERY_INFORMATION) == 36, "BATTERY_INFORMATION size");
@@ -1393,6 +1395,8 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.process_count) bits |= kWantCount;
     if (w.gpu_temp) bits |= kWantGpuTemp;
     if (w.dgpu_power) bits |= kWantDgpuPower;
+    if (w.cpu_usage) bits |= kWantCpuUsage;
+    if (w.memory_usage) bits |= kWantMemUsage;
     return bits;
 }
 
@@ -1414,6 +1418,8 @@ constexpr Wants UnpackWants(unsigned bits) {
     w.process_count = (bits & kWantCount) != 0;
     w.gpu_temp = (bits & kWantGpuTemp) != 0;
     w.dgpu_power = (bits & kWantDgpuPower) != 0;
+    w.cpu_usage = (bits & kWantCpuUsage) != 0;
+    w.memory_usage = (bits & kWantMemUsage) != 0;
     return w;
 }
 
@@ -1425,6 +1431,7 @@ constexpr Wants FpsWantOnly() {
     wants.gpu_usage = false;
     wants.processes = false;
     wants.fps = true;
+    wants.cpu_usage = wants.memory_usage = false;
     return wants;
 }
 static_assert(PackWants(FpsWantOnly()) == kWantFps, "fps want bit");
@@ -2756,6 +2763,11 @@ Wants Metrics::Impl::CurrentWants() const {
 }
 
 void Metrics::Impl::ClearTurnedOff(Snapshot& s, const Wants& w) {
+    if (!w.cpu_usage && !w.cpu_freq) {
+        s.cpu_percent = s.cpu_time_percent = s.cpu_utility_percent = NAN;
+        s.cpu_from_utility = false;
+    }
+    if (!w.memory_usage && !w.memory_detail) s.mem_percent = NAN;
     if (!w.chip_power) {
         s.pkg_w = NAN;
         s.cpu_w = NAN;
@@ -3629,6 +3641,11 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (!wants.processes) ReleaseProcs();
     if (!wants.disk_io) ReleaseDisk();
     if (!wants.cpu_freq) ReleaseCpuFreq();
+    if (!wants.cpu_usage && !wants.cpu_freq) {
+        ReleaseCpuQuery();
+        have_cpu_ = false;
+        last_.cpu_percent = NAN;
+    }
     if (!wants.gpu_memory) ReleaseGpuMem();
     if (!wants.gpu_temp) ReleaseGpuTemp();
     if (!wants.dgpu_power && (dgpu_.gate.api.module || dgpu_.gate.retry_at || dgpu_.last_gate != DgpuStatus::Off ||
@@ -3650,6 +3667,7 @@ Snapshot Metrics::Impl::Take(bool full) {
         ReleaseEnergy();
         ReleaseGpu();
         have_net_ = have_cpu_ = have_tick_ = false;
+        last_.cpu_percent = NAN; // Resume/mode switch must not display a pre-pause CPU rate.
         disk_warmed_ = cpu_freq_warmed_ = cpu_utility_warmed_ = false;
         have_disk_due_ = have_cpu_query_tick_ = false;
         if (!full && pdh_buf_.size() > 65536) std::vector<unsigned char>(65536).swap(pdh_buf_);
@@ -3657,6 +3675,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     if (paused_.load(std::memory_order_relaxed)) {
         // A hidden widget must not keep a system-wide Present consumer.
         ReleaseFps(L"paused");
+        ReleaseCpuQuery();
         dgpu_.Reset();
         last_.dgpu_status = DgpuStatus::Off;
         last_.dgpu_w = NAN;
@@ -3694,8 +3713,10 @@ Snapshot Metrics::Impl::Take(bool full) {
         } else if (!ActiveGpu()) ChooseGpu(adapters_.empty() ? 0 : adapters_.front().luid);
     }
     UpdateNet(s, now);
-    UpdateCpu(s, now, wants.cpu_freq);
-    UpdateMem(s, wants.memory_detail);
+    if (wants.cpu_usage || wants.cpu_freq) UpdateCpu(s, now, wants.cpu_freq);
+    else s.cpu_percent = NAN;
+    if (wants.memory_usage || wants.memory_detail) UpdateMem(s, wants.memory_detail);
+    else s.mem_percent = NAN;
     UpdateBattery(s, now, dt, has_dt);
     if (wants.power_scheme) {
         UpdateScheme(now);
@@ -3784,6 +3805,29 @@ Snapshot Metrics::Sample(bool full) { return impl_->Take(full); }
 void Metrics::SetWants(const Wants& w) { impl_->ApplyWants(w); }
 #ifdef PULSE_DEVELOPMENT
 bool diagnostics::SensorContracts() {
+    // Exercise actual collection/PDH lifetime, including re-enabling after pause.
+    {
+        Metrics metrics;
+        auto wants = UnpackWants(0);
+        metrics.SetWants(wants);
+        auto sample = metrics.Sample(false);
+        if (!std::isnan(sample.cpu_percent) || !std::isnan(sample.mem_percent) ||
+            metrics.impl_->cpu_query_ || metrics.impl_->have_cpu_) return false;
+        wants.cpu_usage = wants.memory_usage = true;
+        metrics.SetWants(wants);
+        sample = metrics.Sample(false);
+        if (!std::isnan(sample.cpu_percent)) return false; // Fresh interval, not a stale rate.
+        metrics.SetPaused(true);
+        metrics.Sample(false);
+        if (metrics.impl_->cpu_query_) return false;
+        metrics.SetPaused(false);
+        sample = metrics.Sample(false);
+        if (!std::isnan(sample.cpu_percent)) return false;
+        metrics.SetWants(UnpackWants(0));
+        sample = metrics.Sample(false);
+        if (!std::isnan(sample.cpu_percent) || !std::isnan(sample.mem_percent) ||
+            metrics.impl_->cpu_query_ || metrics.impl_->have_cpu_) return false;
+    }
     BatterySample battery{true, true, true, true, false, false, true, 0};
     auto idle = ClassifyBattery(battery);
     if (idle.mode != PowerMode::AcIdle || !idle.rate_valid || idle.rate_mw != 0 || idle.show_watts) return false;

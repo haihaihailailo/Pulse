@@ -119,6 +119,8 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
     if (display == DisplayMode::Taskbar) c.compact = c.taskbar;
     const bool package = NeedsPackagePower(trace);
     Wants w;
+    w.cpu_usage = compact ? c.Enabled(CompactComponent::Cpu) : c.Enabled(FullComponent::Hardware);
+    w.memory_usage = compact ? c.Enabled(CompactComponent::Memory) : c.Enabled(FullComponent::Hardware);
     w.chip_power = compact ? c.Enabled(CompactComponent::Power) && package :
         c.Enabled(FullComponent::Hardware) || (c.Enabled(FullComponent::PowerChart) && package);
     w.gpu_usage = compact ? c.Enabled(CompactComponent::Gpu) : c.Enabled(FullComponent::Hardware);
@@ -142,6 +144,8 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
         w.gpu_usage = w.gpu_usage || strip.gpu_usage;
         w.disk_io = w.disk_io || strip.disk_io;
         w.cpu_freq = w.cpu_freq || strip.cpu_freq;
+        w.cpu_usage = w.cpu_usage || strip.cpu_usage;
+        w.memory_usage = w.memory_usage || strip.memory_usage;
         w.fps = w.fps || strip.fps;
         w.gpu_temp = w.gpu_temp || strip.gpu_temp;
     }
