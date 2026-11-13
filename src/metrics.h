@@ -1,9 +1,10 @@
 // metrics.h —— Pulse 原生版：后端数据模块与界面之间的唯一接口。
-// 后端（metrics.cpp / netprobe.cpp，由 Grok 实现）只负责采样，界面（Codex 实现）只读 Snapshot。
+// 后端（metrics.cpp / netprobe.cpp）负责采样，界面只读 Snapshot。
 // 约定：数值未知时用 NaN（double）或 -1（整数），界面显示 "--"。
 #pragma once
 #include "power_state.h"
 #include "dgpu_state.h"
+#include "peripheral_state.h"
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -41,6 +42,7 @@ struct GpuAdapter {
 };
 
 struct Snapshot {
+    PeripheralSnapshot peripherals;
     // —— 电池 ——
     PowerMode mode = PowerMode::Unknown;
     int percent = -1;                 // 0..100
@@ -181,6 +183,7 @@ struct Wants {
     bool dgpu_power = false; // Full hardware card only; D0-gated NVML.
     bool cpu_usage = true;   // Defaults preserve diagnostic callers; UI opts out when hidden.
     bool memory_usage = true;
+    bool peripherals = false;
 };
 
 class Metrics {

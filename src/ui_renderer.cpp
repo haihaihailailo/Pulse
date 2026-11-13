@@ -765,6 +765,21 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             Bar(Rect(25, y + 63, content, 4), v.wifi, Down, Charge);
             break;
         }
+        case FullComponent::Peripherals: {
+            Panel(card);
+            const float y = card.top;
+            Text(T(Key::Peripherals), Rect(25,y+9,content,18),11.5f,Muted);
+            for (size_t i=0;i<v.peripherals.size() && i<4;++i) {
+                const auto& device=v.peripherals[i]; const float row=y+34+static_cast<float>(i)*32;
+                const auto color=device.percent < 0 ? Faint : device.percent <= 20 ? Danger : Charge;
+                Text(device.name,Rect(25,row,content-65,18),11.5f,TextColor);
+                Text(device.percent < 0 ? L"--" : std::to_wstring(device.percent)+L"%",
+                     Rect(right-60,row,60,18),12,color,true,true,true);
+                Bar(Rect(25,row+23,content,3),device.percent < 0 ? -1.0f : device.percent/100.0f,color,color);
+            }
+            Text(v.peripheralHint,Rect(25,y+167,content,14),9,Faint);
+            break;
+        }
         case FullComponent::BatteryHealth: {
             Panel(card);
             const float y = card.top;

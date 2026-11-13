@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "metrics.h"
 #include "i18n.h"
 #include <array>
@@ -14,7 +14,7 @@ enum class DisplayMode { Full, Compact, Taskbar };
 
 enum class FullComponent : std::size_t {
     Hardware, Battery, PowerChart, Network, Processes, DiskIO, SystemDisk,
-    SystemInfo, GpuMemory, Wifi, BatteryHealth, Fps, Count
+    SystemInfo, GpuMemory, Wifi, BatteryHealth, Fps, Peripherals, Count
 };
 enum class CompactComponent : std::size_t {
     Battery, Eta, Power, Cpu, Memory, Gpu, Network, Latency, DiskIO, CpuFrequency, Fps, GpuTemp, Count
@@ -37,7 +37,8 @@ inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(FullComponen
     {L"gpu_memory", Key::GpuMemory, false, 84},
     {L"wifi", Key::Wifi, false, 80},
     {L"battery_health", Key::BatteryHealth, false, 78},
-    {L"fps", Key::Fps, false, 72}
+    {L"fps", Key::Fps, false, 72},
+    {L"peripherals", Key::Peripherals, true, 188}
 }};
 inline constexpr std::array<ComponentInfo, static_cast<std::size_t>(CompactComponent::Count)> CompactComponents{{
     {L"battery", Key::BatteryPercent, true, 68},
@@ -57,7 +58,7 @@ inline constexpr std::array<FullComponent, FullComponents.size()> FullOrder{{
     FullComponent::Hardware, FullComponent::Battery, FullComponent::PowerChart,
     FullComponent::Network, FullComponent::DiskIO, FullComponent::SystemDisk,
     FullComponent::SystemInfo, FullComponent::GpuMemory, FullComponent::Wifi,
-    FullComponent::BatteryHealth, FullComponent::Fps, FullComponent::Processes
+    FullComponent::BatteryHealth, FullComponent::Peripherals, FullComponent::Fps, FullComponent::Processes
 }};
 inline constexpr auto TaskbarComponents = [] {
     auto items = CompactComponents;
@@ -111,6 +112,8 @@ struct Process {
 
 // Canonical display values. Only enabled components are populated or compared.
 struct View {
+    std::vector<PeripheralBattery> peripherals;
+    std::wstring peripheralHint;
     PowerMode mode = PowerMode::Unknown;
     PowerTrace powerTrace = PowerTrace::Unknown;
     NetState netState = NetState::Checking;

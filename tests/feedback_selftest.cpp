@@ -12,6 +12,7 @@
 #include "ui_prefs.h"
 #include "power_diagnostics.h"
 #include "probe_status.h"
+#include "receiver_protocol.h"
 
 #include <windows.h>
 
@@ -1205,6 +1206,45 @@ void CheckUiPreferences() {
 }  // namespace
 
 int main() {
+    {
+        using namespace pulse;
+        using namespace pulse::ui;
+        Expect(peripheral::Percentage(0)==0 && peripheral::Percentage(100)==100 &&
+            peripheral::Percentage(101)==-1 && peripheral::Percentage(255)==-1, "battery percent keeps zero and rejects unknown sentinels");
+        std::vector<PeripheralBattery> devices;
+        peripheral::Merge(devices,{L"a",L"Mouse",-1});
+        peripheral::Merge(devices,{L"a",L"Mouse HID",72});
+        peripheral::Merge(devices,{L"b",L"Mouse HID",0});
+        Expect(devices.size()==2 && devices[0].percent==72 && devices[1].percent==0,
+            "service nodes deduplicate by identity, never by shared display name");
+        Expect(peripheral::CleanName(L"Name\nInjected")==L"Name Injected", "device labels cannot add lines");
+        Expect(peripheral::ReceiverName(0x3554,0xf503) && peripheral::ReceiverName(0x373b,0x1031) &&
+            !peripheral::ReceiverName(0x373b,0xffff) && !peripheral::ReceiverName(0xffff,0xf503),
+            "receiver requests require exact known vendor/product pairs");
+        auto reply=peripheral::BatteryRequest();
+        Expect(peripheral::ReceiverPercentage(reply.data(),16)==-1,"truncated HID report rejected");
+        reply[6]=100; reply[16]=static_cast<uint8_t>(0x49-100);
+        Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==100,"valid receiver battery frame accepted");
+        reply[6]=0; reply[16]=0x49;
+        Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==0,"receiver zero is a real percentage");
+        reply[1]=5;
+        Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==-1,"unrelated reply rejected");
+        reply[1]=4; reply[16]^=1;
+        Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==-1,"bad checksum rejected");
+        reply[6]=255; reply[16]=0x4a;
+        Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==-1,"receiver unknown sentinel rejected");
+        Components c; c.full.fill(false); c.full[static_cast<size_t>(FullComponent::Peripherals)]=true;
+        Expect(CollectionWants(c,DisplayMode::Full).peripherals && !CollectionWants(c,DisplayMode::Compact).peripherals &&
+            !CollectionWants(c,DisplayMode::Taskbar).peripherals && CollectionWants(c,DisplayMode::Taskbar,true).peripherals,
+            "only visible peripheral card requests collection");
+        Model m; Snapshot s; s.peripherals.state=PeripheralState::Ready; s.peripherals.devices=devices;
+        m.Update(s,false,c);
+        Expect(m.Data().peripherals.size()==2 && m.Data().peripherals[1].percent==0,"real zero displayed");
+        s.peripherals.devices[0].percent=200;
+        Expect(m.Update(s,false,c) && m.Data().peripherals[0].percent==-1,"invalid readings redraw as unknown");
+        s.peripherals.devices.clear(); m.Update(s,false,c);
+        Expect(m.Data().peripherals.empty() && m.Data().peripheralHint==T(Key::NoPeripherals),"removed devices do not leave stale battery rows");
+    }
     {
         using namespace pulse;
         using namespace pulse::ui;

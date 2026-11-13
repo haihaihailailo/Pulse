@@ -220,6 +220,7 @@ enum class Key : std::size_t {
     MiniTaskbar, RefreshOnePlain, RefreshFive, MiniOpacity,
     SelectAll, SelectNone, TextColor, ResetColors, Reorder,
     MoveUp, MoveDown, MoveFirst, MoveLast,
+    Peripherals, NoPeripherals, PeripheralSource, MorePeripherals,
     Count
 };
 namespace detail {

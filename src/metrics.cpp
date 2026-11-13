@@ -28,6 +28,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include "peripheral_battery.h"
 #include <tlhelp32.h>
 #include "fpsmon.h"
 #include <powrprof.h>
@@ -119,6 +120,7 @@ constexpr unsigned kWantGpuTemp = 1u << 14;
 constexpr unsigned kWantDgpuPower = 1u << 15;
 constexpr unsigned kWantCpuUsage = 1u << 16;
 constexpr unsigned kWantMemUsage = 1u << 17;
+constexpr unsigned kWantPeripherals = 1u << 18;
 constexpr unsigned kWantDefault = kWantChip | kWantGpu | kWantProc | kWantCpuUsage | kWantMemUsage;
 
 static_assert(sizeof(void*) == 8, "x64 only");
@@ -1397,6 +1399,7 @@ constexpr unsigned PackWants(const Wants& w) {
     if (w.dgpu_power) bits |= kWantDgpuPower;
     if (w.cpu_usage) bits |= kWantCpuUsage;
     if (w.memory_usage) bits |= kWantMemUsage;
+    if (w.peripherals) bits |= kWantPeripherals;
     return bits;
 }
 
@@ -1420,6 +1423,7 @@ constexpr Wants UnpackWants(unsigned bits) {
     w.dgpu_power = (bits & kWantDgpuPower) != 0;
     w.cpu_usage = (bits & kWantCpuUsage) != 0;
     w.memory_usage = (bits & kWantMemUsage) != 0;
+    w.peripherals = (bits & kWantPeripherals) != 0;
     return w;
 }
 
@@ -1832,9 +1836,14 @@ struct Metrics::Impl {
     Impl& operator=(const Impl&) = delete;
 
     Snapshot Take(bool full);
-    void ApplyWants(const Wants& wants) { want_bits_.store(PackWants(wants), std::memory_order_release); }
+    void ResumePeripherals() { peripherals_.Enable(!paused_.load() && CurrentWants().peripherals); }
+    void ApplyWants(const Wants& wants) {
+        want_bits_.store(PackWants(wants), std::memory_order_release);
+        peripherals_.Enable(wants.peripherals && !paused_.load());
+    }
 
     NetProbe probe;
+    PeripheralMonitor peripherals_;
     std::atomic<bool> paused_{false};
     std::atomic<bool> reset_intervals_{false};
     Snapshot last_{};
@@ -3705,6 +3714,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     have_tick_ = true;
 
     Snapshot s;
+    if (wants.peripherals) s.peripherals = peripherals_.Snapshot();
     if (wants.gpu_usage || wants.gpu_memory || wants.gpu_temp || wants.dgpu_power) {
         RefreshAdapters(now);
         if (!selected_gpu_.empty()) {
@@ -3870,6 +3880,7 @@ void Metrics::SetGpuAdapter(const std::wstring& id) {
 
 void Metrics::SetPaused(bool paused) {
     const bool was_paused = impl_->paused_.exchange(paused, std::memory_order_relaxed);
+    impl_->ResumePeripherals();
     if (was_paused && !paused) impl_->reset_intervals_.store(true, std::memory_order_release);
 }
 
@@ -3879,9 +3890,10 @@ void Metrics::SetProbeEnabled(bool enabled) { impl_->probe.SetEnabled(enabled); 
 
 void Metrics::SetSlowThreshold(int slow_ms) { impl_->probe.SetSlowThreshold(slow_ms); }
 
-void Metrics::OnSuspend() { impl_->probe.OnSuspend(); }
+void Metrics::OnSuspend() { impl_->peripherals_.Enable(false); impl_->probe.OnSuspend(); }
 
 void Metrics::OnResume() {
+    impl_->ResumePeripherals();
     impl_->dgpu_.Reset();
     impl_->reset_intervals_.store(true, std::memory_order_release);
     impl_->probe.OnResume();

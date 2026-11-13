@@ -32,10 +32,13 @@ def package(out, exe, artifact, run, commit):
     out.mkdir(exist_ok=True, parents=True)
     require(not any(out.iterdir()), 'Package directory must be empty')
     manifest = dict(repository=REPO, tag=tag, commit=commit, fileVersion=version,
-                    architecture='Windows x64', compiler='MinGW', ciRun=run,
-                    ciArtifact=artifact['id'], ciZipSha256=artifact['digest'].removeprefix('sha256:'),
+                    architecture='Windows x64', compiler='MinGW',
                     executable=dict(name='Pulse.exe', bytes=len(exe), sha256=sha(exe)),
                     binaryUnmodified=True, license='MIT')
+    if artifact is not None:
+        manifest.update(ciRun=run, ciArtifact=artifact['id'], ciZipSha256=artifact['digest'].removeprefix('sha256:'))
+    else:
+        manifest.update(compiler='LLVM-MinGW', build='Protected local release, independently trial-tested')
     data = (json.dumps(manifest, ensure_ascii=False, indent=2)+'\n').encode('utf-8')
     (out / 'release-manifest.json').write_bytes(data)
     archive = out / ('Pulse-' + tag + '-win-x64.zip')
@@ -65,6 +68,17 @@ def package(out, exe, artifact, run, commit):
              f'源码：https://github.com/{REPO}/commit/{commit}\n'
              f'CI：https://github.com/{REPO}/actions/runs/{run}\n\n'
              '旧 Release 保留供回退；回退前正常退出并备份个人设置。\n')
+    if tag == 'custom-2026.11.13.1':
+        notes = ('新增外设电量卡片，保留软件内下载更新和现有配置。\n\n'
+                 '- 显示设备名称、百分比与低电量颜色；未上报显示 --，真实 0% 保留。\n'
+                 '- 后台每 60 秒刷新；关闭卡片、暂停或进入不显示卡片的模式时停止查询。\n'
+                 '- 支持 Windows 上报电量的蓝牙鼠标、键盘和耳机，以及部分 VGN/ATK/VXE 接收器。\n'
+                 '- VGN：3554:F503/F505/F50B；VXE：3554:F58A/F58D/F58E、373B:104D/1040；ATK：373B:1031/11D9。其他型号不保证支持。\n'
+                 '- 酷雨键盘接收器尚无专用协议适配；OPPO 耳机依赖 Windows 上报。用户具体设备尚未实测。\n\n'
+                 '源码编译、异常数据处理、卡片开关保存和原生界面验证通过；下载包使用同一验收 EXE，附来源清单和 SHA256。\n'
+                 '已有带更新功能的定制版可右键「检查更新」下载替换；也可下载 ZIP 解压使用。\n'
+                 '普通设置和便携 data 不包含在包内。旧版本保留供回退，回退前正常退出并备份个人设置。\n\n'
+                 f'源码：https://github.com/{REPO}/commit/{commit}\n')
     (out/'release-notes.md').write_bytes(notes.encode())
     return tag, files
 

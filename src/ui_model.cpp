@@ -1,4 +1,4 @@
-﻿#include "ui_model.h"
+#include "ui_model.h"
 #include <algorithm>
 #include <cmath>
 #include <ctime>
@@ -137,6 +137,7 @@ Wants CollectionWants(const Components& components, DisplayMode display, bool de
     w.gpu_temp = compact ? c.Enabled(CompactComponent::GpuTemp) : c.Enabled(FullComponent::GpuMemory);
     w.wifi = !compact && c.Enabled(FullComponent::Wifi);
     w.battery_health = !compact && c.Enabled(FullComponent::BatteryHealth);
+    w.peripherals = !compact && c.Enabled(FullComponent::Peripherals);
     w.fps = compact ? c.Enabled(CompactComponent::Fps) : c.Enabled(FullComponent::Fps);
     if (display == DisplayMode::Taskbar && details) {
         const auto strip = CollectionWants(components, DisplayMode::Taskbar, false, trace);
@@ -216,6 +217,7 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
     if (c.Enabled(FullComponent::BatteryHealth) &&
         std::tie(health, cycles) != std::tie(r.health, r.cycles)) return false;
     if (c.Enabled(FullComponent::Fps) && std::tie(fps, fpsAdmin) != std::tie(r.fps, r.fpsAdmin)) return false;
+    if (c.Enabled(FullComponent::Peripherals) && std::tie(peripherals, peripheralHint) != std::tie(r.peripherals, r.peripheralHint)) return false;
     return true;
 }
 
@@ -518,6 +520,20 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             v.wifiSsid = s.wifi_status == WifiStatus::Connected ? s.wifi_ssid : T(status);
             v.wifi = s.wifi_signal < 0 ? -1 : Fraction(s.wifi_signal);
             v.wifiSignal = s.wifi_signal < 0 ? T(status) : Percent(s.wifi_signal, 0);
+        }
+        if (c.Enabled(FullComponent::Peripherals)) {
+            v.peripherals = s.peripherals.devices;
+            for (auto& device : v.peripherals) {
+                device.name = peripheral::CleanName(std::move(device.name));
+                device.percent = device.percent >= 0 && device.percent <= 100 ? device.percent : -1;
+            }
+            v.peripheralHint = T(s.peripherals.state == PeripheralState::Reading ? Key::Reading :
+                s.peripherals.state == PeripheralState::Unavailable ? Key::SensorReadFailed :
+                v.peripherals.empty() ? Key::NoPeripherals : Key::PeripheralSource);
+            if (v.peripherals.size() > 4) {
+                v.peripheralHint = i18n::Format(Key::MorePeripherals,{std::to_wstring(v.peripherals.size()-4)});
+                v.peripherals.resize(4);
+            }
         }
         if (c.Enabled(FullComponent::BatteryHealth)) {
             v.health = Known(s.battery_health_percent) ? Number(s.battery_health_percent, 1) + L"%" : L"--";

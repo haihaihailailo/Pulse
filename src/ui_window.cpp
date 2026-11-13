@@ -1,4 +1,4 @@
-﻿#include "ui_window.h"
+#include "ui_window.h"
 #include "ui_renderer.h"
 #include "ui_taskbar.h"
 #include "metrics.h"
@@ -1037,7 +1037,7 @@ private:
         require(r.left == -1895 && r.top == -75, "Drag away did not release snap");
         r = SnapToWorkArea({-1903, 300, -1703, 400}, syntheticWork, 18);
         require(r.left == -1920 && r.top == 300, "DPI-scaled snap distance failed");
-        // Independent regression examples: all 12 cards are 1320 DIP tall.
+        // Independent geometry regressions for the historical 1320 DIP layout.
         require(WorkAreaZoom(70, 320, 1320, 168, {0, 0, 2560, 1516}) == 65,
                 "Full panel did not fit the reported high-DPI work area");
         require(WorkAreaZoom(70, 320, 1320, 96, {0, 0, 1920, 1080}) == 70 &&
@@ -1123,7 +1123,7 @@ private:
         require(!CollectionWants(config_.components, DisplayMode::Full).fps,
                 "Synthetic FPS layout enabled the real collector");
         RECT client{}; GetClientRect(window_, &client);
-        require(FullLayout(config_.components).height == 1320 && config_.zoom == 70 &&
+        require(FullLayout(config_.components).height == 1516 && config_.zoom == 70 &&
                 GetPrivateProfileIntW(L"Window", L"zoom", 0, config_.file.c_str()) == 70,
                 "Full layout or saved preferred zoom changed");
         if (Pixels(ContentHeight(), dpi_, MinimumZoom) <= work.bottom-work.top &&
@@ -1144,6 +1144,11 @@ private:
         sample.dgpu_status = DgpuStatus::Valid; sample.dgpu_w = 18.8; sample.gpu_percent = 32;
         sample.gpu_shared_mem_mb = 150; sample.gpu_dedicated_mem_mb = 1200; sample.gpu_temp_c = 52;
         sample.wifi_status = WifiStatus::PermissionRequired; sample.battery_cycles = -1;
+        sample.peripherals.state = PeripheralState::Ready;
+        sample.peripherals.devices = {{L"test-mouse",L"测试鼠标 / Mouse",15},
+            {L"test-keyboard",L"测试折叠键盘 / Keyboard",100},
+            {L"test-earbuds",L"测试蓝牙耳机 / Headphones",0},
+            {L"test-unknown",L"未报告电量的设备 / Unknown",-1}};
         model_.Update(sample, false, config_.components);
         require(model_.Data().watt == L"0.0" && model_.Data().pph == L"0.0" &&
             model_.Data().wifiSsid == T(Key::WifiPermissionRequired) && model_.Data().cycles == T(Key::NotReported),
@@ -1182,6 +1187,14 @@ private:
             require(effectiveZoom_ == 70 && config_.zoom == 70, "Removing cards did not restore preferred zoom");
         config_.components = previousComponents;
         Reconfigure(false);
+        const bool peripheralsBefore = config_.components.Enabled(FullComponent::Peripherals);
+        Command(CmdFullComponent + static_cast<UINT>(FullComponent::Peripherals));
+        require(config_.components.Enabled(FullComponent::Peripherals) != peripheralsBefore &&
+                GetPrivateProfileIntW(L"Full",L"peripherals",-1,config_.file.c_str()) == !peripheralsBefore,
+                "Peripheral card menu did not persist its selection");
+        Command(CmdFullComponent + static_cast<UINT>(FullComponent::Peripherals));
+        require(config_.components.Enabled(FullComponent::Peripherals) == peripheralsBefore,
+                "Peripheral card selection did not restore");
         SetMode(DisplayMode::Compact);
         require(effectiveZoom_ == 70, "Full-panel fit leaked into compact mode");
         if (config_.pinned != previousPinned) TogglePin();
