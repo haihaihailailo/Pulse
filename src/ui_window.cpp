@@ -1,6 +1,7 @@
 #include "ui_window.h"
 #include "ui_renderer.h"
 #include "ui_taskbar.h"
+#include "ui_settings.h"
 #include "metrics.h"
 #include "netprobe.h"
 #include "development.h"
@@ -68,6 +69,8 @@ constexpr UINT CmdSnap = 114, CmdClickThrough = 115;
 constexpr UINT CmdWifiPermissions = 116, CmdGpu = 1200;
 constexpr UINT CmdPowerDiagnostics = 117;
 constexpr UINT CmdUpdate = 118;
+constexpr UINT CmdSettings = 119;
+constexpr UINT CmdSettingsCompact = 3200, CmdSettingsTaskbar = 3300;
 constexpr UINT CmdTaskbarComponent = 700;
 constexpr UINT CmdTaskbarPosition = 750;
 constexpr UINT CmdFullComponent = 200, CmdCompactComponent = 300;
@@ -343,7 +346,11 @@ struct Config {
             colors[i] = ParseTextColor(value);
         }
     }
-    void SaveMiniPreferences(const wchar_t* section, const ComponentOrder& order, const TextColors& colors) const {
+    bool SaveMiniPreferences(const wchar_t* section, const ComponentOrder& order, const TextColors& colors) const {
+        bool ok = true;
+        const auto WritePrivateProfileStringW = [&](LPCWSTR a,LPCWSTR b,LPCWSTR c,LPCWSTR d) {
+            const BOOL result = ::WritePrivateProfileStringW(a,b,c,d); ok = result && ok; return result;
+        };
         const auto value = FormatComponentOrder(order);
         WritePrivateProfileStringW(section, L"order", value.c_str(), file.c_str());
         for (size_t i = 0; i < CompactComponents.size(); ++i) {
@@ -351,6 +358,7 @@ struct Config {
             const auto color = FormatTextColor(colors[i]);
             WritePrivateProfileStringW(section, key.c_str(), color.empty() ? nullptr : color.c_str(), file.c_str());
         }
+        return ok;
     }
     bool ReadComponent(const wchar_t* section, const ComponentInfo& info) const {
         wchar_t value[16]{};
@@ -434,8 +442,12 @@ struct Config {
 #endif
         return true;
     }
-    void Save() const {
-        if (file.empty()) return;
+    bool Save() const {
+        if (file.empty()) return false;
+        bool ok = true;
+        const auto WritePrivateProfileStringW = [&](LPCWSTR a,LPCWSTR b,LPCWSTR c,LPCWSTR d) {
+            const BOOL result = ::WritePrivateProfileStringW(a,b,c,d); ok = result && ok; return result;
+        };
         WritePrivateProfileStringW(L"Hardware", L"gpu", gpu.c_str(), file.c_str());
         const auto sx = std::to_wstring(x), sy = std::to_wstring(y);
         WritePrivateProfileStringW(L"Window", L"X", sx.c_str(), file.c_str());
@@ -459,8 +471,8 @@ struct Config {
         WritePrivateProfileStringW(L"Window", L"mini_refresh_ms", miniInterval.c_str(), file.c_str());
         const auto opacity = std::to_wstring(appearance.opacity);
         WritePrivateProfileStringW(L"Compact", L"opacity", opacity.c_str(), file.c_str());
-        SaveMiniPreferences(L"Compact", components.compactOrder, appearance.compact);
-        SaveMiniPreferences(L"Taskbar", components.taskbarOrder, appearance.taskbar);
+        ok = SaveMiniPreferences(L"Compact", components.compactOrder, appearance.compact) && ok;
+        ok = SaveMiniPreferences(L"Taskbar", components.taskbarOrder, appearance.taskbar) && ok;
         const auto slow = std::to_wstring(slow_ms);
         WritePrivateProfileStringW(L"Network", L"slow_ms", slow.c_str(), file.c_str());
         WritePrivateProfileStringW(L"Network", L"notify", notify ? L"1" : L"0", file.c_str());
@@ -471,6 +483,7 @@ struct Config {
             WritePrivateProfileStringW(L"Compact", CompactComponents[i].key, components.compact[i] ? L"1" : L"0", file.c_str());
         for (size_t i = 0; i < TaskbarComponents.size(); ++i)
             WritePrivateProfileStringW(L"Taskbar", TaskbarComponents[i].key, components.taskbar[i] ? L"1" : L"0", file.c_str());
+        return ok;
     }
 };
 
@@ -666,6 +679,7 @@ class Application {
 public:
     explicit Application(HINSTANCE instance) : instance_(instance) {}
     ~Application() {
+        settingsWindow_.Close();
         callbackWindow_.store(nullptr, std::memory_order_release);
         metrics_.reset();
         taskbar_.Close();
@@ -800,6 +814,7 @@ public:
         MSG message{};
         BOOL result;
         while ((result = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+            if (settingsWindow_.Translate(message)) continue;
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -1001,7 +1016,7 @@ private:
         RECT r{};
         if (GetWindowRect(window_, &r)) { config_.x = r.left; config_.y = r.top; }
     }
-    void Save() { CapturePosition(); config_.Save(); }
+    void Save() { CapturePosition(); settingsSaved_ = config_.Save(); }
 #ifdef PULSE_DEVELOPMENT
     void InteractionSmoke(development::UiPeer& peer, bool capture) {
         auto require = [](bool condition, const char* message) {
@@ -1231,6 +1246,46 @@ private:
         Command(CmdClickThrough); Command(CmdClickThrough);
         require(!config_.clickThrough && GetPrivateProfileIntW(L"Window", L"click_through", 1, config_.file.c_str()) == 0,
                 "Disabling click-through was not saved");
+        // Exercise real modeless controls through the shared command/save path.
+        auto drainSettings=[&] {
+            MSG message{};int count=0;
+            while(count++<200&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
+                if(!settingsWindow_.Translate(message)){TranslateMessage(&message);DispatchMessageW(&message);}
+            }
+        };
+        const auto previousLanguage=config_.language;
+        Command(CmdLanguage+1);
+        Command(CmdSettings);
+        require(settingsWindow_.Handle()&&IsWindowVisible(settingsWindow_.Handle()),"Settings did not open");
+        const HWND settingsHandle=settingsWindow_.Handle();
+        Command(CmdSettings);require(settingsWindow_.Handle()==settingsHandle,"Duplicate settings window");
+        drainSettings();
+        if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-general.bmp").c_str());
+        settingsWindow_.SelectPageForTest(2);
+        const UINT peripheralCommand=CmdFullComponent+static_cast<UINT>(FullComponent::Peripherals);
+        const bool oldPeripheral=config_.components.Enabled(FullComponent::Peripherals);
+        HWND peripheralControl=settingsWindow_.ControlForTest(peripheralCommand);
+        require(peripheralControl&&IsWindowEnabled(peripheralControl),"Settings peripheral control missing");
+        SendMessageW(peripheralControl,BM_CLICK,0,0);drainSettings();
+        require(config_.components.Enabled(FullComponent::Peripherals)!=oldPeripheral&&settingsSaved_,"Settings toggle did not apply/save");
+        require(GetPrivateProfileIntW(L"Full",L"peripherals",-1,config_.file.c_str())==!oldPeripheral,"Settings toggle INI mismatch");
+        if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-components.bmp").c_str());
+        settingsWindow_.Close();Command(CmdSettings);settingsWindow_.SelectPageForTest(2);
+        peripheralControl=settingsWindow_.ControlForTest(peripheralCommand);
+        require((SendMessageW(peripheralControl,BM_GETCHECK,0,0)==BST_CHECKED)==!oldPeripheral,"Settings reopen lost value");
+        SendMessageW(peripheralControl,BM_CLICK,0,0);drainSettings();
+        settingsWindow_.SelectPageForTest(0);
+        HWND languageControl=settingsWindow_.ControlForTest(CmdLanguage+2);
+        require(languageControl!=nullptr,"Settings language control missing");
+        SendMessageW(languageControl,CB_SETCURSEL,2,0);
+        SendMessageW(GetParent(languageControl),WM_COMMAND,MAKEWPARAM(GetDlgCtrlID(languageControl),CBN_SELCHANGE),reinterpret_cast<LPARAM>(languageControl));
+        drainSettings();require(config_.language==i18n::Preference::English,"Settings combo did not apply language");
+        settingsWindow_.SelectPageForTest(5);
+        SetWindowPos(settingsWindow_.Handle(),nullptr,0,0,700,460,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        drainSettings();
+        if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-english-narrow.bmp").c_str());
+        settingsWindow_.Close();require(!settingsWindow_.Handle(),"Settings close left window alive");
+        SetLanguage(previousLanguage);
     }
 #endif
     RECT SnapDrag(RECT candidate) {
@@ -1746,7 +1801,7 @@ private:
         static COLORREF custom[16]{}; // Process lifetime only; no disk writes.
         CHOOSECOLORW choice{};
         choice.lStructSize = sizeof(choice);
-        choice.hwndOwner = window_;
+        choice.hwndOwner = settingsWindow_.Handle() ? settingsWindow_.Handle() : window_;
         choice.rgbResult = initial;
         choice.lpCustColors = custom;
         choice.Flags = CC_RGBINIT | CC_FULLOPEN | CC_ANYCOLOR | CC_ENABLEHOOK;
@@ -1760,9 +1815,113 @@ private:
         colors[i] = rgb;
         ColorsChanged(taskbar);
     }
+    const wchar_t* SettingsText(const wchar_t* zh, const wchar_t* en) const {
+        return i18n::CurrentLanguage() == i18n::Language::English ? en : zh;
+    }
+    static bool FindSetting(HMENU menu, UINT command, SettingOption& option) {
+        for (int i=0;i<GetMenuItemCount(menu);++i) {
+            wchar_t label[512]{};
+            MENUITEMINFOW info{};info.cbSize=sizeof(info);info.fMask=MIIM_ID|MIIM_STATE|MIIM_SUBMENU|MIIM_STRING;
+            info.dwTypeData=label;info.cch=511;
+            if (!GetMenuItemInfoW(menu,i,TRUE,&info)) continue;
+            if (info.hSubMenu) { if(FindSetting(info.hSubMenu,command,option))return true; }
+            else if(info.wID==command) {
+                option={label,command,(info.fState&MFS_CHECKED)!=0,(info.fState&MFS_DISABLED)==0};return true;
+            }
+        }
+        return false;
+    }
+    std::vector<SettingsPage> SettingsPages() {
+        HMENU menu=BuildMenu();
+        if(!menu)throw std::runtime_error("Settings menu unavailable");
+        struct MenuOwner {HMENU value;~MenuOwner(){DestroyMenu(value);}} owner{menu};
+        using Kind=SettingRow::Kind;
+        std::vector<SettingsPage> pages;
+        auto page=[&](const wchar_t* zh,const wchar_t* en) { pages.push_back({SettingsText(zh,en),{}}); };
+        auto option=[&](UINT command) { SettingOption item;item.command=command;item.enabled=false;FindSetting(menu,command,item);return item; };
+        auto single=[&](UINT command,Kind kind,const wchar_t* label=nullptr) {
+            auto item=option(command);
+            if(!item.label.empty() || label)pages.back().rows.push_back({label?label:item.label,kind,{item}});
+        };
+        auto choice=[&](const std::wstring& label,UINT base,size_t count) {
+            SettingRow row{label,Kind::Choice,{}};
+            for(size_t i=0;i<count;++i)row.options.push_back(option(base+static_cast<UINT>(i)));
+            pages.back().rows.push_back(std::move(row));
+        };
+        auto note=[&](const wchar_t* zh,const wchar_t* en) {pages.back().rows.push_back({SettingsText(zh,en),Kind::Note,{}});};
+        page(L"常规",L"General");
+        SettingRow mode{SettingsText(L"显示模式",L"Display mode"),Kind::Choice,{option(CmdFull),option(CmdCompact),option(CmdTaskbar)}};
+        pages.back().rows.push_back(std::move(mode));
+        choice(T(Key::LanguageMenu),CmdLanguage,Languages.size());
+        for(UINT id:{CmdPin,CmdSnap,CmdClickThrough,CmdStartup})single(id,Kind::Toggle);
+        note(L"鼠标穿透开启后，可从系统托盘打开设置。",L"With click-through enabled, open settings from the system tray.");
+        if(portable::Enabled())note(L"便携模式不修改自启和快捷方式。",L"Portable mode leaves startup and shortcuts unchanged.");
+#ifdef PULSE_DEVELOPMENT
+        note(L"开发试用：自启、任务栏嵌入、网络提醒和外部操作已禁用。",L"Development trial: startup, taskbar integration, network alerts and external actions are disabled.");
+#endif
+        page(L"外观与位置",L"Appearance");
+        choice(T(Key::Size),CmdZoom,ZoomLevels.size());
+        if(std::find(ZoomLevels.begin(),ZoomLevels.end(),config_.zoom)==ZoomLevels.end())
+            pages.back().rows.back().options.push_back({std::to_wstring(config_.zoom)+L"%",0,true,false});
+        choice(T(Key::MiniOpacity),CmdMiniOpacity,MiniOpacities.size());
+        choice(T(Key::TaskbarPositionMenu),CmdTaskbarPosition,3);
+        note(L"大小影响监控面板；设置窗口使用系统显示缩放。",L"Size affects the monitor panel. Settings use Windows display scaling.");
+        page(L"完整模式组件",L"Full panel");
+        for(size_t i=0;i<FullComponents.size();++i)single(CmdFullComponent+static_cast<UINT>(i),Kind::Toggle);
+        single(CmdSelect,Kind::Action);single(CmdSelect+1,Kind::Action);
+        single(CmdDefaults,Kind::Action,SettingsText(L"恢复三种模式的默认组件",L"Restore components in all modes"));
+        for(bool taskbar:{false,true}) {
+            page(taskbar?L"任务栏组件":L"迷你模式组件",taskbar?L"Taskbar items":L"Mini items");
+            const auto& order=taskbar?config_.components.taskbarOrder:config_.components.compactOrder;
+            const auto& enabled=taskbar?config_.components.taskbar:config_.components.compact;
+            const auto selected=taskbar?settingsTaskbar_:settingsCompact_;
+            const UINT base=taskbar?CmdTaskbarComponent:CmdCompactComponent;
+            for(auto c:order)single(base+static_cast<UINT>(c),Kind::Toggle);
+            single(CmdSelect+(taskbar?4:2),Kind::Action);single(CmdSelect+(taskbar?5:3),Kind::Action);
+            SettingRow target{SettingsText(L"调整颜色与顺序",L"Color and order for"),Kind::Choice,{}};
+            for(auto c:order)target.options.push_back({T(CompactComponents[static_cast<size_t>(c)].label),
+                (taskbar?CmdSettingsTaskbar:CmdSettingsCompact)+static_cast<UINT>(c),c==selected,true});
+            pages.back().rows.push_back(std::move(target));
+            const UINT color=(taskbar?CmdTaskbarColor:CmdCompactColor)+static_cast<UINT>(selected);
+            const auto colorLabel=SettingsText(L"选择文字颜色…",L"Choose text color…");
+            single(color,Kind::Action,colorLabel);
+            const Key moveLabels[]={Key::MoveUp,Key::MoveDown,Key::MoveFirst,Key::MoveLast};
+            for(UINT i=0;i<4;++i)single((taskbar?CmdTaskbarMove:CmdCompactMove)+static_cast<UINT>(selected)*4+i,
+                Kind::Action,T(moveLabels[i]).c_str());
+            single(CmdResetColors+(taskbar?1:0),Kind::Action);
+            if(!enabled[static_cast<size_t>(selected)])note(L"先勾选该组件，再调整颜色或顺序。",L"Enable this item before changing its color or order.");
+        }
+        page(L"采样与通知",L"Sampling & alerts");
+        choice(SettingsText(L"完整模式刷新间隔",L"Full panel refresh"),CmdRefresh,RefreshIntervals.size());
+        choice(T(Key::MiniTaskbar)+L" · "+T(Key::RefreshInterval),CmdMiniRefresh,MiniRefreshIntervals.size());
+        choice(T(Key::GpuSelection),CmdGpu,gpuChoices_.size()+1);
+        if(!config_.gpu.empty()&&std::none_of(gpuChoices_.begin(),gpuChoices_.end(),[&](const auto& gpu){return gpu.id==config_.gpu;}))
+            pages.back().rows.back().options.push_back({T(Key::GpuUnavailable),0,true,false});
+        choice(T(Key::SlowThreshold),CmdSlowThreshold,SlowThresholds.size());
+        single(CmdNetworkNotify,Kind::Toggle);single(CmdNotifySound,Kind::Toggle);
+        note(L"外设电量每 60 秒刷新；不显示电量卡片时停止查询。",L"Peripheral batteries refresh every 60 seconds, only while their card is needed.");
+        page(L"工具与更新",L"Tools & updates");
+        note((std::wstring(L"Pulse · ")+update::Version).c_str(),(std::wstring(L"Pulse · ")+update::Version).c_str());
+        for(UINT id:{CmdUpdate,CmdWifiPermissions,CmdShortcutDesktop,CmdShortcutStartMenu,CmdPowerDiagnostics,CmdLog,CmdRestartAdmin})
+            single(id,Kind::Action);
+        return pages;
+    }
+    void OpenSettings() {
+        if(!settingsWindow_.Open(window_,[this]{return SettingsPages();},[this](UINT command) {
+            if(command>=CmdSettingsCompact&&command<CmdSettingsCompact+CompactComponents.size()) {
+                settingsCompact_=static_cast<CompactComponent>(command-CmdSettingsCompact);return settingsSaved_;
+            }
+            if(command>=CmdSettingsTaskbar&&command<CmdSettingsTaskbar+CompactComponents.size()) {
+                settingsTaskbar_=static_cast<CompactComponent>(command-CmdSettingsTaskbar);return settingsSaved_;
+            }
+            Command(command);return settingsSaved_;
+        }))MessageBoxW(window_,SettingsText(L"无法打开设置，请重试。",L"Could not open settings. Please try again."),L"Pulse",MB_OK|MB_ICONWARNING);
+    }
     HMENU BuildMenu() {
         HMENU menu = CreatePopupMenu();
         if (!menu) return nullptr;
+        AppendMenuW(menu,MF_STRING,CmdSettings,SettingsText(L"设置…",L"Settings…"));
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Full ? MF_CHECKED : 0), CmdFull, T(Key::FullMode).c_str());
         AppendMenuW(menu, MF_STRING | (Compact() ? MF_CHECKED : 0), CmdCompact, T(Key::MiniMode).c_str());
         AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Taskbar ? MF_CHECKED : 0), CmdTaskbar, T(Key::TaskbarMode).c_str());
@@ -1952,6 +2111,8 @@ private:
         if (command) Command(command);
     }
     void Command(UINT command) {
+        if(command==CmdSettings){OpenSettings();return;}
+        struct RefreshSettings {SettingsWindow& window;~RefreshSettings(){window.Refresh();}} refreshSettings{settingsWindow_};
         if (command == CmdUpdate) {
 #ifndef PULSE_DEVELOPMENT
             if (!update::Start(window_, i18n::CurrentLanguage() == i18n::Language::English))
@@ -2462,6 +2623,9 @@ private:
     ULONGLONG taskbarRetryAt_ = 0; // Checked on SampleTimer; no extra wakeups.
     Model model_;
     Config config_;
+    SettingsWindow settingsWindow_;
+    bool settingsSaved_ = true;
+    CompactComponent settingsCompact_ = CompactComponent::Battery, settingsTaskbar_ = CompactComponent::Network;
     std::unique_ptr<Metrics> metrics_;
     std::vector<GpuAdapter> gpuChoices_;
     std::vector<std::unique_ptr<Toast>> toasts_;

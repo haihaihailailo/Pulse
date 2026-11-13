@@ -43,6 +43,7 @@ def package(out, exe, artifact, run, commit):
     (out / 'release-manifest.json').write_bytes(data)
     archive = out / ('Pulse-' + tag + '-win-x64.zip')
     readme = ('Pulse '+tag+'\nUnzip into a separate folder and run Pulse.exe.\n'
+              'Right-click > Settings: appearance, components, sampling, notifications and update tools.\n'
               'Create an empty pulse-portable.ini beside the EXE BEFORE launch to use portable data.\n'
               'Right-click > Check for updates: download, verify, replace and restart; settings are preserved.\n'
               'Windows PowerShell 5.1 and write access to the executable directory are required.\n'
@@ -78,6 +79,17 @@ def package(out, exe, artifact, run, commit):
                  '源码编译、异常数据处理、卡片开关保存和原生界面验证通过；下载包使用同一验收 EXE，附来源清单和 SHA256。\n'
                  '已有带更新功能的定制版可右键「检查更新」下载替换；也可下载 ZIP 解压使用。\n'
                  '普通设置和便携 data 不包含在包内。旧版本保留供回退，回退前正常退出并备份个人设置。\n\n'
+                 f'源码：https://github.com/{REPO}/commit/{commit}\n')
+    if tag == 'custom-2026.11.14.1':
+        notes = ('新增集中设置页：右键菜单点击「设置…」即可打开。\n\n'
+                 '- 集中管理常规、外观与位置、完整模式组件、迷你模式组件、任务栏组件、采样与通知、工具与更新。\n'
+                 '- 支持组件开关、颜色和排序、缩放、语言、吸附与鼠标穿透等现有选项；修改即时应用并保存。\n'
+                 '- 使用独立原生窗口，支持 DPI 缩放、键盘操作与滚动；重复打开复用同一窗口。\n'
+                 '- 配置保存失败时显示提示；保留原有配置、外设电量卡片及软件内下载更新。\n\n'
+                 '设置打开、修改保存、关闭重开、语言切换和代表性界面验收已通过；正式下载包通过独立配置试运行，沿用同一验收 EXE。\n'
+                 '已有带更新功能的定制版可右键「检查更新」下载替换，也可下载 ZIP 解压使用。真实在线升级替换未在本轮执行。\n'
+                 '外设支持范围沿用上一版本，未新增接收器协议；用户具体设备仍未实测。\n'
+                 '包内不含个人设置、日志和调试文件；附来源清单及 SHA256。旧版本保留供回退，回退前正常退出并备份个人设置。\n\n'
                  f'源码：https://github.com/{REPO}/commit/{commit}\n')
     (out/'release-notes.md').write_bytes(notes.encode())
     return tag, files
