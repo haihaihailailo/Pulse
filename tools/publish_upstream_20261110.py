@@ -37,6 +37,14 @@ if stage == 'release-verify' and 'tag' in args:
     prepared=json.loads((OUT/'publication-plan.json').read_text(encoding='utf-8'))
     check(prepared['tag']==TAG and prepared['repository']==REPO and re.fullmatch('[0-9a-f]{40}',prepared['commit']), 'Invalid preparation')
     COMMIT=prepared['commit']
+elif stage == 'release-package' and 'tag' in args:
+    import re
+    TAG=args['tag']; COMMIT=args['commit']
+    check(re.fullmatch(r'custom-\d{4}\.\d{2}\.\d{2}\.\d+',TAG) and re.fullmatch('[0-9a-f]{40}',COMMIT),'Invalid package target')
+    executable=Path(args['artifactExe']).resolve()
+    check(executable.name=='Pulse.exe' and executable.parent.parent==ROOT/'dev-work/builds' and
+          re.fullmatch('release-[a-f0-9]{24}',executable.parent.name),'Exact local artifact required')
+    CI=executable.parent; OUT=ROOT/'dev-work/releases'/TAG
 elif stage not in ('release-import','release-source'):
     COMMIT=args.get('commit',COMMIT)
     check(COMMIT in ('c76c8f5da525e81c6d7d52dbd741d76a1c00336e','3087bb8c41cd58618809f44258a65333ab099321','f8001b2c69d3e03d602c76f2f8dedcdad27fc02f','2a118b31fbabbe99c45e55fc1810e02aefe3d45f','6bd690998893ee21e8df5fca2afcfa381cc499ab'),'Unapproved release commit')
@@ -52,10 +60,11 @@ elif stage not in ('release-import','release-source'):
 state=json.loads((ROOT/'.local-artifact-storage/state.json').read_text(encoding='utf-8'))
 check(state['last']['status']=='active' and state['last']['owner']=='pulse-upstream-release-20261110','Active release lease required')
 if stage=='release-source':
-    base='2a118b31fbabbe99c45e55fc1810e02aefe3d45f'
-    branch='codex/pulse-optimization-20261114'
-    tag='custom-2026.11.14.2'
-    check(args==dict(base=base,branch=branch,tag=tag),'Exact source publication authorization required')
+    scoped=isinstance(args.get('paths'),list)
+    base=args['base'] if scoped else '2a118b31fbabbe99c45e55fc1810e02aefe3d45f'
+    branch=args['branch'] if scoped else 'codex/pulse-optimization-20261114'
+    tag=args['tag'] if scoped else 'custom-2026.11.14.2'
+    check(set(args)==({'base','branch','tag','paths'} if scoped else {'base','branch','tag'}),'Exact source scope required')
     gh=Path(r'C:\Program Files\GitHub CLI\gh.exe');check(gh.is_file(),'Verified gh is missing')
     audit=ROOT/'dev-work/evidence'/('release-source-'+tag)
     progress=(audit/'source-progress.jsonl').open('x',encoding='utf-8')
@@ -67,6 +76,7 @@ if stage=='release-source':
         if payload is not None:
             body=json.dumps(payload,ensure_ascii=False).encode('utf-8');check(len(body)<1048576,'Git request bound')
             command+=['--method','POST','--input','-']
+            record('intent',dict(endpoint=tail,bodySha256=digest(body)))
         completed=subprocess.run(command,input=body,capture_output=True,timeout=30)
         check(completed.returncode==0,completed.stderr.decode('utf-8','replace')[:1000])
         check(len(completed.stdout)<4*1024*1024,'Git response bound')
@@ -80,22 +90,29 @@ if stage=='release-source':
            'src/peripheral_battery.h','src/peripheral_state.h','src/ui_model.cpp','src/ui_model.h',
            'src/ui_renderer.cpp','src/ui_renderer.h','src/ui_settings.cpp','src/ui_settings.h',
            'src/ui_window.cpp','src/update.ps1','tests/update_selftest.ps1','scripts/publish_custom_release.py']
+    if scoped: paths=args['paths']
+    check(len(paths)==len(set(paths)) and len(paths)<=128,'Bounded unique paths required')
     content={p:(ROOT/p).read_text(encoding='utf-8-sig').replace('\r\n','\n') for p in paths}
-    check(tag in content['src/updater.h'] and 'FILEVERSION 1,3,0,5' in content['app.rc'],'Source version mismatch')
+    check(tag in content['src/updater.h'] and 'FILEVERSION 1,3,0,' in content['app.rc'],'Source version mismatch')
     for text in content.values():
         check(str(PRIVATE_HOME) not in text and PRIVATE_HOME.as_posix() not in text,'Private source path')
     identities=[dict(path=p,sha256=digest(text.encode('utf-8')),bytes=len(text.encode('utf-8'))) for p,text in content.items()]
     record('prepared',dict(base=base,branch=branch,tag=tag,files=identities))
     base_tree=github('git/commits/'+base)['tree']['sha']
+    prior_tree=github('git/trees/'+base_tree+'?recursive=1')
+    check(not prior_tree.get('truncated'),'Base tree truncated')
+    prior={x['path']:x['sha'] for x in prior_tree['tree'] if x['type']=='blob'}
     rows=[]
     for p,text in content.items():
-        blob=github('git/blobs',dict(content=text,encoding='utf-8'))
         raw=text.encode('utf-8');expected=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
+        if prior.get(p)==expected: continue
+        blob=github('git/blobs',dict(content=text,encoding='utf-8'))
         check(blob['sha']==expected,'Remote blob differs: '+p)
         rows.append(dict(path=p,mode='100644',type='blob',sha=blob['sha']))
+    check(rows,'No source changes to publish')
     tree=github('git/trees',dict(base_tree=base_tree,tree=rows))
     for p,text in content.items():check((ROOT/p).read_text(encoding='utf-8-sig').replace('\r\n','\n')==text,'Source changed during upload')
-    commit=github('git/commits',dict(message='Optimize desktop interaction, background sampling and peripheral settings\n\nRelease '+tag,tree=tree['sha'],parents=[base]))
+    commit=github('git/commits',dict(message=('Fix peripheral discovery and battery protocols; automate safe artifact retirement' if scoped else 'Optimize desktop interaction, background sampling and peripheral settings')+'\n\nRelease '+tag,tree=tree['sha'],parents=[base]))
     record('commit-prepared',dict(commit=commit['sha'],tree=tree['sha']))
     github('git/refs',dict(ref='refs/heads/'+branch,sha=commit['sha']))
     check(github('git/ref/heads/'+branch)['object']['sha']==commit['sha'],'Published branch differs')
@@ -133,8 +150,8 @@ elif stage=='release-import':
         with (ci/n).open('xb') as f:f.write(b)
     write(ci/'artifact.json',dict(status='PASS',repository=REPO,commit=import_commit,ciRun=run['id'],artifactId=artifact['id'],ciZipSha256=digest(raw),executableSha256=digest(payload['Pulse.exe']),bytes=len(payload['Pulse.exe'])))
 elif stage=='release-package':
-    if TAG=='custom-2026.11.14.2':
-        source=json.loads((ROOT/'dev-work/evidence/release-source-custom-2026.11.14.2/source-receipt.json').read_text(encoding='utf-8'))
+    if TAG=='custom-2026.11.14.2' or 'tag' in args:
+        source=json.loads((ROOT/'dev-work/evidence'/('release-source-'+TAG)/'source-receipt.json').read_text(encoding='utf-8'))
         check(source['status']=='PASS' and source['commit']==COMMIT and source['tag']==TAG,'Verified source publication required')
         for item in source['files']:
             raw=(ROOT/item['path']).read_text(encoding='utf-8-sig').replace('\r\n','\n').encode('utf-8')
@@ -142,7 +159,7 @@ elif stage=='release-package':
     trial=Path(args['trialReceipt']);result=json.loads(trial.read_text(encoding='utf-8'))
     plan=json.loads(Path(str(trial).replace('-result.json','-plan.json')).read_text(encoding='utf-8'))
     check(result['status']=='PASS' and result['action']=='trial-test' and plan['artifact']['path']==str(CI/'Pulse.exe') and plan['artifact']['sha256']==sha(CI/'Pulse.exe'),'Exact trial required')
-    local=TAG in ('custom-2026.11.13.1','custom-2026.11.14.1','custom-2026.11.14.2')
+    local='artifactExe' in args or TAG in ('custom-2026.11.13.1','custom-2026.11.14.1','custom-2026.11.14.2')
     if local:
         build=json.loads((CI/'build.json').read_text(encoding='utf-8'))
         check(build['status']=='PASS' and build['kind']=='release','A verified release build is required')

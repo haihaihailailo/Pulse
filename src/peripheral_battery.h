@@ -1,6 +1,7 @@
 #pragma once
 #include "peripheral_state.h"
 #include "receiver_battery.h"
+#include "bluetooth_battery.h"
 #include <windows.h>
 #include <objbase.h>
 #include <setupapi.h>
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,24 +20,24 @@
 namespace pulse {
 namespace peripheral {
 
-// Cached Windows battery properties plus whitelisted receiver battery queries.
+// Independent device discovery, Windows cache, BLE and approved vendor queries.
 // No pairing, radio scan or synchronous hardware request on the UI thread.
-inline PeripheralSnapshot Read(const std::atomic<bool>& cancel) {
+inline PeripheralSnapshot Read(const std::atomic<bool>& cancel,std::map<std::wstring,std::wstring>& receiverPaths) {
     constexpr DEVPROPKEY battery{{0x104ea319,0x6ee2,0x4701,{0xbd,0x47,0x8d,0xdb,0xf4,0x25,0xbb,0xe5}},2};
     constexpr DEVPROPKEY life{{0x49cd1f76,0x5626,0x4b17,{0xa4,0xe8,0x18,0xb4,0xaa,0x1a,0x22,0x13}},10};
     constexpr DEVPROPKEY container{{0x8c7ed206,0x3f8a,0x4827,{0xb3,0xab,0xae,0x9e,0x1f,0xae,0xfc,0x6c}},2};
     constexpr DEVPROPKEY nodeStatus{{0x4340a6c5,0x93fa,0x4706,{0x97,0x2c,0x7b,0x64,0x80,0x08,0xa5,0xa7}},2};
     PeripheralSnapshot out;
+    std::map<ULONGLONG,std::wstring> bluetoothIdentities;
     HDEVINFO set = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
-    if (set == INVALID_HANDLE_VALUE) { out.state = PeripheralState::Unavailable; return out; }
-    struct Close { HDEVINFO h; ~Close() { SetupDiDestroyDeviceInfoList(h); } } close{set};
-    out.state = PeripheralState::Ready;
+    struct Close { HDEVINFO h; ~Close() { if(h!=INVALID_HANDLE_VALUE)SetupDiDestroyDeviceInfoList(h); } } close{set};
+    out.state = set==INVALID_HANDLE_VALUE?PeripheralState::Unavailable:PeripheralState::Ready;
     const auto until = GetTickCount64() + 3000;
-    for (DWORD index = 0; index < 2048 && !cancel.load(); ++index) {
-        if (GetTickCount64() >= until) { out.state = PeripheralState::Unavailable; out.devices.clear(); break; }
+    for (DWORD index = 0; set!=INVALID_HANDLE_VALUE && index < 2048 && !cancel.load(); ++index) {
+        if (GetTickCount64() >= until) { out.state = PeripheralState::Unavailable; break; }
         SP_DEVINFO_DATA info{}; info.cbSize = sizeof(info);
         if (!SetupDiEnumDeviceInfo(set, index, &info)) {
-            if (GetLastError() != ERROR_NO_MORE_ITEMS) { out.state = PeripheralState::Unavailable; out.devices.clear(); }
+            if (GetLastError() != ERROR_NO_MORE_ITEMS) out.state = PeripheralState::Unavailable;
             break;
         }
         wchar_t instance[512]{};
@@ -51,7 +53,8 @@ inline PeripheralSnapshot Read(const std::atomic<bool>& cancel) {
         for (const auto& key : {battery,life}) {
             unsigned value = 0;
             if (SetupDiGetDevicePropertyW(set, &info, &key, &type, reinterpret_cast<BYTE*>(&value), sizeof(value), &bytes, 0) &&
-                ((type == DEVPROP_TYPE_BYTE && bytes == 1) || (type == DEVPROP_TYPE_UINT32 && bytes == 4)))
+                ((type == DEVPROP_TYPE_BYTE && bytes == 1) || (type == DEVPROP_TYPE_UINT16 && bytes == 2) ||
+                 (type == DEVPROP_TYPE_UINT32 && bytes == 4)))
                 percent = Percentage(value);
             if (percent >= 0) break;
         }
@@ -70,10 +73,20 @@ inline PeripheralSnapshot Read(const std::atomic<bool>& cancel) {
             wchar_t text[40]{};
             if (StringFromGUID2(group,text,40)) identity = text;
         }
-        Merge(out.devices, {std::move(identity),name,percent});
+        if(root) {
+            const auto marker=id.find(L"DEV_");
+            if(marker!=std::wstring::npos && marker+16<=id.size()) {
+                const auto addressText=id.substr(marker+4,12);
+                if(std::all_of(addressText.begin(),addressText.end(),[](wchar_t c){return std::iswxdigit(c)!=0;}))
+                    bluetoothIdentities[std::wcstoull(addressText.c_str(),nullptr,16)]=identity;
+            }
+        }
+        PeripheralBattery row{std::move(identity),name,percent};row.source=L"Windows";
+        Merge(out.devices,std::move(row));
     }
-    if (!cancel.load()) ReadReceivers(out.devices,cancel);
-    if (!out.devices.empty()) out.state = PeripheralState::Ready;
+    if (!cancel.load()) ReadReceivers(out.devices,cancel,receiverPaths);
+    if (!cancel.load()) ReadClassicBluetooth(out.devices,bluetoothIdentities,cancel);
+    if (!cancel.load()) ReadBleBatteries(out.devices,cancel);
     std::sort(out.devices.begin(),out.devices.end(),[](const auto& a,const auto& b){return a.id < b.id;});
     return out;
 }
@@ -84,13 +97,16 @@ inline PeripheralSnapshot Read(const std::atomic<bool>& cancel) {
 class PeripheralMonitor {
 public:
     ~PeripheralMonitor() {
-        { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; cancel_ = true; }
+        { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; cancel_ = true;
+          if(workerHandle_)CancelSynchronousIo(workerHandle_); }
         wake_.notify_all(); if (worker_.joinable()) worker_.join();
+        if(workerHandle_)CloseHandle(workerHandle_);
     }
     void Enable(bool enabled) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (enabled_ == enabled) return;
         enabled_ = enabled; ++generation_; cancel_ = !enabled; sample_ = {};
+        if(!enabled && workerHandle_)CancelSynchronousIo(workerHandle_);
         if (enabled && !worker_.joinable()) {
             try { worker_ = std::thread([this]{ Run(); }); }
             catch (...) { enabled_ = false; sample_.state = PeripheralState::Unavailable; }
@@ -105,11 +121,12 @@ public:
 private:
     void Run() {
         std::unique_lock<std::mutex> lock(mutex_);
+        DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&workerHandle_,0,FALSE,DUPLICATE_SAME_ACCESS);
         while (!stop_) {
             wake_.wait(lock,[&]{return stop_ || enabled_;}); if (stop_) break;
             const auto generation = generation_; refresh_=false;lock.unlock();
             PeripheralSnapshot next;
-            try { next = peripheral::Read(cancel_); } catch (...) { next.state = PeripheralState::Unavailable; }
+            try { next = peripheral::Read(cancel_,receiverPaths_); } catch (...) { next.state = PeripheralState::Unavailable; }
             next.sampledAt=GetTickCount64();
             lock.lock();
             if (enabled_ && generation == generation_) sample_ = std::move(next);
@@ -122,5 +139,7 @@ private:
     bool enabled_ = false, stop_ = false; unsigned generation_ = 0;
     bool refresh_=false;unsigned long long requestedAt_=0;
     PeripheralSnapshot sample_;
+    HANDLE workerHandle_=nullptr;
+    std::map<std::wstring,std::wstring> receiverPaths_;
 };
 }

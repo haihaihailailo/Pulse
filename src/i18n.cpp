@@ -259,8 +259,8 @@ const Entry strings[] = {
     {L"移到最前", L"Move to first"}, // MoveFirst
     {L"移到最后", L"Move to last"}, // MoveLast
     {L"外设电量", L"Device batteries"},
-    {L"未发现可报告电量的外设", L"No reporting peripherals found"},
-    {L"60 秒刷新 · -- 为未上报", L"Refresh 60s · -- not reported"},
+    {L"未发现已连接或已配对的外设", L"No connected or paired peripherals found"},
+    {L"60 秒刷新 · 详情见外设管理", L"Refresh 60s · Details in settings"},
     {L"另有 {0} 台设备", L"{0} more devices"},
 };
 static_assert(sizeof(strings) / sizeof(strings[0]) == static_cast<std::size_t>(Key::Count), "i18n table size");

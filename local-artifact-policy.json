@@ -1,6 +1,16 @@
 {
   "schema_version": 1,
-  "automatic_cleanup": false,
+  "automatic_cleanup": true,
+  "retention": {
+    "schema_version": 1,
+    "authorization": "2026-11-14 user authorized exact 292-file retirement and future automatic retirement of unneeded registered artifacts; retain current candidates, published releases, rollback and necessary acceptance evidence.",
+    "trigger": "after-successful-acceptance-and-outer-finalization",
+    "keep_latest_failure_per_action": true,
+    "keep_recent_builds_per_kind": 2,
+    "keep_unknown_and_incomplete": true,
+    "keep_release_and_rollback_dependencies": true,
+    "scheduled_cleanup": false
+  },
   "project_budget_bytes": 1073741824,
   "minimum_free_bytes": 21474836480,
   "control_reserve_bytes": 1048576,
@@ -13,11 +23,11 @@
   "managed_directories": {
     "dev-work/builds": {
       "owner": "pulse-development-builds",
-      "maximum_bytes": 335544320
+      "maximum_bytes": 402653184
     },
     "dev-work/vm-sessions": {
       "owner": "pulse-development-sessions",
-      "maximum_bytes": 268435456,
+      "maximum_bytes": 335544320,
       "maximum_entries": 1024
     }
   },
@@ -25,6 +35,6 @@
     "maximum_age_days": 7,
     "maximum_bytes": 104857600
   },
-  "notes": "Builds and bounded session evidence are retained under explicit leases. No automatic deletion or scheduled cleanup. Ordinary log production is disabled in the development variant; smoke markers and resource receipts are critical test evidence. Stop at capacity or incomplete transactions.",
+  "notes": "Automatic retirement runs only after successful acceptance and outer finalization, under the same ledger lock and exact identity/reference checks. Keep candidates, release/rollback dependencies, critical receipts and latest failure checkpoints. Unknown/incomplete states stop retirement. No scheduled cleanup. Capacity limits unchanged.",
   "vm_migration_note": "2026-11-09 user authorized current-VM reserve adaptation; other resource and retention limits preserved."
 }

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Build','Release','Test','Debug','Run','Trial','Trial-Test','Capacity','Merge-Upstream','Script-Test','Workflow-Test','Release-Source','Release-Import','Release-Package','Release-Prepare','Release-Status','Release-Publish','Release-Verify','Reconcile-Wait','Reconcile-Capacity')][string]$Action = 'Test',
+    [ValidateSet('Build','Release','Test','Test-Continue','Debug','Run','Trial','Trial-Test','Capacity','Artifact-Status','Artifact-Review','Artifact-Retire','Merge-Upstream','Script-Test','Workflow-Test','Release-Source','Release-Import','Release-Package','Release-Prepare','Release-Status','Release-Publish','Release-Verify','Reconcile-Wait','Reconcile-Capacity')][string]$Action = 'Test',
     [ValidateSet('daily','idle')][string]$Profile = 'daily',
     [switch]$Interactive,
     [string]$ArtifactExe,
@@ -18,10 +18,10 @@ if ($Interactive) { $runnerArguments += '--interactive' }
 elseif ($Action -eq 'Trial-Test') { $runnerArguments += '--isolated' }
 if ($ArtifactExe) { $runnerArguments += $ArtifactExe }
 if ($PSBoundParameters.ContainsKey('RecoveryInput')) {
-    if ($Action -ne 'Reconcile-Capacity' -or $PSBoundParameters.ContainsKey('ReleaseInput')) { throw 'RecoveryInput only applies to capacity reconciliation.' }
+    if ($Action -notin @('Reconcile-Capacity','Test-Continue','Artifact-Retire') -or $PSBoundParameters.ContainsKey('ReleaseInput')) { throw 'RecoveryInput only applies to reconciliation, continuation or exact retirement.' }
     $RecoveryInput | & $config.node @runnerArguments
-} elseif ($Action -eq 'Reconcile-Capacity') {
-    throw 'Capacity reconciliation requires an explicitly authorized RecoveryInput.'
+} elseif ($Action -in @('Reconcile-Capacity','Test-Continue','Artifact-Retire')) {
+    throw 'Reconciliation/continuation requires exact RecoveryInput.'
 } elseif ($PSBoundParameters.ContainsKey('ReleaseInput')) {
     if ($Action -notin @('Release-Source','Release-Import','Release-Package','Release-Prepare','Release-Status','Release-Publish','Release-Verify')) { throw 'ReleaseInput only applies to release stages.' }
     $ReleaseInput | & $config.node @runnerArguments

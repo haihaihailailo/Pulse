@@ -1279,6 +1279,10 @@ private:
             {L"test-keyboard",L"测试折叠键盘 / Keyboard",100},
             {L"test-earbuds",L"测试蓝牙耳机 / Headphones",0},
             {L"test-unknown",L"未报告电量的设备 / Unknown",-1}};
+        sample.peripherals.devices[2].left=0;sample.peripherals.devices[2].right=75;sample.peripherals.devices[2].chargingCase=100;
+        sample.peripherals.devices[2].source=L"OPPO / HeyMelody";
+        sample.peripherals.devices[3].status=BatteryStatus::Unsupported;
+        sample.peripherals.devices[3].detail=L"VID 3554 · PID FFFF";
         model_.Update(sample, false, config_.components);
         require(model_.Data().watt == L"0.0" && model_.Data().pph == L"0.0" &&
             model_.Data().wifiSsid == T(Key::WifiPermissionRequired) && model_.Data().cycles == T(Key::NotReported),
@@ -2232,8 +2236,13 @@ private:
             pages.back().rows.push_back({SettingsText(L"隐藏此设备",L"Hide this device"),Kind::Toggle,{{L"",CmdDeviceHidden,saved!=config_.devices.end()&&saved->hidden,true}}});
             pages.back().rows.push_back({SettingsText(L"将此设备置于最前",L"Move this device first"),Kind::Action,{{L"",CmdDeviceFirst,false,true}}});
             const auto device=std::find_if(deviceChoices_.begin(),deviceChoices_.end(),[&](const auto& d){return d.id==selectedDevice_;});
-            const auto status=device->percent<0?SettingsText(L"未上报电量或设备已离线",L"Battery not reported or device offline"):(std::to_wstring(device->percent)+L"%");
+            const bool english=i18n::CurrentLanguage()==i18n::Language::English;
+            auto status=device->percent<0?std::wstring(peripheral::StatusText(device->status,english)):(std::to_wstring(device->percent)+L"%");
+            const auto parts=peripheral::ComponentsText(*device,english);
+            if(!parts.empty())status+=L" · "+parts;
             note(status.c_str(),status.c_str());
+            if(!device->source.empty())note(device->source.c_str(),device->source.c_str());
+            if(!device->detail.empty())note(device->detail.c_str(),device->detail.c_str());
         } else note(L"尚未读取到设备。请开启外设电量卡片并连接设备，再刷新。",L"No devices reported. Enable the peripheral battery card, connect a device and refresh.");
         return pages;
     }

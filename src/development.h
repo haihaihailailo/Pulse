@@ -53,10 +53,10 @@ inline const std::wstring& DataDirectory() {
         if (_wcsicmp(work.substr(work.find_last_of(L'\\') + 1).c_str(), L"dev-work"))
             throw std::runtime_error("Development work root mismatch");
         const auto path = FullPath(Environment(L"PULSE_DEV_DATA_DIR"));
-        const auto prefix = work + L"\\sessions\\";
+        const auto prefix = work + L"\\vm-sessions\\";
         if (path.size() <= prefix.size() || _wcsnicmp(path.c_str(), prefix.c_str(), prefix.size()) ||
             _wcsicmp(path.substr(path.find_last_of(L'\\') + 1).c_str(), L"profile"))
-            throw std::runtime_error("Development profile must be inside this checkout's dev-work/sessions");
+            throw std::runtime_error("Development profile must be inside this checkout's registered dev-work/vm-sessions");
         CheckDirectory(build);
         CheckDirectory(path);
         const auto marker = Parent(path) + L"\\pulse-dev-session.json";

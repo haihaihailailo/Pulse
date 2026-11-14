@@ -783,10 +783,13 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             for (size_t i=0;i<v.peripherals.size() && i<4;++i) {
                 const auto& device=v.peripherals[i]; const float row=y+34+static_cast<float>(i)*32;
                 const auto color=device.percent < 0 ? Faint : device.percent <= 20 ? Danger : Charge;
-                Text(device.name,Rect(25,row,content-65,18),11.5f,TextColor);
-                Text(device.percent < 0 ? L"--" : std::to_wstring(device.percent)+L"%",
-                     Rect(right-60,row,60,18),12,color,true,true,true);
-                Bar(Rect(25,row+23,content,3),device.percent < 0 ? -1.0f : device.percent/100.0f,color,color);
+                const bool english=i18n::CurrentLanguage()==i18n::Language::English;
+                Text(device.name,Rect(25,row,content-87,18),11.5f,TextColor);
+                Text(device.percent < 0 ? peripheral::StatusText(device.status,english) : std::to_wstring(device.percent)+L"%",
+                     Rect(right-82,row,82,18),device.percent<0?9.0f:12.0f,color,true,true,true);
+                const auto parts=peripheral::ComponentsText(device,english);
+                if(!parts.empty()) Text(parts,Rect(25,row+18,content,13),8.5f,Muted);
+                else Bar(Rect(25,row+23,content,3),device.percent < 0 ? -1.0f : device.percent/100.0f,color,color);
             }
             Text(v.peripheralHint,Rect(25,y+167,content,14),9,Faint);
             break;

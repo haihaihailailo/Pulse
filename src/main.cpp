@@ -1,4 +1,4 @@
-﻿#include "ui_window.h"
+#include "ui_window.h"
 #include "i18n.h"
 #include "development.h"
 #include "development_ui.h"

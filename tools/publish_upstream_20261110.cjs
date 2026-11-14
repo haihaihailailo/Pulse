@@ -110,9 +110,27 @@ exports.run=async({root,storage,config,action,preparedArgs,emit=true})=>{
   if(preparedVerification)flow.check(args.commit===undefined||args.commit===prepared.commit,'Verification commit differs');
   const importCommit=preparedVerification?prepared.commit:args.commit||originalCommit;
   const sourcing=action==='release-source';
+  const currentPackage=action==='release-package'&&args.tag!==undefined;
+  if(sourcing&&args.paths!==undefined) {
+    flow.check(/^[a-f0-9]{40}$/.test(args.base)&&/^codex\/[a-z0-9-]+$/.test(args.branch)&&
+      /^custom-\d{4}\.\d{2}\.\d{2}\.\d+$/.test(args.tag)&&Array.isArray(args.paths)&&args.paths.length>0&&args.paths.length<=128,
+      'Bounded exact source scope required');
+    for(const name of args.paths) {
+      flow.check(/^(?:src\/[^/]+\.(?:h|cpp|ps1)|tests\/[^/]+\.(?:cpp|ps1)|tools\/(?:shared\/)?[a-zA-Z0-9_.-]+\.(?:cjs|py|ps1)|scripts\/publish_custom_release\.py|docs\/development-guide\.md|app\.rc|build(?:_msvc)?\.bat|local-artifact-policy\.json)$/.test(name),
+        'Private or unsupported source path');
+      flow.read(root,name,524288);
+    }
+  }
+  if(currentPackage) {
+    flow.check(/^[a-f0-9]{40}$/.test(args.commit)&&/^custom-\d{4}\.\d{2}\.\d{2}\.\d+$/.test(args.tag),'Exact package identity required');
+    const source=flow.json(root,path.join('dev-work/evidence','release-source-'+args.tag,'source-receipt.json'));
+    flow.check(source.status==='PASS'&&source.commit===args.commit&&source.tag===args.tag,'Accepted source publication required');
+    const exe=flow.local(root,args.artifactExe);
+    flow.check(/^dev-work\/builds\/release-[a-f0-9]{24}\/Pulse\.exe$/.test(path.relative(root,exe).split(path.sep).join('/')),'Exact local release artifact required');
+  }
   const approved=action==='release-import'?[originalCommit,'503f60eee59a2bf31de11648bb13d4fb3ad77bc8',releaseCommit]:[originalCommit,releaseCommit,peripheralCommit,settingsCommit,optimizationCommit];
-  if(!sourcing&&!preparedVerification&&!approved.includes(importCommit))throw Error('Unapproved artifact commit');
-  const tag=preparedVerification?args.tag:sourcing||importCommit===optimizationCommit?'custom-2026.11.14.2':importCommit===settingsCommit?'custom-2026.11.14.1':importCommit===peripheralCommit?'custom-2026.11.13.1':importCommit===releaseCommit?'custom-2026.11.11.1':'custom-2026.11.10.2';
+  if(!sourcing&&!preparedVerification&&!currentPackage&&!approved.includes(importCommit))throw Error('Unapproved artifact commit');
+  const tag=(preparedVerification||currentPackage||(sourcing&&args.paths))?args.tag:sourcing||importCommit===optimizationCommit?'custom-2026.11.14.2':importCommit===settingsCommit?'custom-2026.11.14.1':importCommit===peripheralCommit?'custom-2026.11.13.1':importCommit===releaseCommit?'custom-2026.11.11.1':'custom-2026.11.10.2';
   const ci=path.join(root,'dev-work/ci',importCommit.slice(0,7)),out=path.join(root,'dev-work/releases',tag);
   const names=sourcing?['source-receipt.json','source-progress.jsonl']:action==='release-import'?['artifact.zip','Pulse.exe','metrics_selftest.exe','artifact.json']:
     action==='release-package'?['Pulse-'+tag+'-win-x64.zip','release-manifest.json','SHA256SUMS.txt','release-notes.md','package-receipt.json']:['public-verification.json'];

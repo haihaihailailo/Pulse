@@ -13,6 +13,7 @@
 #include "power_diagnostics.h"
 #include "probe_status.h"
 #include "receiver_protocol.h"
+#include "oppo_protocol.h"
 
 #include <windows.h>
 
@@ -1233,6 +1234,66 @@ int main() {
         Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==-1,"bad checksum rejected");
         reply[6]=255; reply[16]=0x4a;
         Expect(peripheral::ReceiverPercentage(reply.data(),reply.size())==-1,"receiver unknown sentinel rejected");
+        Expect(peripheral::ReceiverName(0x3554,0xfb3e) && peripheral::ReceiverName(0x373b,0x124f) &&
+            peripheral::ReceiverName(0x391d,0x1a04),"new VGN and ATK receiver families discovered");
+        Expect(peripheral::DiscoverReceiver(0x3554,0xffff,L"Compx") &&
+            peripheral::DiscoverReceiver(0x1234,0x5678,L"2.4G Wireless Receiver") &&
+            !peripheral::DiscoverReceiver(0x1234,0x5678,L"USB Keyboard"),
+            "unknown wireless receivers are discoverable without listing every ordinary wired HID");
+        const auto zero=peripheral::Receiver(0x373b,0x1155);
+        Expect(peripheral::ReceiverInterface(zero,0xff05,1,64,64) &&
+            !peripheral::ReceiverInterface(zero,0xff02,2,17,17) &&
+            !peripheral::ReceiverInterface(peripheral::Receiver(0x373b,0xffff),0xff05,1,64,64),
+            "ATK Zero requires its own collection; unknown PID never receives a command");
+        const auto wireless=peripheral::Nordic54Request(false), wired=peripheral::Nordic54Request(true);
+        Expect(wireless[5]==1 && wired[5]==0 && wireless[2]==0x72 && wireless[6]==7,
+            "ATK battery query routes dongle and wired links independently");
+        std::array<uint8_t,64> n54{8,0x72,0,0x3a,0,7,1,100,0x16,0x11};
+        Expect(peripheral::Nordic54Percentage(n54.data(),64)==100,"Nordic 54 battery response accepted");
+        n54[2]=1;
+        Expect(peripheral::Nordic54Percentage(n54.data(),64)==-2,"sleeping receiver cannot replay 100 percent");
+        n54[2]=0;n54[7]=255;
+        Expect(peripheral::Nordic54Percentage(n54.data(),64)==-1,"Nordic 54 invalid percentage rejected");
+        n54[7]=0;n54[5]=8;
+        Expect(peripheral::Nordic54Percentage(n54.data(),64)==-1,"Nordic 54 unrelated subcommand rejected");
+        auto feature=peripheral::VgnFeatureRequest();feature[3]=72;feature[64]=static_cast<uint8_t>(8-72);
+        Expect(peripheral::VgnFeaturePercentage(feature.data(),65)==72 &&
+            !peripheral::ReceiverInterface(peripheral::Receiver(0x391d,0x1a04),1,2,0,0,65) &&
+            peripheral::ReceiverInterface(peripheral::Receiver(0x391d,0x1a04),0xff00,1,0,0,65),
+            "VGN feature-only collection supported; standard input collection excluded");
+        feature[64]^=1;
+        Expect(peripheral::VgnFeaturePercentage(feature.data(),65)==-1,"corrupt VGN feature response rejected");
+        PeripheralBattery buds{L"oppo",L"OPPO",-1};
+        const std::array<uint8_t,15> batteryFrame{0xaa,13,0,0,6,0x81,0xf0,6,0,1,0x80,2,75,3,100};
+        peripheral::OppoStream stream;
+        Expect(!stream.Append(batteryFrame.data(),1,buds) && !stream.Append(batteryFrame.data()+1,7,buds) &&
+            stream.Append(batteryFrame.data()+8,7,buds),"fragmented OPPO stream reassembled");
+        Expect(buds.left==0 && buds.right==75 && buds.chargingCase==100 && buds.percent==0 && buds.charging,
+            "OPPO real zero, charging bit and three independent battery components preserved");
+        auto invalid=batteryFrame;invalid[7]=5;
+        const auto savedBuds=buds;
+        Expect(!peripheral::OppoBattery(invalid.data(),invalid.size(),buds) && buds==savedBuds,
+            "invalid OPPO payload length cannot mutate readings");
+        invalid=batteryFrame;invalid[6]=4;
+        Expect(!peripheral::OppoBattery(invalid.data(),invalid.size(),buds),"unrelated OPPO sequence rejected");
+        invalid=batteryFrame;invalid[10]=127;invalid[12]=255;invalid[14]=127;
+        Expect(!peripheral::OppoBattery(invalid.data(),invalid.size(),buds),"OPPO unavailable sentinels never become percent");
+        std::vector<uint8_t> combined{0,0xaa,0,0xff};
+        const auto hello=peripheral::OppoQuery(true);combined.insert(combined.end(),hello.begin(),hello.end());
+        combined.insert(combined.end(),batteryFrame.begin(),batteryFrame.end());
+        Expect(stream.Append(combined.data(),combined.size(),buds),"OPPO garbage, handshake and coalesced battery packets handled");
+        std::array<uint8_t,15> notification{0xaa,13,0,0,4,2,0,6,0,1,2,1,60,2,70};
+        Expect(stream.Append(notification.data(),notification.size(),buds) && buds.left==60 && buds.right==70 && buds.percent==60,
+            "OPPO active battery notification merges components");
+        std::vector<PeripheralBattery> unknown;
+        PeripheralBattery unknownReceiver{L"unknown",L"2.4G Receiver",-1};
+        unknownReceiver.status=BatteryStatus::Unsupported;unknownReceiver.detail=L"VID 3554 · PID FFFF";
+        peripheral::Merge(unknown,unknownReceiver);
+        peripheral::Merge(unknown,{L"unknown",L"HID service",-1});
+        Expect(unknown.size()==1 && unknown[0].status==BatteryStatus::Unsupported && !unknown[0].detail.empty(),
+            "unknown receiver remains visible without sending unsupported queries");
+        peripheral::Merge(unknown,{L"unknown",L"service",83});
+        Expect(unknown[0].percent==83 && unknown[0].name==L"2.4G Receiver","successful alternate interface updates the existing physical device");
         Components c; c.full.fill(false); c.full[static_cast<size_t>(FullComponent::Peripherals)]=true;
         Expect(CollectionWants(c,DisplayMode::Full).peripherals && !CollectionWants(c,DisplayMode::Compact).peripherals &&
             !CollectionWants(c,DisplayMode::Taskbar).peripherals && CollectionWants(c,DisplayMode::Taskbar,true).peripherals,

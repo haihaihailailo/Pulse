@@ -222,9 +222,11 @@ def apply_interactive_defaults(pid, profile, defaults_hash, window_class='Pulse.
 
 def main(plan_file, expected):
     plan_file = safe(plan_file)
-    if plan_file.stat().st_size > 65536 or sha(plan_file) != expected:
+    if plan_file.stat().st_size > 524288 or sha(plan_file) != expected:
         raise RuntimeError('Plan identity mismatch')
     plan = json.loads(plan_file.read_text(encoding='utf-8'))
+    if plan['action'] != 'artifact-retire' and plan_file.stat().st_size > 65536:
+        raise RuntimeError('Non-retirement plan exceeds original bound')
     root, config = Path(plan['root']), plan['config']
     if plan['parentPid'] != os.getppid() or not within(root/'dev-work/evidence', plan_file):
         raise RuntimeError('Use the protected Node entry; direct worker invocation refused')
@@ -235,6 +237,13 @@ def main(plan_file, expected):
     for item in config['identities'] + plan['inputs']:
         if sha(safe(item['path'])) != item['sha256']:
             raise RuntimeError('Input identity drift: ' + item['path'])
+    capacity_file = safe(root/'local-artifact-policy.json')
+    capacity_identity = next(item['sha256'] for item in plan['inputs'] if Path(item['path']) == capacity_file)
+    capacity = json.loads(capacity_file.read_text(encoding='utf-8'))
+    build_maximum = capacity['managed_directories']['dev-work/builds']['maximum_bytes']
+    if (not isinstance(build_maximum, int) or build_maximum <= 0 or
+            state['managedDirectories'][str(root/'dev-work/builds')]['maximumBytes'] != build_maximum):
+        raise RuntimeError('Registered build capacity differs from the bound policy')
     os.environ['CODEX_TEST_MEMORY_PROFILE'] = plan['policy']['profile']
     P = runpy.run_path(config['memoryPolicy'])
     S = runpy.run_path(config['resourceSlots'])
@@ -285,8 +294,11 @@ def main(plan_file, expected):
             raise RuntimeError('Memory policy/reserve drift')
         if shutil.disk_usage(root).free < 20 * 1024**3:
             raise RuntimeError('Physical disk headroom exhausted')
-        used = 0; count = 0
+        retiring = {item['path']: item['identity']['bytes'] for item in plan.get('retirements', [])} if plan['action'] == 'artifact-retire' else {}
+        used = sum(retiring.values()); count = len(retiring)
         for file in root.rglob('*'):
+            if str(file) in retiring:
+                continue  # Charge original bytes while exclusive handles delete; avoid a stat/delete race.
             safe(file)
             if file.is_file():
                 used += file.stat().st_size; count += 1
@@ -294,7 +306,7 @@ def main(plan_file, expected):
             raise RuntimeError('Project capacity bound exceeded')
         if plan['action'] in ('build','release'):
             build_bytes = sum(file.stat().st_size for file in (root/'dev-work'/'builds').rglob('*') if file.is_file())
-            if build_bytes > 320 * MIB:
+            if sha(capacity_file) != capacity_identity or build_bytes > build_maximum:
                 raise RuntimeError('Registered build capacity bound exceeded')
         if startup_state and startup_state.get('pid') and not startup_state.get('applied'):
             applied = apply_interactive_defaults(startup_state['pid'], startup_state['profile'], startup_state['sha256'],
@@ -419,6 +431,12 @@ def main(plan_file, expected):
                 outputs=[dict(path=str(file),bytes=file.stat().st_size,sha256=sha(file)) for file in all_outputs])
             write(target/'build.json', manifest)
             receipt['build'] = manifest
+        elif plan['action'] == 'artifact-retire':
+            result = run([config['python'], '-B', root/'tools/pulse_artifact_delete.py', plan_file, expected],
+                         'exact registered same-handle retirement', maximum_seconds=60)
+            receipt['retirement'] = json.loads(result)
+            if receipt['retirement'].get('deletedFiles') != len(plan['retirements']):
+                raise RuntimeError('Retirement count differs from exact plan')
         elif plan['action'] == 'workflow-test':
             result = run([config['node'], '--max-old-space-size=64', root/'tools/pulse_workflow_selftest.cjs', target],
                          'release preparation, checkpoint recovery and refusal checks', maximum_seconds=25)
@@ -491,6 +509,11 @@ def main(plan_file, expected):
             receipt['portableLogs'] = [str(file) for file in profile.glob('*.log')]
         else:
             profile = target/'profile'; profile.mkdir()
+            if plan['action'] == 'test-continue':
+                for item in plan['continuation']['files']:
+                    if sha(safe(item['path'])) != item['sha256']:
+                        raise RuntimeError('Accepted test evidence changed')
+                receipt['reusedEvidence'] = plan['continuation']
             write(target/'pulse-dev-session.json', dict(id=plan['id'],owner=plan['owner'],action=plan['action']))
             if plan['action'] == 'run':
                 defaults = safe(root/'tools/development-defaults.ini')
@@ -503,6 +526,8 @@ def main(plan_file, expected):
                 (profile/'settings.ini').write_text('[Window]\nMode=compact\nCompact=1\nOnTop=0\nzoom=100\n[Network]\nnotify=0\nnotify_sound=0\n',encoding='utf-8')
             os.environ['PULSE_DEV_DATA_DIR'] = str(profile)
             os.environ['PULSE_DEV_SESSION_KIND'] = 'interactive' if plan['action'] == 'run' else plan['action']
+            if plan['action'] == 'test-continue':
+                os.environ['PULSE_DEV_SESSION_KIND'] = 'debug'
             exe = Path(plan['buildDir'])/'Pulse-Dev.exe'
             if plan['action'] == 'run':
                 run([exe], 'visible development session', maximum_seconds=1800)
@@ -542,12 +567,13 @@ def main(plan_file, expected):
                         raise RuntimeError('LLDB did not confirm the backend breakpoint and clean completion')
                     receipt['debugScope'] = 'GUI first launch and settings restart: source breakpoint, step, rendering and clean exit; backend breakpoint and clean exit.'
                 else:
-                    output = run([exe,'--dev-smoke'], 'isolated first launch',desktop_name)
-                    if 'PULSE_DEV_SMOKE ' not in output:
-                        raise RuntimeError('First development launch produced no smoke receipt')
-                    output = run([exe,'--dev-smoke-resume'], 'isolated restart restores settings',desktop_name)
-                    if '"restored":true' not in output:
-                        raise RuntimeError('Restart did not restore development settings')
+                    if not (plan.get('continuation') or {}).get('guiAccepted', False):
+                        output = run([exe,'--dev-smoke'], 'isolated first launch',desktop_name)
+                        if 'PULSE_DEV_SMOKE ' not in output:
+                            raise RuntimeError('First development launch produced no smoke receipt')
+                        output = run([exe,'--dev-smoke-resume'], 'isolated restart restores settings',desktop_name)
+                        if '"restored":true' not in output:
+                            raise RuntimeError('Restart did not restore development settings')
                     run([exe,'--dev-smoke','unexpected'], 'refuse extra smoke arguments',desktop_name,expected_code=1)
                     run([exe], 'refuse missing smoke argument',desktop_name,expected_code=1)
                     run([Path(plan['buildDir'])/'metrics-selftest-dev.exe','--samples','6','--gpu-each','--no-probe'],
@@ -572,10 +598,10 @@ def main(plan_file, expected):
                             with safe(png).open('xb') as destination:
                                 rgb.save(destination, format='PNG')
                             captures.append(dict(path=str(png),width=rgb.width,height=rgb.height,sha256=sha(png)))
-                    if len(captures) != 15 or any(not (profile/name).is_file() for name in (
+                    if plan['action'] != 'test-continue' and (len(captures) != 15 or any(not (profile/name).is_file() for name in (
                             'full-fps-70-fit.png','sensor-unavailable.png','settings-general.png',
                             'settings-components.png','settings-english-narrow.png','full-custom-dark.png',
-                            'settings-dark.png','settings-peripherals.png')):
+                            'settings-dark.png','settings-peripherals.png'))):
                         raise RuntimeError('Expected ten panel captures and five native settings captures')
                     receipt['renderCaptures'] = captures
                 if input_desktop() != visible:
@@ -584,6 +610,10 @@ def main(plan_file, expected):
         for item in plan['inputs']:
             if sha(item['path']) != item['sha256']:
                 raise RuntimeError('Source changed while executing; result not reusable')
+        if plan['action'] == 'test-continue':
+            for item in plan['continuation']['files']:
+                if sha(safe(item['path'])) != item['sha256']:
+                    raise RuntimeError('Accepted test evidence changed during continuation')
         receipt['status'] = 'PASS'
     except BaseException as error:
         receipt['error'] = str(error)

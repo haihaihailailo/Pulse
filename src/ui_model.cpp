@@ -543,7 +543,10 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             if(s.peripherals.sampledAt) {
                 const auto age=(GetTickCount64()-s.peripherals.sampledAt)/1000;
                 v.peripheralHint += L" · " + std::to_wstring(age) + (i18n::CurrentLanguage()==i18n::Language::English?L"s ago":L"秒前");
-                if(age>180)for(auto& device:v.peripherals)device.percent=-1;
+                if(age>180)for(auto& device:v.peripherals) {
+                    device.percent=device.left=device.right=device.chargingCase=-1;
+                    device.status=BatteryStatus::Unknown;device.charging=false;
+                }
             }
         }
         if (c.Enabled(FullComponent::BatteryHealth)) {

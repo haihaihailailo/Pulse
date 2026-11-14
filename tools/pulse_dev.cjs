@@ -17,8 +17,8 @@ const configPath = path.join(__dirname, 'dev-environment.local.json');
 const config = JSON.parse(read(configPath));
 // Pulse opts into the separately versioned shared guard. Keep the old configured
 // module and other projects untouched; bind the effective module in every plan.
-config.storage = path.join(path.dirname(config.storage),'local_artifact_storage_v2.cjs');
-const storageIdentity = {path:config.storage,sha256:'9939d2ab774b7071ae18ca0c3a65373cab80d77d678055692123293760b37fef'};
+config.storage = path.join(__dirname,'shared','pulse_artifact_storage_v3.cjs');
+const storageIdentity = {path:config.storage,sha256:'9c837f3b7ca009293ddf779889e0b45590daa426726a25aaac63fd0b1f88ede7'};
 if(fileHash(storageIdentity.path)!==storageIdentity.sha256)throw Error('Versioned storage guard identity changed');
 config.identities.push(storageIdentity);
 const storage = require(config.storage);
@@ -138,6 +138,7 @@ function reconcileCapacity() {
   const rawInput=fs.readFileSync(0,'utf8').replace(/^\uFEFF/,'');
   if(Buffer.byteLength(rawInput)>8192)fail('Oversized reconciliation input');
   const input=JSON.parse(rawInput);
+  if(input.mode==='limits') return reconcileLimits(input);
   const preflight=input.mode==='preflight';
   const entries=input.mode==='entries';
   if(input.mode && !preflight && !entries)fail('Unknown capacity migration mode');
@@ -294,8 +295,110 @@ function reconcileCapacity() {
     fs.unlinkSync(lock);
   }
 }
+// Explicitly authorized preflight changes for existing registered directories.
+// Bind the full previous state/policy, retain snapshots, and stop on any partial
+// transaction. This does not authorize cleanup or replay a completed migration.
+function reconcileLimits(input) {
+  if(!/^[a-f0-9-]{36}$/.test(input.id)||!/^[a-f0-9]{64}$/.test(input.stateSha256)||
+     !/^[a-f0-9]{64}$/.test(input.policySha256)||typeof input.authorization!=='string'||
+     !input.authorization.trim()||input.authorization.length>1000||!Array.isArray(input.changes)||
+     input.changes.length<1||input.changes.length>2)fail('Bounded authorization and exact state required');
+  const home=path.join(root,'.local-artifact-storage'),stateFile=path.join(home,'state.json');
+  const policyFile=path.join(root,'local-artifact-policy.json'),pending=path.join(home,'state.pending.json');
+  const policyPending=policyFile+'.pending',lock=path.join(home,'lock.json');
+  const backup=path.join(root,'dev-work/evidence',input.id+'-capacity');
+  const targets=[{path:path.join(backup,'state.before.json'),estimatedBytes:8*1024*1024},
+    {path:path.join(backup,'policy.before.json'),estimatedBytes:16384},
+    {path:path.join(backup,'reconciliation.json'),estimatedBytes:262144}];
+  const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+  const durable=(file,data)=>{const fd=fs.openSync(storage.safe(root,file),'wx');
+    try{fs.writeFileSync(fd,data);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}};
+  for(const item of config.identities)if(fileHash(item.path)!==item.sha256)fail('Shared tool identity changed');
+  durable(lock,JSON.stringify({owner:'pulse-capacity-reconciliation',id:input.id}));
+  const lockIdentity=storage.fileIdentity(root,lock);
+  try {
+    if(fs.existsSync(pending)||fs.existsSync(policyPending)||fs.existsSync(backup))fail('Existing or interrupted capacity transaction');
+    const stateRaw=read(stateFile),policyRaw=read(policyFile);
+    if(sha(stateRaw)!==input.stateSha256||sha(policyRaw)!==input.policySha256)fail('Capacity input identity changed');
+    const state=json(stateFile,8*1024*1024),policy=json(policyFile),next=structuredClone(policy);
+    if(state.last?.status!=='complete'||(state.last.reconciliation && state.last.reconciliation.phase!=='complete'))fail('Previous transaction incomplete');
+    if(policy.project_budget_bytes!==1073741824||policy.minimum_free_bytes!==21474836480)fail('Unexpected project protections');
+    const checked=[],unique=new Set();
+    for(const change of input.changes) {
+      if(!['dev-work/builds','dev-work/vm-sessions'].includes(change.path)||unique.has(change.path)||
+         !Number.isSafeInteger(change.oldBytes)||!Number.isSafeInteger(change.newBytes)||change.newBytes<=change.oldBytes||
+         change.newBytes>=policy.project_budget_bytes)fail('Invalid directory capacity change');
+      unique.add(change.path);
+      const managed=storage.safe(root,path.join(root,change.path)),record=state.managedDirectories[managed];
+      const configured=policy.managed_directories[change.path],stat=fs.lstatSync(managed);
+      if(!record||record.resourceId!==managed||record.maximumBytes!==change.oldBytes||configured?.maximum_bytes!==change.oldBytes||
+         !stat.isDirectory()||String(stat.dev)!==record.identity.deviceId||String(stat.ino)!==record.identity.fileId||
+         (record.maximumEntries??512)!==(configured.maximum_entries??512))fail('Registered capacity/identity mismatch');
+      quiescent(managed);
+      let bytes=0,files=0;
+      const walk=[managed];
+      while(walk.length) {
+        const directory=walk.pop();
+        for(const entry of fs.readdirSync(directory,{withFileTypes:true})) {
+          const file=storage.safe(root,path.join(directory,entry.name));
+          if(entry.isDirectory())walk.push(file);
+          else {
+            const registered=state.objects[file],identity=storage.fileIdentity(root,file);
+            if(!registered||!same(identity,registered.identity))fail('Unregistered or changed managed artifact');
+            bytes+=identity.bytes;++files;
+          }
+          storage.checkManagedBound(files+walk.length,bytes,record.maximumBytes,record.maximumEntries??512);
+        }
+      }
+      if(bytes>change.oldBytes)fail('Preflight change cannot reconcile an over-limit failed transaction');
+      next.managed_directories[change.path].maximum_bytes=change.newBytes;
+      checked.push({...change,managed,bytes,files});
+    }
+    const verification=storage.verifyRegistered(root,state,new Set(),true);
+    const admission=storage.checkCapacity(root,next,12*1024*1024);
+    const save=()=>{const value=JSON.stringify(state)+'\n';if(Buffer.byteLength(value)>8*1024*1024)fail('State size limit');
+      durable(pending,value);fs.renameSync(pending,stateFile);};
+    state.last.reconciliation={phase:'registered-before-generation',kind:'capacity-limits',id:input.id,
+      authorization:input.authorization,changes:checked,targets,admission};save();
+    fs.mkdirSync(storage.safe(root,backup));durable(targets[0].path,stateRaw);durable(targets[1].path,policyRaw);
+    if(!read(policyFile).equals(policyRaw))fail('Capacity policy drift');
+    durable(policyPending,JSON.stringify(next,null,2)+'\n');fs.renameSync(policyPending,policyFile);
+    for(const change of checked)state.managedDirectories[change.managed].maximumBytes=change.newBytes;
+    const receipt={status:'PASS',kind:'CAPACITY_LIMITS_MIGRATED',authorization:input.authorization,changes:checked,
+      stateBeforeSha256:input.stateSha256,policyBeforeSha256:input.policySha256,policyAfterSha256:sha(read(policyFile)),
+      verification,deletedFiles:0,rollback:'Retain every artifact and registration; shrinking requires authorized reconciliation below the old limits. Never overwrite newer state with the snapshot.'};
+    durable(targets[2].path,JSON.stringify(receipt,null,2)+'\n');
+    for(const target of targets) {
+      const identity=storage.fileIdentity(root,target.path);if(identity.bytes>target.estimatedBytes)fail('Capacity evidence limit');
+      state.objects[target.path]={path:target.path,owner:'pulse-capacity-reconciliation',purpose:'Authorized capacity change and rollback evidence',identity};
+    }
+    storage.verifyRegistered(root,state,new Set(),true);quiescent(path.join(root,'dev-work/builds'));storage.checkCapacity(root,next,4*1024*1024);
+    state.last.reconciliation.phase='complete';state.last.reconciliation.receipt=targets[2].path;save();
+    if(!same(json(stateFile,8*1024*1024),state)||!same(json(policyFile),next))fail('Capacity readback mismatch');
+    console.log(JSON.stringify({status:'PASS',receipt:targets[2].path,changes:checked,deletedFiles:0}));
+  } finally {
+    if(!same(storage.fileIdentity(root,lock),lockIdentity))fail('Own capacity lock changed');
+    fs.unlinkSync(lock);
+  }
+}
 async function main() {
   const [action = 'test', profile = 'daily', consent, artifactExe] = process.argv.slice(2);
+  const retire=async(request,automatic=false)=>require('./pulse_artifact_retire.cjs').run({root,storage,config,
+    policy:memoryPolicy(profile),quiescent:()=>quiescent(path.join(root,'dev-work')),child,request,automatic});
+  if(action==='artifact-retire') {
+    if(profile!=='daily'||consent||artifactExe)fail('Unexpected retirement arguments');
+    for(const item of config.identities)if(fileHash(item.path)!==item.sha256)fail('Shared tool identity changed: '+item.path);
+    const raw=fs.readFileSync(0,'utf8').replace(/^\uFEFF/,'');if(Buffer.byteLength(raw)>4096)fail('Bounded retirement input required');
+    console.log(JSON.stringify(await retire(JSON.parse(raw))));return;
+  }
+  if(['artifact-status','artifact-review'].includes(action)) {
+    if(profile!=='daily'||consent||artifactExe)fail('Unexpected artifact review arguments');
+    for(const item of config.identities.filter(x=>[config.node,config.storage,...(action==='artifact-review'?[config.python]:[])].includes(x.path)))
+      if(fileHash(item.path)!==item.sha256)fail('Shared tool identity changed: '+item.path);
+    const result=await require('./pulse_artifact_review.cjs').run({root,storage,action,
+      quiescent:()=>quiescent(path.join(root,'dev-work'))});
+    console.log(JSON.stringify(result));return;
+  }
   if(action==='reconcile-capacity') {
     if(profile!=='daily'||consent||artifactExe)fail('Unexpected capacity reconciliation arguments');
     return reconcileCapacity();
@@ -306,7 +409,11 @@ async function main() {
   }
   if (['release-source','release-import','release-package','release-prepare','release-status','release-publish','release-verify'].includes(action)) {
     if (profile !== 'daily' || consent || artifactExe) fail('Unexpected release arguments');
-    return require('./publish_upstream_20261110.cjs').run({root,storage,config,action});
+    const result=await require('./publish_upstream_20261110.cjs').run({root,storage,config,action});
+    if((action==='release-verify'&&result?.status==='PASS')||
+       (action==='release-publish'&&result?.verification?.status==='PASS'))
+      console.log(JSON.stringify({automaticRetirement:await retire(null,true)}));
+    return result;
   }
   if (action === 'merge-upstream') {
     if (consent || artifactExe || profile !== 'daily') fail('Unexpected upstream preparation arguments');
@@ -315,7 +422,7 @@ async function main() {
   const trial = ['trial','trial-test'].includes(action);
   const building = ['build','release'].includes(action);
   const workflowTest = action === 'workflow-test';
-  if (!['build','release','test','debug','run','trial','trial-test','capacity','script-test','workflow-test'].includes(action)) fail('Unknown action');
+  if (!['build','release','test','test-continue','debug','run','trial','trial-test','capacity','script-test','workflow-test'].includes(action)) fail('Unknown action');
   if (['run','trial'].includes(action) && consent !== '--interactive') fail('Visible use requires -Interactive');
   if (consent && !(['run','trial'].includes(action) && consent === '--interactive') &&
       !(action === 'trial-test' && consent === '--isolated')) fail('Unexpected interactive flag');
@@ -327,7 +434,8 @@ async function main() {
   const sources = workflowTest ? [] : fs.readdirSync(path.join(root,'src')).filter(x => /\.(cpp|h|ps1)$/.test(x)).sort().map(x => ownFile(path.join(root,'src',x)));
   const upstreamTests = workflowTest ? [] : fs.readdirSync(path.join(root,'tests')).filter(x => /\.(cpp|ps1)$/.test(x)).sort().map(x => ownFile(path.join(root,'tests',x)));
   const inputs = workflowTest ? ['tools/Pulse-Dev.ps1','tools/pulse_dev.cjs','tools/pulse_dev_worker.py',
-    'tools/publish_upstream_20261110.cjs','tools/pulse_release_flow.cjs','tools/pulse_workflow_selftest.cjs','tools/pulse_build_identity.cjs',
+    'tools/publish_upstream_20261110.cjs','tools/pulse_release_flow.cjs','tools/pulse_workflow_selftest.cjs','tools/pulse_build_identity.cjs','tools/pulse_artifact_review.cjs',
+    'tools/pulse_artifact_retire.cjs','tools/pulse_artifact_delete.py','tools/pulse_artifact_retirement_selftest.py','tools/shared/pulse_artifact_storage_v3.cjs',
     'tools/dev-environment.local.json','local-artifact-policy.json'].map(x=>ownFile(path.join(root,x))) :
     [...sources, ...upstreamTests, ...['app.rc','app.manifest','pulse.ico','tools/pulse_dev_worker.py','tools/pulse_dev.cjs','tools/pulse_build_identity.cjs',
     'local-artifact-policy.json','tools/dev-environment.local.json','tools/development-defaults.ini',
@@ -352,6 +460,13 @@ async function main() {
   let buildKey = action === 'release' ? 'release-' + executionKey : executionKey;
   let buildDir = path.join(root,'dev-work','builds',buildKey);
   let buildManifest = path.join(buildDir,'build.json');
+  const retiredObjects=workflowTest?{}:json(path.join(root,'.local-artifact-storage/state.json'),8*1024*1024).retiredObjects||{};
+  const retiredBuild=manifest=>require('./pulse_build_identity.cjs').retiredBuild(manifest,retiredObjects);
+  if(!workflowTest&&fs.existsSync(buildManifest)&&retiredBuild(json(buildManifest))) {
+    buildKey=(action==='release'?'release-':'')+sha(JSON.stringify({inputs,retired:json(buildManifest).outputs
+      .filter(x=>retiredObjects[x.path]).map(x=>retiredObjects[x.path].runId)})).slice(0,24);
+    buildDir=path.join(root,'dev-work/builds',buildKey);buildManifest=path.join(buildDir,'build.json');
+  }
   // Test-harness/evidence-policy edits do not require another C++ build.
   // Select a retained verified build by binary inputs, never by age alone.
   if (!workflowTest && !fs.existsSync(buildManifest)) {
@@ -362,7 +477,7 @@ async function main() {
       const baselinePath=path.join(builds,name,'build.json');
       if(!fs.existsSync(baselinePath))continue;
       const baseline=json(baselinePath);
-      if (baseline.status==='PASS' && baseline.buildKey===name &&
+      if (baseline.status==='PASS' && !retiredBuild(baseline) && baseline.buildKey===name &&
           baseline.kind===(action==='release'?'release':'development') && sameBinaries(inputs,baseline.inputs)) {
       buildKey = baseline.buildKey;
       buildDir = path.join(root,'dev-work','builds',buildKey);
@@ -380,6 +495,51 @@ async function main() {
     }
   }
   if (!building && !['capacity','script-test','workflow-test'].includes(action) && !build && !trial) fail('No verified build for these inputs. Run -Action Build first');
+  let continuation=null;
+  if(action==='test-continue') {
+    const raw=fs.readFileSync(0,'utf8').replace(/^\uFEFF/,'');
+    if(Buffer.byteLength(raw)>2048)fail('Oversized continuation input');
+    const request=JSON.parse(raw);
+    if(!/^[a-f0-9-]{36}$/.test(request.testId)||!/^[a-f0-9]{64}$/.test(request.receiptSha256))fail('Exact failed test identity required');
+    const previousFile=path.join(root,'dev-work/evidence',request.testId+'-result.json');
+    if(fileHash(previousFile)!==request.receiptSha256)fail('Original test receipt changed');
+    const previousPlanFile=path.join(root,'dev-work/evidence',request.testId+'-plan.json');
+    const previous=json(previousFile),previousPlan=json(previousPlanFile);
+    if(previous.status!=='FAILED'||!['test','test-continue'].includes(previous.action)||previous.buildKey!==buildKey||
+       previousPlan.buildKey!==buildKey||previousPlan.id!==request.testId||
+       JSON.stringify(require('./pulse_build_identity.cjs').binaryInputs(previousPlan.inputs))!==
+           JSON.stringify(require('./pulse_build_identity.cjs').binaryInputs(build.inputs))||
+       Object.keys(previous.policy).length!==Object.keys(policy).length||
+       Object.keys(policy).some(key=>previous.policy[key]!==policy[key])||
+       previous.productionUnchanged!==true||previous.desktopClosed!==true||previous.remainingDevelopmentProcesses?.length!==0||
+       previous.slots?.released!==true)fail('Original test is not an eligible same-build partial result');
+    const labels=['updater transaction regression','compile upstream synthetic regression','upstream synthetic regression','isolated first launch'];
+    const originalTestId=previous.action==='test'?request.testId:previous.reusedEvidence?.originalTestId||previous.reusedEvidence?.testId;
+    if(!/^[a-f0-9-]{36}$/.test(originalTestId))fail('Original test reference missing');
+    const originalFile=path.join(root,'dev-work/evidence',originalTestId+'-result.json');
+    const original=json(originalFile);
+    const priorFiles=previous.action==='test'?[]:previous.reusedEvidence?.files;
+    if(!Array.isArray(priorFiles)||priorFiles.length>80||priorFiles.some(item=>fileHash(storage.safe(root,item.path))!==item.sha256)||
+       (previous.action!=='test'&&!priorFiles.some(item=>item.path===originalFile&&item.sha256===fileHash(originalFile))))
+      fail('Previously accepted evidence chain changed');
+    if(original.buildKey!==buildKey || labels.some(label=>!original.commands.some(command=>command.label===label&&command.status==='EXITED'&&command.exitCode===0)))
+      fail('Required accepted stages absent; run full Test');
+    const oldProfile=path.join(root,'dev-work/vm-sessions',originalTestId,'profile');
+    const smokeFile=path.join(oldProfile,'smoke-first.json'),smoke=json(smokeFile,4096);
+    if(smoke.pass!==true||smoke.restored!==false)fail('Accepted first-launch evidence missing');
+    const captures=fs.readdirSync(oldProfile).filter(name=>name.endsWith('.bmp'));
+    if(captures.length!==15||!['full-fps-70-fit.bmp','full-custom-dark.bmp','settings-peripherals.bmp'].every(name=>captures.includes(name)))
+      fail('Native capture evidence incomplete');
+    const guiAccepted=['isolated first launch','isolated restart restores settings'].every(label=>
+      previous.commands.some(command=>command.label===label&&command.status==='EXITED'&&command.exitCode===0));
+    const guiFiles=guiAccepted?['smoke-first.json','smoke-resume.json'].map(name=>path.join(root,'dev-work/vm-sessions',request.testId,'profile',name)):[];
+    if(guiAccepted && guiFiles.some((file,index)=>{const result=json(file,4096);return result.pass!==true||result.restored!==(index===1);}))
+      fail('Accepted GUI pair receipts missing');
+    continuation={testId:request.testId,originalTestId,receiptSha256:request.receiptSha256,acceptedStages:labels,guiAccepted,
+      scope:guiAccepted?'Reuse completed protocol, rendering and GUI-pair stages; finish backend sampling and protection checks.':
+        'Reuse protocol/updater regression and original native captures; repeat GUI pair in a fresh profile and finish remaining checks within the unchanged Test budget.',
+      files:[...new Set([previousFile,previousPlanFile,smokeFile,...captures.map(name=>path.join(oldProfile,name)),...guiFiles,...priorFiles.map(item=>item.path)])].map(ownFile)};
+  }
   const id = crypto.randomUUID();
   const evidence = path.join(root,'dev-work','evidence');
   const planFile = path.join(evidence, id + '-plan.json');
@@ -389,13 +549,14 @@ async function main() {
   const sessionDir = path.join(root,'dev-work','vm-sessions',id);
   const wallSeconds = building ? 240 : ['run','trial'].includes(action) ? 1800 : action === 'debug' ? 120 : 90;
   const plan = {schema:1, root, action, id, owner, parentPid:process.pid, executionKey, buildKey, buildDir, build,
-    sessionDir, receiptFile, config, inputs, policy, wallSeconds, artifact,
+    sessionDir, receiptFile, config, inputs, policy, wallSeconds, artifact, continuation,
     jobMiB:512, outputLimitBytes:262144,
     targetDirectory:building ? buildDir : sessionDir,
     purpose:'Isolated development only; no installation, production writes or publication'};
   if (building && !build) {
     const existing = fs.existsSync(managed) ? storage.usage(managed) : {bytes:0,files:0};
-    if (existing.bytes + 24 * 1024 * 1024 > 335544320) fail('Insufficient registered build headroom for a new compilation; preserve existing builds');
+    const maximum=json(path.join(root,'local-artifact-policy.json')).managed_directories['dev-work/builds'].maximum_bytes;
+    if (existing.bytes + 24 * 1024 * 1024 > maximum) fail('Insufficient registered build headroom for a new compilation; preserve existing builds');
   }
   const result = await storage.withLease({root, operation:'development', owner,
     purpose:plan.purpose, managedDirectories:[{path:managed}],
@@ -426,6 +587,8 @@ async function main() {
   // A restored VM may verify capacity without replaying a historical migration.
   if (action === 'capacity' && result.status === 'PASS' && config.legacyCapacityMigration === true)
     result.migration = await require('./pulse_capacity_migration.cjs').migrate({root,storage,quiescent,testReceipt:receiptFile});
+  if(result.status==='PASS'&&['test','test-continue','trial-test'].includes(action))
+    result.retirement=await retire(null,true);
   console.log(JSON.stringify(result));
   if (result.status !== 'PASS') process.exitCode = 1;
 }
