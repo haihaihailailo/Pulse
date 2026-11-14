@@ -3,8 +3,8 @@
 
 namespace pulse {
 
-inline bool ProbeHttpStatusOk(unsigned long code) {
-    return code >= 200 && code < 300;
+inline bool ProbeHttpStatusOk(unsigned long code, bool expect204=false) {
+    return expect204 ? code==204 : code >= 200 && code < 300;
 }
 
 }  // namespace pulse

@@ -12,6 +12,7 @@
 #include "ui_prefs.h"
 #include "power_diagnostics.h"
 #include "probe_status.h"
+#include "metric_rates.h"
 #include "receiver_protocol.h"
 #include "oppo_protocol.h"
 
@@ -1344,6 +1345,29 @@ int main() {
         const Snapshot unavailable;
         Expect(std::isnan(unavailable.cpu_percent) && std::isnan(unavailable.mem_percent),
                "unavailable CPU and memory are not fabricated zero");
+    }
+    {
+        using namespace pulse;using namespace pulse::ui;
+        Expect(std::fabs(MemoryPercent(16384,8191)-50.006103515625)<1e-8,"memory percentage keeps fractional precision from byte counts");
+        Expect(std::isnan(MemoryPercent(0,0))&&std::isnan(MemoryPercent(100,101)),"invalid memory capacity is unknown");
+        Expect(CounterRate(4096,1024,1.5)==2048&&CounterRate(100,100,1)==0,"counter rate uses actual interval and preserves valid zero");
+        Expect(std::isnan(CounterRate(1,100,1))&&std::isnan(CounterRate(2,1,0)),"reset counter and missing interval are unknown");
+        Expect(CpuTimePercent(400,200,150,50)==50&&std::isnan(CpuTimePercent(1,200,0,50))&&
+            std::isnan(CpuTimePercent(400,200,350,50)),"CPU rejects resets and impossible idle deltas");
+        Expect(ProbeHttpStatusOk(204,true)&&!ProbeHttpStatusOk(200,true)&&!ProbeHttpStatusOk(302,true),"204 endpoint rejects portal HTML and redirects");
+        i18n::SetLanguage(i18n::Preference::English);
+        Components c;Model model;Snapshot s;s.net_state=NetState::Online;s.latency_ms=28;
+        s.endpoints[0]={ProbeState::Success,28,L"connect.rom.miui.com"};
+        s.endpoints[1]={ProbeState::Timeout,NAN,L"www.gstatic.com"};
+        s.down_bps=1048576;s.up_bps=0;model.Update(s,false,c);
+        Expect(model.Data().probeLatency[0]==L"28 ms"&&model.Data().probeLatency[1]==L"Timeout"&&model.Data().netState==NetState::Online,
+            "foreign timeout does not overwrite domestic success or whole-network state");
+        Expect(model.Data().down.unit==L"MiB/s"&&model.Data().down.value==L"1.00","binary transfer unit agrees with divisor");
+        s.endpoints[1]={ProbeState::Success,210,L"www.gstatic.com"};
+        Expect(model.Update(s,false,c)&&model.Data().probeLatency[1]==L"210 ms","second endpoint alone triggers repaint");
+        s.endpoints[0].state=ProbeState::Stale;model.Update(s,false,c);
+        Expect(model.Data().probeLatency[0]==L"Stale","stale endpoint cannot keep showing its last number");
+        i18n::SetLanguage(i18n::Preference::Chinese);
     }
     CheckProbeHttpStatus();
     CheckClassifier();

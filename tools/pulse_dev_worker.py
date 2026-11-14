@@ -62,7 +62,7 @@ def processes():
         entry = ProcessEntry(); entry.size = C.sizeof(entry)
         valid = K.Process32FirstW(snapshot, C.byref(entry))
         while valid:
-            if entry.name.lower() in names:
+            if entry.name.lower() in names or entry.name.lower().startswith('pulse.settings.'):
                 handle = K.OpenProcess(0x1000, False, entry.pid)
                 if not handle:
                     raise RuntimeError('Cannot identify an existing Pulse process')
@@ -86,13 +86,20 @@ def within(root, file):
     return os.path.commonpath([os.path.abspath(root), os.path.abspath(file)]).lower() == os.path.abspath(root).lower()
 
 
-def safe(file):
+def safe(file, system_reference=False):
     file = Path(file).absolute()
     for part in (file, *file.parents):
         if part.exists() and part.lstat().st_file_attributes & 0x400:
             raise RuntimeError('Reparse path refused: ' + str(part))
-    if file.exists() and file.is_file() and file.stat().st_nlink != 1:
-        raise RuntimeError('Multiple-link file refused')
+    framework = Path(os.environ['SystemRoot'])/'Microsoft.NET/Framework64/v4.0.30319'
+    reference = system_reference and file.parent == framework and file.name in {
+        'mscorlib.dll','System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll'}
+    # App-packaged PowerShell/Roslyn files also have deployment hard links.
+    # This exception is read-only, only for hash-pinned external tool inputs.
+    packaged = system_reference and within(Path(os.environ['ProgramFiles'])/'WindowsApps', file) and \
+        file.parent.name == 'powershell' and file.name in {'pwsh.exe','Microsoft.CodeAnalysis.dll','Microsoft.CodeAnalysis.CSharp.dll'}
+    if file.exists() and file.is_file() and file.stat().st_nlink != 1 and not (reference or packaged):
+        raise RuntimeError('Multiple-link file refused: ' + str(file))
     return file
 
 
@@ -235,7 +242,7 @@ def main(plan_file, expected):
     if not lock.is_file() or state['last']['status'] != 'active' or state['last']['owner'] != plan['owner']:
         raise RuntimeError('An active registered capacity lease is required')
     for item in config['identities'] + plan['inputs']:
-        if sha(safe(item['path'])) != item['sha256']:
+        if sha(safe(item['path'], system_reference=item in config['identities'])) != item['sha256']:
             raise RuntimeError('Input identity drift: ' + item['path'])
     capacity_file = safe(root/'local-artifact-policy.json')
     capacity_identity = next(item['sha256'] for item in plan['inputs'] if Path(item['path']) == capacity_file)
@@ -380,10 +387,13 @@ def main(plan_file, expected):
         if plan['action'] in ('build','release'):
             release = plan['action'] == 'release'
             resource = target/'app.res.o'
-            run([bin_dir/'x86_64-w64-mingw32-windres.exe','-F','pe-x86-64','-i',root/'app.rc','-O','coff','-o',resource], 'resources')
+            settings_ui = target/'Pulse.Settings.exe'
+            run([config['powershell'], '-NoProfile','-NonInteractive','-File',root/'tools/build_settings_ui.ps1',
+                 '-Output',settings_ui], 'compile reused WinForms settings', maximum_seconds=30)
+            run([bin_dir/'x86_64-w64-mingw32-windres.exe','-F','pe-x86-64','-I',target,'-i',root/'app.rc','-O','coff','-o',resource], 'resources')
             cpp = sorted((root/'src').glob('*.cpp'))
             commands = []
-            all_outputs = [resource]
+            all_outputs = [resource, settings_ui]
             dev_objects, normal_objects = {}, {}
             intermediates = []
             def release_objects(files):
@@ -432,6 +442,10 @@ def main(plan_file, expected):
             write(target/'build.json', manifest)
             receipt['build'] = manifest
         elif plan['action'] == 'artifact-retire':
+            if plan.get('fixtureArchive'):
+                result = run([config['python'], '-B', root/'tools/pulse_fixture_archive.py', plan_file, expected],
+                             'archive exact completed tool fixtures', maximum_seconds=20)
+                receipt['fixtureArchive'] = json.loads(result)
             result = run([config['python'], '-B', root/'tools/pulse_artifact_delete.py', plan_file, expected],
                          'exact registered same-handle retirement', maximum_seconds=60)
             receipt['retirement'] = json.loads(result)
@@ -443,6 +457,10 @@ def main(plan_file, expected):
             receipt['workflowChecks'] = json.loads(result)
             if receipt['workflowChecks'].get('status') != 'PASS':
                 raise RuntimeError('Workflow self-check failed')
+            if plan.get('fixtureArchive'):
+                result = run([config['python'], '-B', root/'tools/pulse_fixture_archive.py', plan_file, expected],
+                             'archive and retire completed tool fixtures', maximum_seconds=20)
+                receipt['fixtureArchive'] = json.loads(result)
         elif plan['action'] == 'script-test':
             powershell = Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
             for script in ('install_params_selftest.ps1','uninstall_params_selftest.ps1'):

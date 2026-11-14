@@ -696,9 +696,19 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
             speed(v.down, 25 + half, L"↓", Down);
             Line(25, y + 64, right, y + 64, Border);
             const auto color = NetworkColor(v.netState);
-            Text(T(Key::Latency), Rect(25, y + 77, latencyLabelWidth_, 24), 11.5f, Muted);
-            Text(v.latency, Rect(34 + latencyLabelWidth_, y + 73, content - latencyLabelWidth_ - 9, 32), 23, color, true, true);
-            Text(v.netHint, Rect(25, y + 110, content, 36), 11, color, false, false, false, true);
+            const bool english=i18n::CurrentLanguage()==i18n::Language::English;
+            for(size_t i=0;i<2;++i){
+                const float x=25+half*i;
+                const bool domestic=v.probeHost[i]==L"connect.rom.miui.com";
+                const bool foreign=v.probeHost[i]==L"www.gstatic.com";
+                const auto label=domestic?(english?L"China · HTTP":L"国内 · HTTP"):foreign?(english?L"Global · HTTP":L"国外 · HTTP"):
+                    (i==0?(english?L"Target 1 · HTTP":L"目标 1 · HTTP"):(english?L"Target 2 · HTTP":L"目标 2 · HTTP"));
+                const auto ink=v.probeState[i]==ProbeState::Success?color:v.probeState[i]==ProbeState::Checking?Muted:Drain;
+                Text(label,Rect(x,y+72,half-8,16),10.5f,Muted);
+                Text(v.probeLatency[i],Rect(x,y+88,half-8,28),20,ink,true,true);
+                Text(v.probeHost[i].empty()?L"--":v.probeHost[i],Rect(x,y+116,half-8,15),9,Faint);
+            }
+            Text(v.netHint, Rect(25, y + 134, content, 15), 10, color, false, false, true);
             break;
         }
         case FullComponent::Processes: {

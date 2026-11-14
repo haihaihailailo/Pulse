@@ -173,16 +173,16 @@ const Entry strings[] = {
     {L"W", L"W"}, // Watt
     {L"ms", L"ms"}, // Ms
     {L"GHz", L"GHz"}, // Ghz
-    {L"GB", L"GB"}, // Gb
+    {L"GiB", L"GiB"}, // Gb
     {L"Wh", L"Wh"}, // Wh
     {L"fps", L"fps"}, // FpsUnit
     {L"B", L"B"}, // Byte
-    {L"KB", L"KB"}, // Kb
-    {L"MB", L"MB"}, // Mb
-    {L"TB", L"TB"}, // Tb
-    {L"KB/s", L"KB/s"}, // Kbps
-    {L"MB/s", L"MB/s"}, // Mbps
-    {L"GB/s", L"GB/s"}, // Gbps
+    {L"KiB", L"KiB"}, // Kb
+    {L"MiB", L"MiB"}, // Mb
+    {L"TiB", L"TiB"}, // Tb
+    {L"KiB/s", L"KiB/s"}, // Kbps
+    {L"MiB/s", L"MiB/s"}, // Mbps
+    {L"GiB/s", L"GiB/s"}, // Gbps
     {L" 小时 ", L" h "}, // HourJoin
     {L" 时 ", L" h "}, // HourShortJoin
     {L" 天 ", L" d "}, // DayJoin
@@ -193,7 +193,7 @@ const Entry strings[] = {
     {L" W", L" W"}, // WattSuffix
     {L" ms", L" ms"}, // MsSuffix
     {L" GHz", L" GHz"}, // GhzSuffix
-    {L" GB", L" GB"}, // GbSuffix
+    {L" GiB", L" GiB"}, // GbSuffix
     {L" Wh", L" Wh"}, // WhSuffix
     {L" fps", L" fps"}, // FpsSuffix
     {L"读 ", L"Read "}, // ReadPrefix

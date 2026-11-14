@@ -20,7 +20,9 @@ if not exist "build-msvc\selftest" mkdir "build-msvc\selftest"
 if errorlevel 1 goto :failed
 
 rem Compile from the repository root so app.rc can resolve app.manifest.
-rc /nologo /c65001 /fo "build-msvc\app.res" app.rc
+pwsh -NoProfile -NonInteractive -File tools\build_settings_ui.ps1 -Output build-msvc\Pulse.Settings.exe
+if errorlevel 1 goto :failed
+rc /nologo /c65001 /I build-msvc /fo "build-msvc\app.res" app.rc
 if errorlevel 1 goto :failed
 
 rem Source definitions of UNICODE, _UNICODE and NOMINMAX are #ifndef guarded.

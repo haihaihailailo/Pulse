@@ -1,6 +1,50 @@
 'use strict';
 const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');
 const flow=require('./pulse_release_flow.cjs');
+// Resume only an interrupted blob-upload checkpoint. Existing commits/refs
+// remain a separate readback decision; never replay an uncertain publication.
+function resumeSource(root,storage,args,dir,execute) {
+  const home=path.join(root,'.local-artifact-storage'),file=path.join(home,'state.json'),lock=path.join(home,'lock.json');
+  const original=fs.readFileSync(file),state=JSON.parse(original),last=state.last;
+  const progress=path.join(dir,'source-progress.jsonl'),receipt=path.join(dir,'source-receipt.json');
+  if(last?.status==='complete')return null;
+  flow.check(last?.status==='failed'&&last.owner==='pulse-upstream-release-20261110'&&last.targets.length>=2&&
+    last.targets.slice(0,2).every((row,i)=>row.path===[receipt,progress][i]&&row.before===null)&&
+    !state.objects[receipt]&&!state.objects[progress]&&!fs.existsSync(receipt),'Not an unfinished first source upload');
+  const records=flow.read(root,progress,1048576).toString('utf8').trim().split('\n').map(JSON.parse);
+  flow.check(records[0]?.operation==='prepared'&&['base','branch','tag'].every(key=>records[0].response[key]===args[key])&&
+    records.every(row=>row.operation==='prepared'||row.operation==='git/blobs'||(row.operation==='intent'&&row.response.endpoint==='git/blobs')),
+    'Source checkpoint advanced beyond blobs or changed target; inspect before continuation');
+  const durable=(name,raw)=>{const fd=fs.openSync(storage.safe(root,name),'wx');try{fs.writeFileSync(fd,raw);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}};
+  const id=require('node:crypto').randomUUID(),snapshot=path.join(dir,'state-before-resume-'+id+'.json');
+  durable(lock,JSON.stringify({owner:last.owner,id}));const lockIdentity=storage.fileIdentity(root,lock);let active=false;
+  const save=()=>{const raw=JSON.stringify(state)+'\n';flow.check(Buffer.byteLength(raw)<=8*1024*1024,'State size bound');
+    const pending=path.join(home,'state.pending.json');durable(pending,raw);fs.renameSync(pending,file);};
+  try {
+    flow.check(fs.readFileSync(file).equals(original),'State changed before source continuation');
+    storage.verifyRegistered(root,state,new Set(),true);
+    const policy=JSON.parse(fs.readFileSync(path.join(root,'local-artifact-policy.json')));
+    for(const record of Object.values(state.managedDirectories)) {
+      const found=[],pending=[record.path];while(pending.length)for(const entry of fs.readdirSync(pending.pop(),{withFileTypes:true})) {
+        const name=storage.safe(root,path.join(entry.parentPath,entry.name));if(entry.isDirectory())pending.push(name);else found.push(name);
+      }
+      const known=Object.values(state.objects).filter(row=>row.managedDirectory===record.path).map(row=>row.path);
+      flow.check(JSON.stringify(found.sort())===JSON.stringify(known.sort()),'Managed members changed');
+      const used=storage.usage(record.path);storage.checkManagedBound(used.files,used.bytes,record.maximumBytes,record.maximumEntries);
+      const rule=policy.managed_directories[path.relative(root,record.path).split(path.sep).join('/')];
+      flow.check(rule.maximum_bytes===record.maximumBytes&&storage.entryLimit(rule.maximum_entries)===record.maximumEntries,'Capacity policy changed');
+    }
+    storage.checkCapacity(root,policy,16*1024*1024);
+    last.status='active';last.resumedFrom=snapshot;last.targets.push({path:snapshot,before:null,purpose:'Immutable failed source checkpoint'});save();active=true;
+    durable(snapshot,original);state.objects[snapshot]={path:snapshot,owner:last.owner,purpose:'Original interrupted source state',identity:storage.fileIdentity(root,snapshot)};save();
+    const result=execute();flow.check(result.status==='PASS','Source continuation failed');
+    storage.verifyRegistered(root,state,new Set(),true);
+    for(const name of [receipt,progress])state.objects[name]={path:name,owner:last.owner,purpose:'Exact resumed source publication',identity:storage.fileIdentity(root,name)};
+    last.status='complete';last.completedUtc=new Date().toISOString();delete last.error;save();
+    flow.check(JSON.parse(fs.readFileSync(file)).last.status==='complete','Continuation readback failed');return result;
+  }catch(error){if(active){last.status='failed';last.error=String(error.message).slice(0,300);save();}throw error;}
+  finally{flow.check(JSON.stringify(storage.fileIdentity(root,lock))===JSON.stringify(lockIdentity),'Source continuation lock changed');fs.unlinkSync(lock);}
+}
 function ghTransport(root, plan, spawnSync=cp.spawnSync) {
   const gh='C:\\Program Files\\GitHub CLI\\gh.exe';
   if(!fs.existsSync(gh))throw Error('Official gh unavailable; inspect before choosing a fallback');
@@ -117,7 +161,7 @@ exports.run=async({root,storage,config,action,preparedArgs,emit=true})=>{
       /^custom-\d{4}\.\d{2}\.\d{2}\.\d+$/.test(args.tag)&&Array.isArray(args.paths)&&args.paths.length>0&&args.paths.length<=128,
       'Bounded exact source scope required');
     for(const name of args.paths) {
-      flow.check(/^(?:src\/[^/]+\.(?:h|cpp|ps1)|tests\/[^/]+\.(?:cpp|ps1)|tools\/(?:shared\/)?[a-zA-Z0-9_.-]+\.(?:cjs|py|ps1)|scripts\/publish_custom_release\.py|docs\/development-guide\.md|app\.rc|build(?:_msvc)?\.bat|local-artifact-policy\.json)$/.test(name),
+      flow.check(/^(?:src\/[^/]+\.(?:h|cpp|ps1)|src\/settings_ui\/(?:LiteUI|PulseSettings)\.cs|THIRD_PARTY_NOTICES\.md|tests\/[^/]+\.(?:cpp|ps1)|tools\/(?:shared\/)?[a-zA-Z0-9_.-]+\.(?:cjs|py|ps1)|scripts\/publish_custom_release\.py|docs\/development-guide\.md|app\.rc|build(?:_msvc)?\.bat|local-artifact-policy\.json)$/.test(name),
         'Private or unsupported source path');
       flow.read(root,name,524288);
     }
@@ -138,6 +182,10 @@ exports.run=async({root,storage,config,action,preparedArgs,emit=true})=>{
   const dir=sourcing?path.join(root,'dev-work/evidence/release-source-'+tag):action==='release-import'?ci:out;
   const targets=names.map(n=>({path:path.join(dir,n),purpose:action+' exact authorized Pulse artifact',estimatedBytes:n.endsWith('.zip')||n.endsWith('.exe')?16*1024*1024:n.endsWith('.jsonl')?1024*1024:65536}));
   const verifyPaths=preparedVerification?[...flow.dependencies(root,tag),flow.local(root,path.join(out,'publication-plan.json'))]:[];
+  const execute=()=>{const r=cp.spawnSync(config.python,['-B',path.join(__dirname,'publish_upstream_20261110.py'),action],{input,encoding:'utf8',windowsHide:true,timeout:90000,maxBuffer:65536,env:{...process.env,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8'}});
+    if(r.error||r.status!==0)throw Error((r.stderr||r.error?.message||'Release stage failed').slice(-2000));return JSON.parse(r.stdout);};
+  if(sourcing&&fs.existsSync(path.join(dir,'source-progress.jsonl'))){const resumed=resumeSource(root,storage,args,dir,execute);
+    if(resumed){if(emit)console.log(JSON.stringify(resumed));return resumed;}}
   const result=await storage.withLease({root,operation:'development',owner:'pulse-upstream-release-20261110',purpose:action==='release-import'?'Import exact authorized CI artifact; retain previous downloads and installations':'Prepare authorized release; retain previous downloads and installations',targets,verifyPaths},async()=>{
     fs.mkdirSync(dir,{recursive:true});
     if(preparedVerification)flow.check(flow.encode(flow.prepare(root,tag,prepared.rollback.tag))===flow.encode(prepared),'Preparation drift before verification');
@@ -153,9 +201,7 @@ exports.run=async({root,storage,config,action,preparedArgs,emit=true})=>{
       const prior=flow.publicReceiptMatches(root,tag,current);
       if(prior)return {status:'PASS',stage:action,reused:true,remoteChecked:false,verification:'RECORDED_PUBLIC_DOWNLOADS',receipt:prior.path};
     }
-    const r=cp.spawnSync(config.python,['-B',path.join(__dirname,'publish_upstream_20261110.py'),action],{input,encoding:'utf8',windowsHide:true,timeout:90000,maxBuffer:65536,env:{...process.env,PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8'}});
-    if(r.error||r.status!==0)throw Error((r.stderr||r.error?.message||'Release stage failed').slice(-2000));
-    return JSON.parse(r.stdout);
+    return execute();
   });
   if(action==='release-package')result.preparation=await preparedStage({root,storage,action:'release-prepare',args:{tag,rollbackTag:args.rollbackTag},emit:false});
   if(emit)console.log(JSON.stringify(result));return result;

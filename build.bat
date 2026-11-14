@@ -4,6 +4,8 @@ pushd "%~dp0"
 if errorlevel 1 exit /b 1
 
 rem MinGW-w64 g++ 13.2 x64. Do not include the console self-test in Pulse.exe.
+pwsh -NoProfile -NonInteractive -File tools\build_settings_ui.ps1 -Output Pulse.Settings.exe
+if errorlevel 1 goto :failed
 windres -F pe-x86-64 -i app.rc -O coff -o app.res.o
 if errorlevel 1 goto :failed
 

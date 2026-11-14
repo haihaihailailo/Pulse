@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
 
 namespace pulse {
 #ifdef PULSE_DEVELOPMENT
@@ -16,6 +17,12 @@ namespace diagnostics { bool SensorContracts(); }
 #endif
 
 enum class NetState { Checking, Online, Slow, Offline };
+enum class ProbeState { Checking, Success, Timeout, Failed, Stale };
+struct ProbeEndpoint {
+    ProbeState state=ProbeState::Checking;
+    double latency_ms=NAN;
+    std::wstring host;
+};
 
 struct ProcUsage {
     std::wstring name;     // 去掉 .exe
@@ -67,7 +74,8 @@ struct Snapshot {
     double down_bps = NAN, up_bps = NAN;  // 字节/秒；未取得有效区间时未知
     uint64_t rx_total = 0, tx_total = 0;  // 本次启动以来
     NetState net_state = NetState::Checking;
-    double latency_ms = NAN;          // 最近一次探测延迟（失败为 NaN）
+    double latency_ms = NAN;          // HTTP response-header duration; primary, then fallback.
+    std::array<ProbeEndpoint,2> endpoints{};
     int64_t offline_since_unix = 0;   // 断网开始时间（0 = 未断网）
     bool offline_by_latency = false;  // 断网原因是延迟过高
 
@@ -102,14 +110,14 @@ struct Snapshot {
     double pkg_power_counter_w = NAN;
 
     // CPU 诊断：同一采样区间的旧口径，以及未截断的 Processor Utility。
-    // PDH 预热/失败时 Utility 为 NaN，cpu_percent 沿用旧口径或上一值。
+    // PDH 预热/失败时 Utility 为 NaN，cpu_percent 仅使用有效的 GetSystemTimes 区间。
     double cpu_time_percent = NAN, cpu_utility_percent = NAN;
     bool cpu_from_utility = false;
 
     PowerSchemeKind power_scheme_kind = PowerSchemeKind::Unknown;
     OfflineReason offline_reason = OfflineReason::None;
     double offline_latency_ms = NAN;
-    double gpu_temp_c = NAN;   // 显卡温度（°C），同任务管理器口径（D3DKMT 适配器性能数据）；多块显卡取最高；不支持/显卡休眠/未启用为 NaN
+    double gpu_temp_c = NAN;   // 所选 GPU 的 D3DKMT 温度（°C）；不支持/休眠/未启用为 NaN
 
     // Appended fields. power_scheme / power_scheme_kind stay the overlay, not the plan.
     // Active Control Panel plan. Invalid or empty after a failed query; custom names are not translated.
@@ -157,7 +165,7 @@ struct NetEvent {
 struct Settings {
     int probe_interval_s = 5, probe_timeout_s = 4, fail_threshold = 3;
     int slow_ms = 300, unusable_ms = 1000;
-    std::vector<std::wstring> probe_urls;  // 空 = 默认三个地址
+    std::vector<std::wstring> probe_urls;  // 空 = 国内小米、国外 Google，两路独立 HTTP 探测。
 
     // 默认构造使用 500 ms；按只追加约定保留已有字段声明。
     Settings() : slow_ms(500) {}

@@ -22,6 +22,7 @@
 #endif
 
 #include "metrics.h"
+#include "metric_rates.h"
 #include "power_diagnostics.h"
 #include "netprobe.h"
 
@@ -2166,17 +2167,17 @@ void Metrics::Impl::UpdateNet(Snapshot& s, unsigned long long now) {
     }
     const std::int64_t qpc = QpcNow();
     const double dt = QpcSeconds(qpc, net_qpc_);
-    double down = complete ? 0.0 : NAN;
-    double up = complete ? 0.0 : NAN;
+    double down = NAN;
+    double up = NAN;
     if (complete && have_net_ && dt > 0.0 && nics_ == prev_nics_) {
         if (rx >= prev_rx_) {
             const uint64_t delta = rx - prev_rx_;
-            down = static_cast<double>(delta) / dt;
+            down = CounterRate(rx,prev_rx_,dt);
             rx_total_ += delta;
         }
         if (tx >= prev_tx_) {
             const uint64_t delta = tx - prev_tx_;
-            up = static_cast<double>(delta) / dt;
+            up = CounterRate(tx,prev_tx_,dt);
             tx_total_ += delta;
         }
     }
@@ -2196,7 +2197,7 @@ void Metrics::Impl::UpdateCpu(Snapshot& s, unsigned long long now, bool frequenc
     FILETIME idle{};
     FILETIME kernel{};
     FILETIME user{};
-    double cpu = last_.cpu_percent;
+    double cpu = NAN;
     if (GetSystemTimes(&idle, &kernel, &user)) {
         const uint64_t idle_v = FileTimeToU64(idle);
         const uint64_t total = FileTimeToU64(kernel) + FileTimeToU64(user);
@@ -2206,8 +2207,8 @@ void Metrics::Impl::UpdateCpu(Snapshot& s, unsigned long long now, bool frequenc
         if (have_cpu_ && total > prev_total_ && idle_v >= prev_idle_) {
             const double idle_d = static_cast<double>(idle_v - prev_idle_);
             const double total_d = static_cast<double>(total - prev_total_);
-            if (total_d > 0) {
-                cpu = 100.0 * (1.0 - idle_d / total_d);
+            if (total_d > 0 && idle_d <= total_d) {
+                cpu = CpuTimePercent(total,prev_total_,idle_v,prev_idle_);
                 if (cpu < 0) cpu = 0;
                 if (cpu > 100.0) cpu = 100.0;
                 s.cpu_time_percent = cpu;
@@ -2238,7 +2239,7 @@ void Metrics::Impl::UpdateCpu(Snapshot& s, unsigned long long now, bool frequenc
         if (PdhCollectQueryData(cpu_query_) != ERROR_SUCCESS) {
             ReleaseCpuQuery();
             cpu_query_retry_at_ = now + kPdhRetryMs;
-            return; // Keep GetSystemTimes or the last value during a PDH outage.
+            return; // Only this interval's valid GetSystemTimes result may survive.
         }
     }
     have_cpu_query_tick_ = true;
@@ -2246,7 +2247,7 @@ void Metrics::Impl::UpdateCpu(Snapshot& s, unsigned long long now, bool frequenc
     if (cpu_utility_) {
         if (cpu_utility_warmed_) {
             double utility = NAN;
-            if (FormatDouble(cpu_utility_, utility, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100)) {
+            if (FormatDouble(cpu_utility_, utility, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100) && std::isfinite(utility) && utility>=0) {
                 s.cpu_utility_percent = utility;
                 s.cpu_from_utility = true;
                 s.cpu_percent = std::clamp(utility, 0.0, 100.0);
@@ -2265,7 +2266,8 @@ void Metrics::Impl::UpdateMem(Snapshot& s, bool detail) {
     MEMORYSTATUSEX mem{};
     mem.dwLength = sizeof(mem);
     if (!GlobalMemoryStatusEx(&mem)) return;
-    s.mem_percent = static_cast<double>(mem.dwMemoryLoad);
+    if(!mem.ullTotalPhys||mem.ullAvailPhys>mem.ullTotalPhys)return;
+    s.mem_percent = MemoryPercent(mem.ullTotalPhys,mem.ullAvailPhys);
     if (!detail) return;
     diagnostics::ScopedTiming detail_timing(L"Memory detail");
     const double total = static_cast<double>(mem.ullTotalPhys);
@@ -3366,6 +3368,7 @@ void Metrics::Impl::UpdateSysDisk(unsigned long long now, Snapshot& s) {
     ULARGE_INTEGER total{};
     ULARGE_INTEGER free_bytes{};
     if (!GetDiskFreeSpaceExW(sys_root_, &avail, &total, &free_bytes) || total.QuadPart == 0) {
+        sys_used_pct_=sys_free_gb_=NAN;
         s.sys_disk_used_percent = sys_used_pct_;
         s.sys_disk_free_gb = sys_free_gb_;
         return;
@@ -3699,6 +3702,7 @@ Snapshot Metrics::Impl::Take(bool full) {
         const auto network = probe.Get();
         last_.net_state = network.state;
         last_.latency_ms = network.latency_ms;
+        last_.endpoints = network.endpoints;
         last_.offline_since_unix = network.offline_since_unix;
         last_.offline_by_latency = network.offline_by_latency;
         last_.offline_reason = network.offline_reason;
@@ -3799,6 +3803,7 @@ Snapshot Metrics::Impl::Take(bool full) {
     }
     s.net_state = view.state;
     s.latency_ms = view.latency_ms;
+    s.endpoints = view.endpoints;
     s.offline_since_unix = view.offline_since_unix;
     s.offline_by_latency = view.offline_by_latency;
     s.offline_reason = view.offline_reason;

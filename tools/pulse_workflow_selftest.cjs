@@ -147,7 +147,7 @@ test('build identity helper accepts tool-only dispatch and rejects product/recip
   // Synthetic build evidence: future product edits or retirement of a historical
   // build must not break a tool-only check or force a product rebuild.
   const baseline=[{path:path.join(project,'src/main.cpp'),sha256:flow.hash('synthetic source')},
-    {path:worker,sha256:flow.hash(raw.toString('utf8').replace(build.toolDispatch,''))},
+    {path:worker,sha256:flow.hash(build.beforeFixtures(raw.toString('utf8').replace(/\r\n/g,'\n')).replace(build.toolDispatch,''))},
     {path:path.join(project,'tools/dev-environment.local.json'),sha256:flow.hash('synthetic toolchain binding')}];
   const rows=baseline.map(item=>item.path===worker?{...item,sha256:flow.hash(raw)}:{...item});
   assert.equal(build.sameBinaries(rows,baseline,worker,raw),true);
@@ -343,6 +343,14 @@ test('versioned storage preserves default and byte guards; only explicit entry b
   assert.equal(result.status,'PREPARED');assert.equal(result.reused,true);assert.equal(leases,1);
   checks.push('actual preparation entry reuses the same registered plan under a lease');
   const config={identities:[]};
+  const localConfig=JSON.parse(fs.readFileSync(path.join(project,'tools/dev-environment.local.json'),'utf8'));
+  const packageCheck=require('node:child_process').spawnSync(localConfig.python,['-B',path.join(project,'tools/pulse_settings_package_selftest.py'),target],
+    {encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:65536});
+  assert.equal(packageCheck.status,0,packageCheck.stderr||packageCheck.error?.message);
+  assert.match(packageCheck.stdout,/settings package contract: PASS/);
+  checks.push('actual package embeds third-party license and runtime requirement; identical synthetic binary; no remote calls');
+  for(const name of ['src/settings_ui/LiteUI.cs','src/settings_ui/PulseSettings.cs','THIRD_PARTY_NOTICES.md'])
+    await assert.rejects(release.run({root,storage,config,action:'release-source',preparedArgs:{base:'a'.repeat(40),branch:'codex/synthetic',tag,paths:[name]},emit:false}),/ENOENT/);
   for(const message of ['', 'x'.repeat(201), 'title\nsecond line', 123])
     await assert.rejects(release.run({root,storage,config,action:'release-source',preparedArgs:{
       base:'a'.repeat(40),branch:'codex/synthetic',tag,paths:['app.rc'],message},emit:false}),/Invalid commit message/);

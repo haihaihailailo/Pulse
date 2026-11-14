@@ -32,7 +32,7 @@ Speed FormatSpeed(double bps) {
     const std::wstring* units[] = {&T(Key::Kbps), &T(Key::Mbps), &T(Key::Gbps)};
     double n = bps / 1024;
     int i = 0;
-    while (n >= 1000 && i < 2) { n /= 1024; ++i; }
+    while (n >= 1024 && i < 2) { n /= 1024; ++i; }
     return {Number(n, n >= 100 ? 0 : n >= 10 ? 1 : i ? 2 : 1), *units[i]};
 }
 std::wstring Bytes(uint64_t bytes) {
@@ -205,8 +205,8 @@ bool View::Equals(const View& r, bool compact, const Components& c) const {
         std::tie(mode, powerTrace, powerLabel, powerValue, powerHistory) !=
         std::tie(r.mode, r.powerTrace, r.powerLabel, r.powerValue, r.powerHistory)) return false;
     if (c.Enabled(FullComponent::Network) &&
-        std::tie(netState, down, up, totals, latency, netHint) !=
-        std::tie(r.netState, r.down, r.up, r.totals, r.latency, r.netHint)) return false;
+        std::tie(netState, down, up, totals, latency, netHint,probeLatency,probeHost,probeState) !=
+        std::tie(r.netState, r.down, r.up, r.totals, r.latency, r.netHint,r.probeLatency,r.probeHost,r.probeState)) return false;
     if (c.Enabled(FullComponent::Processes) &&
         std::tie(processes, selfCpu) != std::tie(r.processes, r.selfCpu)) return false;
     if (c.Enabled(FullComponent::DiskIO) && std::tie(read, write) != std::tie(r.read, r.write)) return false;
@@ -481,6 +481,14 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             }
         }
         if (network) {
+            const bool english=i18n::CurrentLanguage()==i18n::Language::English;
+            for(size_t i=0;i<2;++i){
+                const auto& endpoint=s.endpoints[i];v.probeHost[i]=endpoint.host;v.probeState[i]=endpoint.state;
+                v.probeLatency[i]=endpoint.state==ProbeState::Success&&Known(endpoint.latency_ms)?Number(endpoint.latency_ms,0)+L" ms":
+                    endpoint.state==ProbeState::Timeout?(english?L"Timeout":L"超时"):
+                    endpoint.state==ProbeState::Failed?(english?L"Unavailable":L"无响应"):
+                    endpoint.state==ProbeState::Stale?(english?L"Stale":L"已过期"):(english?L"Checking":L"检测中");
+            }
             v.down = FormatSpeed(s.down_bps); v.up = FormatSpeed(s.up_bps);
             v.totals = T(Key::SessionTraffic) + Bytes(s.rx_total) + L" · ↑ " + Bytes(s.tx_total);
             if (s.net_state == NetState::Offline) {

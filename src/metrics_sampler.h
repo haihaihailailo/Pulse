@@ -5,6 +5,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <tuple>
 
 namespace pulse {
 // The collector and its GPU/provider state have one owner. UI requests coalesce
@@ -26,7 +27,12 @@ public:
         const auto freshness=std::chrono::milliseconds(std::max(5000u,refreshMs*3));
         return std::chrono::steady_clock::now()-published_>freshness?Snapshot{}:latest_;
     }
-    void SetWants(const Wants& wants) {std::lock_guard<std::mutex> lock(mutex_);wants_=wants;}
+    void SetWants(const Wants& wants) {
+        const auto fields=[](const Wants& w){return std::make_tuple(w.chip_power,w.gpu_usage,w.processes,w.memory_detail,w.disk_io,w.sys_disk,
+            w.cpu_freq,w.uptime,w.gpu_memory,w.wifi,w.battery_health,w.fps,w.power_scheme,w.process_count,w.gpu_temp,w.dgpu_power,w.cpu_usage,w.memory_usage,w.peripherals);};
+        std::lock_guard<std::mutex> lock(mutex_);if(fields(wants_)==fields(wants))return;
+        wants_=wants;latest_={};++generation_;pending_=true;wake_.notify_one();
+    }
     void SetPaused(bool paused) {
         std::lock_guard<std::mutex> lock(mutex_);
         if(paused_==paused)return;paused_=paused;latest_={};++generation_;pending_=true;wake_.notify_one();
@@ -41,7 +47,7 @@ public:
         return adapters_;
     }
     void SetSlowThreshold(int value) {std::lock_guard<std::mutex> lock(mutex_);slow_=value;pending_=true;wake_.notify_one();}
-    void SetProbeEnabled(bool value) {std::lock_guard<std::mutex> lock(mutex_);probe_=value;pending_=true;wake_.notify_one();}
+    void SetProbeEnabled(bool value) {std::lock_guard<std::mutex> lock(mutex_);if(probe_==value)return;probe_=value;latest_={};++generation_;pending_=true;wake_.notify_one();}
     void OnSuspend() {Suspend(true);}
     void OnResume() {Suspend(false);}
     void RefreshPeripherals() {std::lock_guard<std::mutex> lock(mutex_);refreshDevices_=true;pending_=true;wake_.notify_one();}

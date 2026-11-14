@@ -55,6 +55,7 @@ public:
     struct View {
         NetState state = NetState::Checking;
         double latency_ms = NAN;
+        std::array<ProbeEndpoint,2> endpoints{};
         std::int64_t offline_since_unix = 0;
         bool offline_by_latency = false;
         OfflineReason offline_reason = OfflineReason::None;
@@ -68,6 +69,9 @@ public:
     void OnResume();
     void SetEnabled(bool enabled);
     void RequestProbe(); // Reuses Metrics' passive NIC notifications; no polling.
+#ifdef PULSE_DEVELOPMENT
+    static bool CheckForDevelopment(); // In-memory classification; never starts HTTP.
+#endif
 
 private:
     struct Impl;

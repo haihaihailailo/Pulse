@@ -1,6 +1,24 @@
-# 第三方声明
+# LiteMonitor settings interface
 
-Pulse 本体（`src/`）是原创代码，许可证见仓库根目录的 [LICENSE](LICENSE)（MIT）。本体没有引用、复制或静态链接下列项目的实现。
+Portions of the settings interface are adapted from [Diorser/LiteMonitor](https://github.com/Diorser/LiteMonitor), commit `3b91b5ca6d70a9056b8fdd01c9acddc985721240`.
+
+Author: Diorser. The upstream README declares: “本项目基于 MIT License 开源，可自由使用、修改与分发。” The pinned repository has no separate LICENSE file; this notice records the declaration without inventing a copyright year.
+
+Imported implementation: `src/UI/Controls/LiteUI.cs`; adapted window and page-container code from `src/UI/SettingsForm.cs`, `src/UI/Settings/MainPanelPage.cs`, and scaling helpers from `src/Core/UIUtils.cs`.
+
+Pulse adaptations replace the LiteMonitor application/configuration bindings, retain Pulse's save behavior, add theme and narrow-window handling, and fix navigation font disposal. No LiteMonitor hardware collection, updater, startup or reset behavior is included.
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+# 插件第三方声明
+
+Pulse 主程序使用仓库根目录的 [LICENSE](LICENSE)（MIT），设置界面的 LiteMonitor 来源另见上节。主程序没有引用、复制或静态链接本节所列插件项目的实现。
 
 `extras/trafficmonitor-plugins/` 是早期可独立使用的 TrafficMonitor 插件（NetProbe、BatteryPlus）。下面的声明针对这些插件及其带入的头文件。
 

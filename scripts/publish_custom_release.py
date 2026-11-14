@@ -49,9 +49,10 @@ def package(out, exe, artifact, run, commit):
               'Create an empty pulse-portable.ini beside the EXE BEFORE launch to use portable data.\n'
               'Right-click > Check for updates: download, verify, replace and restart; settings are preserved.\n'
               'Windows PowerShell 5.1 and write access to the executable directory are required.\n'
+              'Settings use Windows .NET Framework 4.8 WinForms; the settings module is embedded in Pulse.exe.\n'
               'Old executables are retained as .rollback-* files for recovery.\n')
     with zipfile.ZipFile(archive, 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        for name, content in [('Pulse.exe', exe), ('LICENSE', (ROOT/'LICENSE').read_text(encoding='utf-8').encode()),
+        for name, content in [('Pulse.exe', exe), ('LICENSE', ((ROOT/'LICENSE').read_text(encoding='utf-8')+'\n\n'+(ROOT/'THIRD_PARTY_NOTICES.md').read_text(encoding='utf-8')).encode()),
                               ('README.txt', readme.encode()), ('build-info.json', data)]:
             entry = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
             entry.compress_type = zipfile.ZIP_DEFLATED
@@ -128,6 +129,18 @@ def package(out, exe, artifact, run, commit):
                  '用户的 VGN 蜻蜓 3 大师版+ 尚未接入测试环境，真实电量及具体固件兼容性仍需实机确认；其他外设支持范围沿用上一版本。\n'
                  '已有带更新功能的版本可使用「检查更新」下载替换，也可下载 ZIP 解压使用。包内不含个人设置、日志或调试文件。\n'
                  '旧 Release 保留供回退；附来源清单与 SHA256。真实在线替换安装未在本轮执行。\n\n'
+                 f'源码：https://github.com/{REPO}/commit/{commit}\n')
+    if tag == 'custom-2026.11.14.5':
+        notes = ('复用 LiteMonitor 设置界面，增加国内外双目标网络卡片，并修正数据显示准确度。\n\n'
+                 '- 直接复用并适配 LiteMonitor 的 WinForms 控件、导航和滚动容器；修复重复滚动、窄窗口、主题及编辑保存行为。\n'
+                 '- 设置模块内嵌在同一个 EXE，仅打开设置时运行，使用 Windows .NET Framework 4.8；包内保留来源及许可说明。\n'
+                 '- 网络卡片分别显示小米 connect.rom.miui.com 和 Google www.gstatic.com 的 HTTP 响应耗时、超时及过期状态；一路失败不覆盖另一路。\n'
+                 '- 网络数值是 HTTP 响应头耗时，沿用系统代理，不等同于 ICMP Ping；默认 204 目标拒绝重定向与门户网页。\n'
+                 '- 修正 CPU、磁盘读取失败后的旧值残留，内存字节比例、网速初始采样和计数器重置；统一 KiB/MiB/GiB 单位，缺失或过期数据保持未知。\n\n'
+                 '界面滚动、深浅色、窄窗口、配置保存重开及相关采样回归已通过；正式下载包使用独立配置验收，发布同一份 EXE。\n'
+                 '实体传感器精度、不同代理线路和真实在线替换安装未在本轮验证。\n'
+                 '已有带更新功能的版本可使用「检查更新」下载替换，也可下载 ZIP 解压使用。保留现有用户设置，包内不含个人配置、日志或调试文件。\n'
+                 '旧 Release 保留供回退；附来源清单与 SHA256。\n\n'
                  f'源码：https://github.com/{REPO}/commit/{commit}\n')
     (out/'release-notes.md').write_bytes(notes.encode())
     return tag, files

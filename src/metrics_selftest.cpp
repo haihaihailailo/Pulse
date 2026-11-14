@@ -595,6 +595,8 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef PULSE_DEVELOPMENT
     if (!pulse::diagnostics::SensorContracts()) { std::wprintf(L"sensor contracts: FAIL\n"); return 1; }
     std::wprintf(L"sensor contracts: PASS\n");
+    if(!pulse::NetProbe::CheckForDevelopment()){std::wprintf(L"probe contracts: FAIL\n");return 1;}
+    std::wprintf(L"probe contracts: PASS (classification, independent results, stale data; no HTTP)\n");
 #endif
     int samples = 60, interval_ms = 1000, compact_interval_ms = 2000, switch_every = 0;
     bool full = true, brief = false, fps_test = false, no_probe = false, count_only = false, gpu_test = false, power_test = false, nvml_test = false;

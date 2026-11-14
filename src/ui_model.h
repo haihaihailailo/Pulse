@@ -132,6 +132,8 @@ struct View {
     std::wstring compactEtaLabel, compactEtaValue;
     std::wstring cpuValue, memoryValue, packageW, packageNote, cpuW, gpuW, memW, gpuUsage;
     std::wstring latency, netHint, compactUp, compactDown, diskRead, diskWrite;
+    std::array<std::wstring,2> probeLatency{},probeHost{};
+    std::array<ProbeState,2> probeState{};
     std::wstring diskPercent, diskFree, cpuFrequency, memoryDetail, processCount, uptime;
     std::wstring sharedMemory, dedicatedMemory, wifiSsid, wifiSignal, health, cycles, fps;
     bool fpsAdmin = false;

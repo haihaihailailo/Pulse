@@ -104,9 +104,8 @@ std::wstring FormatOutageDuration(std::uint64_t seconds) {
 namespace {
 
 const wchar_t* kDefaultUrls[] = {
-    L"http://www.msftconnecttest.com/connecttest.txt",
-    L"http://www.gstatic.com/generate_204",
     L"http://connect.rom.miui.com/generate_204",
+    L"http://www.gstatic.com/generate_204",
 };
 
 enum class Display { Checking, Online, Slow, Offline, Unusable };
@@ -353,6 +352,8 @@ struct Status {
     bool link_disconnected = false;
     OfflineReason outage_reason = OfflineReason::None;
     double outage_latency_ms = NAN;
+    std::array<ProbeEndpoint,2> endpoints{};
+    ULONGLONG sampled_tick=0;
 };
 
 class CsLock {
@@ -518,7 +519,12 @@ struct NetProbe::Impl {
     NetProbe::View Get() const {
         if (!cs_ready_) return view_;
         CsLock lock(&status_cs_);
-        return view_;
+        auto view=view_;
+        if(!status_.link_disconnected&&status_.sampled_tick&&GetTickCount64()-status_.sampled_tick>static_cast<ULONGLONG>(config_.interval_s)*3000+3000){
+            view.state=NetState::Checking;view.latency_ms=NAN;
+            for(auto& endpoint:view.endpoints){endpoint.state=ProbeState::Stale;endpoint.latency_ms=NAN;}
+        }
+        return view;
     }
 
     void SetSlowThreshold(int slow_ms) {
@@ -527,7 +533,6 @@ struct NetProbe::Impl {
         // Classification and configuration share this lock with ApplyResult.
         // Do not change failure counts, outage timestamps, logs or notifications.
         if (status_.has_result && status_.latest_ok &&
-            status_.latest_ms < static_cast<ULONGLONG>(config_.unusable_ms) &&
             (status_.display == Display::Online || status_.display == Display::Slow)) {
             status_.display = status_.latest_ms >= static_cast<ULONGLONG>(config_.slow_ms)
                                   ? Display::Slow : Display::Online;
@@ -585,6 +590,27 @@ struct NetProbe::Impl {
         if (network_event_) SetEvent(network_event_);
     }
 
+ #ifdef PULSE_DEVELOPMENT
+    bool CheckForDevelopment(){
+        Settings settings;settings.fail_threshold=1;config_=Normalize(settings);
+        auto apply=[&](bool ok,ULONGLONG ms){return ApplyResult(ok,ms,true,power_epoch_);};
+        round_endpoints_[0]={ProbeState::Success,25,L""};round_endpoints_[1]={ProbeState::Timeout,NAN,L""};
+        if(!apply(true,25))return false;
+        auto v=Get();
+        if(v.state!=NetState::Online||v.latency_ms!=25||v.endpoints[0].latency_ms!=25||
+            v.endpoints[1].state!=ProbeState::Timeout||!std::isnan(v.endpoints[1].latency_ms))return false;
+        round_endpoints_[0]={ProbeState::Timeout,NAN,L""};round_endpoints_[1]={ProbeState::Success,1250,L""};
+        if(!apply(true,1250)||Get().state!=NetState::Slow||Get().offline_since_unix!=0)return false;
+        round_endpoints_[1]={ProbeState::Failed,NAN,L""};
+        if(!apply(false,0)||Get().state!=NetState::Offline)return false;
+        status_.sampled_tick=GetTickCount64()-19000;v=Get();
+        if(v.state!=NetState::Checking||v.endpoints[0].state!=ProbeState::Stale||!std::isnan(v.latency_ms))return false;
+        status_.link_disconnected=true;view_=MakeView(status_);
+        if(Get().state!=NetState::Offline||Get().endpoints[0].state!=ProbeState::Failed)return false;
+        OnSuspend();v=Get();
+        return v.state==NetState::Checking&&std::isnan(v.endpoints[0].latency_ms)&&std::isnan(v.endpoints[1].latency_ms);
+    }
+ #endif
 private:
     std::wstring ResetAfterResumeLocked(bool detected_gap) {
         suspended_ = false;
@@ -755,6 +781,27 @@ private:
         // Snapshot requests before RAII cancellation, preserving the real error.
         // Formatting/file I/O stays off the callbacks and healthy result path.
         auto finish = [&](bool ok, const wchar_t* reason, DWORD fallback) {
+            // Complete both independent targets. One successful endpoint must
+            // neither cancel the other nor turn its failure into a latency value.
+            ok=false;
+            for(auto& endpoint:round_endpoints_){endpoint.state=fallback==ERROR_WINHTTP_TIMEOUT?ProbeState::Timeout:ProbeState::Failed;endpoint.latency_ms=NAN;}
+            for(const auto& item:requests){
+                auto* p=item->probe;
+                const bool headers=p&&p->headers.load(std::memory_order_acquire);
+                const auto response=headers?p->response_tick.load(std::memory_order_relaxed):0;
+                const auto duration=headers?ProbeElapsedMs(item->start_tick,response):0;
+                const bool late=headers&&ProbeElapsedMs(start,response)>budget;
+                const bool success=headers&&item->http_known&&!item->http_error&&!late;
+                const bool timeout=late||(p&&p->timed_out.load(std::memory_order_relaxed))||
+                    (!headers&&!(p&&p->failed.load(std::memory_order_acquire))&&!item->setup_error&&fallback==ERROR_WINHTTP_TIMEOUT);
+                if(item->url_index<round_endpoints_.size()){
+                    auto& endpoint=round_endpoints_[item->url_index];
+                    endpoint.state=success?ProbeState::Success:timeout?ProbeState::Timeout:ProbeState::Failed;
+                    endpoint.latency_ms=success?static_cast<double>(duration):NAN;
+                }
+                // Stable primary preference; never silently pick the fastest region.
+                if(success&&!ok){elapsed=duration;ok=true;}
+            }
             if (trace && (!ok || elapsed >= static_cast<ULONGLONG>(config_.unusable_ms))) {
                 for (const auto& item : requests) {
                     const ProbeContext* p = item->probe;
@@ -810,7 +857,7 @@ private:
                         if (!item->http_known) {
                             item->http_error = GetLastError();
                             if (!item->http_error) item->http_error = ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
-                        } else if (!ProbeHttpStatusOk(item->http_status)) {
+                        } else if (!ProbeHttpStatusOk(item->http_status,config_.urls[item->url_index].find(L"/generate_204")!=std::wstring::npos)) {
                             item->http_error = ERROR_WINHTTP_INVALID_SERVER_RESPONSE;
                         }
                     }
@@ -831,14 +878,6 @@ private:
                     // failed's acquire above makes the callback's timeout flag visible.
                     timed_out = true;
                 }
-            }
-            if (winner) {
-                elapsed = ProbeElapsedMs(start, winner);
-                if (elapsed > budget) {
-                    timed_out = true;
-                    return finish(false, L"late_headers", ERROR_WINHTTP_TIMEOUT);
-                }
-                return finish(true, L"headers", ERROR_SUCCESS); // RAII cancels losing requests.
             }
             const ULONGLONG spent = ProbeElapsedMs(start, ProbeClockNow());
             if (!pending || spent >= budget) {
@@ -882,6 +921,13 @@ private:
         view.offline_since_unix = state.outage_active ? state.outage_unix : 0;
         view.offline_reason = state.outage_active ? state.outage_reason : OfflineReason::None;
         view.offline_latency_ms = state.outage_active ? state.outage_latency_ms : NAN;
+        view.endpoints=state.endpoints;
+        for(size_t i=0;i<view.endpoints.size()&&i<config_.urls.size();++i){
+            URL_COMPONENTS parts{};parts.dwStructSize=sizeof(parts);parts.dwHostNameLength=static_cast<DWORD>(-1);
+            if(WinHttpCrackUrl(config_.urls[i].c_str(),0,0,&parts)&&parts.lpszHostName)
+                view.endpoints[i].host.assign(parts.lpszHostName,parts.dwHostNameLength);
+            if(state.link_disconnected){view.endpoints[i].state=ProbeState::Failed;view.endpoints[i].latency_ms=NAN;}
+        }
         return view;
     }
 
@@ -956,7 +1002,9 @@ private:
             state.has_result = true;
             state.latest_ok = ok;
             state.latest_ms = ms;
-            if (ok && ms < static_cast<ULONGLONG>(config_.unusable_ms)) {
+            state.endpoints=round_endpoints_;
+            state.sampled_tick=tick;
+            if (ok) {
                 if (state.outage_active) {
                     const ULONGLONG duration = tick - state.first_failure_tick;
                     event.reason = state.outage_reason;
@@ -1185,12 +1233,11 @@ private:
             // Once unavailable or after a NIC change, race all addresses within
             // one 1.5 s deadline. Steady healthy operation still uses only the
             // primary (and falls back only on failure), preserving its power use.
-            const bool parallel = fast || race_next;
+            const bool parallel = true;
             race_next = false;
+            round_endpoints_={};
             bool ok = !config_.urls.empty() &&
-                ProbeUrls(0, parallel ? config_.urls.size() : 1, ms, round_start, timed_out, trace_out);
-            if (!parallel && !ok && !Interrupted() && config_.urls.size() > 1)
-                ok = ProbeUrls(1, config_.urls.size(), ms, round_start, timed_out, trace_out);
+                ProbeUrls(0, config_.urls.size(), ms, round_start, timed_out, trace_out);
             if (Stopping()) break;
             // Includes sleep that occurred inside an async WinHTTP wait, even
             // when WM_POWERBROADCAST was missed. Never apply that stale result.
@@ -1209,7 +1256,7 @@ private:
             if (!ok) ms = 0;
             const bool applied = ApplyResult(ok, ms, timed_out, epoch);
             if (!applied) ++cancelled_rounds_;
-            if (applied && ok && ms < static_cast<ULONGLONG>(config_.unusable_ms))
+            if (applied && ok)
                 last_success_tick_ = GetTickCount64();
             else if (trace_round)
                 LogProbeRound(round, round_start, ok, ms, timed_out, parallel, epoch,
@@ -1231,6 +1278,7 @@ private:
     }
 
     Config config_{};
+    std::array<ProbeEndpoint,2> round_endpoints_{};
     Status status_{};
     NetProbe::View view_{};
     mutable CRITICAL_SECTION status_cs_{};
@@ -1257,6 +1305,9 @@ private:
 };
 
 NetProbe::NetProbe() : impl_(new Impl) {}
+#ifdef PULSE_DEVELOPMENT
+bool NetProbe::CheckForDevelopment(){NetProbe probe;return probe.impl_->CheckForDevelopment();}
+#endif
 
 NetProbe::~NetProbe() { delete impl_; }
 

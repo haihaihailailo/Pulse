@@ -70,10 +70,18 @@ if stage=='release-source':
     check(isinstance(message,str) and 1<=len(message)<=200 and not any(ord(c)<32 for c in message),'Invalid commit message')
     gh=Path(r'C:\Program Files\GitHub CLI\gh.exe');check(gh.is_file(),'Verified gh is missing')
     audit=ROOT/'dev-work/evidence'/('release-source-'+tag)
-    progress=(audit/'source-progress.jsonl').open('x',encoding='utf-8')
+    progress_file=audit/'source-progress.jsonl'
+    previous=[json.loads(line) for line in progress_file.read_text(encoding='utf-8').splitlines()] if progress_file.exists() else []
+    if previous:
+        check(previous[0]['operation']=='prepared' and all(previous[0]['response'][k]==v for k,v in
+              [('base',base),('branch',branch),('tag',tag)]),'Source continuation target differs')
+        check(not any(row['operation'] in ('git/trees','git/commits','commit-prepared','git/refs') or
+              (row['operation']=='intent' and row['response']['endpoint']!='git/blobs') for row in previous),
+              'Source advanced beyond blobs; inspect immutable commit/ref checkpoint before continuing')
+    progress=progress_file.open('a' if previous else 'x',encoding='utf-8')
     def record(operation,value):
         progress.write(json.dumps(dict(operation=operation,response=value),ensure_ascii=False)+'\n');progress.flush();os.fsync(progress.fileno())
-    def github(tail,payload=None):
+    def github(tail,payload=None,missing=False):
         command=[str(gh),'api','repos/'+REPO+'/'+tail]
         body=None
         if payload is not None:
@@ -81,6 +89,10 @@ if stage=='release-source':
             command+=['--method','POST','--input','-']
             record('intent',dict(endpoint=tail,bodySha256=digest(body)))
         completed=subprocess.run(command,input=body,capture_output=True,timeout=30)
+        if missing and completed.returncode!=0:
+            try: absent=json.loads(completed.stdout)
+            except (ValueError,UnicodeDecodeError): absent={}
+            if str(absent.get('status'))=='404' and 'HTTP 404' in completed.stderr.decode('utf-8','replace'): return None
         check(completed.returncode==0,completed.stderr.decode('utf-8','replace')[:1000])
         check(len(completed.stdout)<4*1024*1024,'Git response bound')
         value=json.loads(completed.stdout)
@@ -106,10 +118,12 @@ if stage=='release-source':
     check(not prior_tree.get('truncated'),'Base tree truncated')
     prior={x['path']:x['sha'] for x in prior_tree['tree'] if x['type']=='blob'}
     rows=[]
+    acknowledged={row['response']['sha'] for row in previous if row['operation']=='git/blobs'}
     for p,text in content.items():
         raw=text.encode('utf-8');expected=hashlib.sha1(b'blob '+str(len(raw)).encode()+b'\0'+raw).hexdigest()
         if prior.get(p)==expected: continue
-        blob=github('git/blobs',dict(content=text,encoding='utf-8'))
+        blob=dict(sha=expected) if expected in acknowledged else github('git/blobs/'+expected,missing=True) if previous else None
+        if blob is None: blob=github('git/blobs',dict(content=text,encoding='utf-8'))
         check(blob['sha']==expected,'Remote blob differs: '+p)
         rows.append(dict(path=p,mode='100644',type='blob',sha=blob['sha']))
     check(rows,'No source changes to publish')

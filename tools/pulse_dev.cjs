@@ -138,6 +138,7 @@ function reconcileCapacity() {
   const rawInput=fs.readFileSync(0,'utf8').replace(/^\uFEFF/,'');
   if(Buffer.byteLength(rawInput)>8192)fail('Oversized reconciliation input');
   const input=JSON.parse(rawInput);
+  if(['fixtures','fixture-refusal'].includes(input.mode))return require('./pulse_fixture_recovery.cjs')({root,storage,config,child,quiescent,policy:memoryPolicy('daily'),input});
   if(input.mode==='limits') return reconcileLimits(input);
   const preflight=input.mode==='preflight';
   const entries=input.mode==='entries';
@@ -432,12 +433,14 @@ async function main() {
   }
   const policy = memoryPolicy(profile);
   const sources = workflowTest ? [] : fs.readdirSync(path.join(root,'src')).filter(x => /\.(cpp|h|ps1)$/.test(x)).sort().map(x => ownFile(path.join(root,'src',x)));
+  if(!workflowTest)for(const name of ['LiteUI.cs','PulseSettings.cs'])sources.push(ownFile(path.join(root,'src/settings_ui',name)));
   const upstreamTests = workflowTest ? [] : fs.readdirSync(path.join(root,'tests')).filter(x => /\.(cpp|ps1)$/.test(x)).sort().map(x => ownFile(path.join(root,'tests',x)));
   const inputs = workflowTest ? ['tools/Pulse-Dev.ps1','tools/pulse_dev.cjs','tools/pulse_dev_worker.py',
     'tools/publish_upstream_20261110.cjs','tools/pulse_release_flow.cjs','tools/pulse_workflow_selftest.cjs','tools/pulse_build_identity.cjs','tools/pulse_artifact_review.cjs',
     'tools/pulse_artifact_retire.cjs','tools/pulse_artifact_delete.py','tools/pulse_artifact_retirement_selftest.py','tools/shared/pulse_artifact_storage_v3.cjs',
-    'tools/dev-environment.local.json','local-artifact-policy.json'].map(x=>ownFile(path.join(root,x))) :
-    [...sources, ...upstreamTests, ...['app.rc','app.manifest','pulse.ico','tools/pulse_dev_worker.py','tools/pulse_dev.cjs','tools/pulse_build_identity.cjs',
+    'tools/dev-environment.local.json','local-artifact-policy.json','tools/pulse_settings_package_selftest.py','tools/pulse_fixture_archive.py',
+    'scripts/publish_custom_release.py','THIRD_PARTY_NOTICES.md','LICENSE','app.rc','src/updater.h'].map(x=>ownFile(path.join(root,x))) :
+    [...sources, ...upstreamTests, ...['app.rc','app.manifest','pulse.ico','tools/build_settings_ui.ps1','THIRD_PARTY_NOTICES.md','tools/pulse_dev_worker.py','tools/pulse_dev.cjs','tools/pulse_build_identity.cjs',
     'local-artifact-policy.json','tools/dev-environment.local.json','tools/development-defaults.ini',
     'tools/pulse_capacity_migration.cjs'].map(x => ownFile(path.join(root,x)))];
   let artifact = null;
@@ -553,6 +556,7 @@ async function main() {
     jobMiB:512, outputLimitBytes:262144,
     targetDirectory:building ? buildDir : sessionDir,
     purpose:'Isolated development only; no installation, production writes or publication'};
+  if(workflowTest){plan.fixtureArchive=path.join(evidence,id+'-fixtures.zip');plan.fixtureJournal=path.join(evidence,id+'-fixtures-deletions.jsonl');}
   if (building && !build) {
     const existing = fs.existsSync(managed) ? storage.usage(managed) : {bytes:0,files:0};
     const maximum=json(path.join(root,'local-artifact-policy.json')).managed_directories['dev-work/builds'].maximum_bytes;
@@ -562,7 +566,9 @@ async function main() {
     purpose:plan.purpose, managedDirectories:[{path:managed}],
     assertManagedQuiescent:() => quiescent(managed),
     targets:[{path:planFile,purpose:'Exact inputs, paths and resource reservation before execution',estimatedBytes:65536},
-      {path:receiptFile,purpose:'Bounded critical verification receipt',estimatedBytes:2097152}]}, async () => {
+      {path:receiptFile,purpose:'Bounded critical verification receipt',estimatedBytes:2097152},
+      ...(workflowTest?[{path:plan.fixtureArchive,purpose:'Exact completed synthetic fixtures archive',estimatedBytes:2097152},
+        {path:plan.fixtureJournal,purpose:'Same-handle fixture retirement journal',estimatedBytes:524288}]:[])]}, async () => {
     fs.mkdirSync(evidence,{recursive:true});
     fs.mkdirSync(managed,{recursive:true});
     const serialized = JSON.stringify(plan,null,2) + '\n';
@@ -580,6 +586,14 @@ async function main() {
       fs.writeFileSync(receiptFile,JSON.stringify({status:'FAILED',error:outcome.output.slice(-16000),code:outcome.code})+'\n',{flag:'wx'});
     }
     const receipt = json(receiptFile);
+    if(workflowTest&&receipt.status!=='PASS') {
+      // Optional stages may not have started. Preserve failure fixtures and
+      // materialize explicit NOT_RUN evidence so registration can still finish.
+      if(!fs.existsSync(plan.fixtureArchive))fs.writeFileSync(plan.fixtureArchive,
+        Buffer.from('504b0506000000000000000000000000000000000000','hex'),{flag:'wx'});
+      if(!fs.existsSync(plan.fixtureJournal))fs.writeFileSync(plan.fixtureJournal,
+        JSON.stringify({status:'NOT_RUN',reason:'Tool check failed before fixture retirement; preserve all failure materials'})+'\n',{flag:'wx'});
+    }
     return {status:receipt.status,action,buildKey,buildDir,sessionDir:building?null:sessionDir,
       receipt:receiptFile,error:receipt.error || null,policy,slots:receipt.slots};
   });

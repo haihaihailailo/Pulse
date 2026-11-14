@@ -1228,6 +1228,9 @@ private:
         const int themeBeforeCaptures=config_.theme;Command(CmdTheme+1);
         Snapshot sample{};
         sample.percent = 68; sample.cpu_percent = 24; sample.mem_percent = 48;
+        sample.net_state=NetState::Online;sample.latency_ms=32;
+        sample.endpoints[0]={ProbeState::Success,32,L"connect.rom.miui.com"};
+        sample.endpoints[1]={ProbeState::Timeout,NAN,L"www.gstatic.com"};
         for (auto mode : {DisplayMode::Full, DisplayMode::Compact}) {
             SetMode(mode);
             for (int zoom : {30, 100, 200}) {
@@ -1391,6 +1394,7 @@ private:
             while(count++<200&&PeekMessageW(&message,nullptr,0,0,PM_REMOVE)) {
                 if(!settingsWindow_.Translate(message)){TranslateMessage(&message);DispatchMessageW(&message);}
             }
+            if(settingsWindow_.Handle())settingsWindow_.SettleForTest();
         };
         const auto previousLanguage=config_.language;
         Command(CmdLanguage+1);
@@ -1419,11 +1423,12 @@ private:
         require(languageControl!=nullptr,"Settings language control missing");
         SendMessageW(languageControl,CB_SETCURSEL,2,0);
         SendMessageW(GetParent(languageControl),WM_COMMAND,MAKEWPARAM(GetDlgCtrlID(languageControl),CBN_SELCHANGE),reinterpret_cast<LPARAM>(languageControl));
-        drainSettings();require(config_.language==i18n::Preference::English,"Settings combo did not apply language");
+        drainSettings();settingsWindow_.SettleForTest();require(config_.language==i18n::Preference::English,"Settings combo did not apply language");
         settingsWindow_.SelectPageForTest(5);
         const UINT settingsDpi=GetDpiForWindow(settingsWindow_.Handle());
         SetWindowPos(settingsWindow_.Handle(),nullptr,0,0,MulDiv(700,settingsDpi,96),MulDiv(460,settingsDpi,96),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
         drainSettings();
+        require(settingsWindow_.ScrollForTest(),"Settings repeated scrolling changed child layout");
         if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-english-narrow.bmp").c_str());
         settingsWindow_.Close();require(!settingsWindow_.Handle(),"Settings close left window alive");
         const auto optimizationState=config_;
@@ -1481,8 +1486,8 @@ private:
         settingsWindow_.SelectPageForTest(7);drainSettings();
         const auto edit=settingsWindow_.ControlForTest(CmdDeviceAlias);
         require(edit!=nullptr,"Peripheral alias edit missing");
-        SetWindowTextW(edit,L"办公鼠标 🖱");
-        SendMessageW(GetParent(edit),WM_COMMAND,MAKEWPARAM(GetDlgCtrlID(edit),EN_KILLFOCUS),reinterpret_cast<LPARAM>(edit));
+        require(SendMessageW(edit,WM_SETTEXT,0,reinterpret_cast<LPARAM>(L"办公鼠标 🖱"))!=0,"Peripheral alias text was not accepted");
+        settingsWindow_.CommitForTest();
         drainSettings();
         Config savedDevice;
         require(savedDevice.Load()&&!savedDevice.devices.empty()&&savedDevice.devices.front().alias==L"办公鼠标 🖱",
@@ -1509,7 +1514,7 @@ private:
         selectedDevice_=L"test-mouse";settingsWindow_.SelectPageForTest(7);drainSettings();
         if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-peripherals.bmp").c_str());
         const auto closingEdit=settingsWindow_.ControlForTest(CmdDeviceAlias);
-        SetFocus(closingEdit);SetWindowTextW(closingEdit,L"关闭前编辑");
+        require(SendMessageW(closingEdit,WM_SETTEXT,0,reinterpret_cast<LPARAM>(L"关闭前编辑"))!=0,"Closing alias edit was not accepted");
         settingsWindow_.Close();
         savedDevice.Load();
         require(std::any_of(savedDevice.devices.begin(),savedDevice.devices.end(),[](const auto& d){return d.id==L"test-mouse"&&d.alias==L"关闭前编辑";}),
@@ -2225,6 +2230,7 @@ private:
         };
         sourceChoice(SettingsText(L"网速来源",L"Network source"),SettingsText(L"自动汇总物理网卡",L"Automatic physical adapters"),networkChoices_,config_.networkSource,CmdNetworkSource);
         sourceChoice(SettingsText(L"磁盘读写与空间来源",L"Disk I/O and space source"),SettingsText(L"全部读写 / 系统盘空间",L"All I/O / system volume space"),diskChoices_,config_.diskSource,CmdDiskSource);
+        note(L"国内：http://connect.rom.miui.com/generate_204\n国外：http://www.gstatic.com/generate_204\n两路每 5 秒独立检测；HTTP 耗时包含连接和响应头等待，使用系统代理设置，并非 ICMP Ping。目标服务或代理异常不等于整条线路断网。",L"China: http://connect.rom.miui.com/generate_204\nGlobal: http://www.gstatic.com/generate_204\nIndependent checks every 5 seconds. HTTP duration includes connection and response headers, using system proxy settings; it is not ICMP Ping. Target or proxy failures do not prove that the whole connection is down.");
         single(CmdPeripheralRefresh,Kind::Action);
         section(L"刷新与提醒",L"Refresh & alerts");
         choice(SettingsText(L"完整模式刷新间隔",L"Full panel refresh"),CmdRefresh,RefreshIntervals.size());
