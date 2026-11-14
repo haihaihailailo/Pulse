@@ -1836,6 +1836,7 @@ struct Metrics::Impl {
     Impl& operator=(const Impl&) = delete;
 
     Snapshot Take(bool full);
+    void SetInputSources(const std::wstring& network,const std::wstring& disk);
     void ResumePeripherals() { peripherals_.Enable(!paused_.load() && CurrentWants().peripherals); }
     void ApplyWants(const Wants& wants) {
         want_bits_.store(PackWants(wants), std::memory_order_release);
@@ -1844,6 +1845,7 @@ struct Metrics::Impl {
 
     NetProbe probe;
     PeripheralMonitor peripherals_;
+    std::wstring selected_network_,selected_disk_;
     std::atomic<bool> paused_{false};
     std::atomic<bool> reset_intervals_{false};
     Snapshot last_{};
@@ -2130,7 +2132,8 @@ bool Metrics::Impl::DiscoverNics(std::vector<ULONG>& out) const {
     out.clear();
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IF_ROW2& row = table->Table[i];
-        if (IsPhysicalNic(row) && row.OperStatus == IfOperStatusUp) {
+        wchar_t id[40]{};StringFromGUID2(row.InterfaceGuid,id,40);
+        if ((selected_network_.empty()?IsPhysicalNic(row):_wcsicmp(selected_network_.c_str(),id)==0) && row.OperStatus == IfOperStatusUp) {
             out.push_back(row.InterfaceIndex);
         }
     }
@@ -2151,7 +2154,7 @@ void Metrics::Impl::UpdateNet(Snapshot& s, unsigned long long now) {
     }
     uint64_t rx = 0;
     uint64_t tx = 0;
-    bool complete = true;
+    bool complete = !nics_.empty();
     for (ULONG index : nics_) {
         MIB_IF_ROW2 row;
         std::memset(&row, 0, sizeof(row));
@@ -2992,10 +2995,9 @@ bool Metrics::Impl::EnsureDisk(unsigned long long now) {
     if (disk_ok_) return true;
     if (now < disk_retry_at_) return false;
     disk_retry_at_ = now + kPdhRetryMs;
-    const CounterBind binds[] = {
-        {L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", &disk_read_counter_},
-        {L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", &disk_write_counter_},
-    };
+    const auto prefix=selected_disk_.empty()?std::wstring(L"\\PhysicalDisk(_Total)\\"):L"\\LogicalDisk("+selected_disk_+L")\\";
+    const auto read=prefix+L"Disk Read Bytes/sec",write=prefix+L"Disk Write Bytes/sec";
+    const CounterBind binds[] = {{read.c_str(),&disk_read_counter_},{write.c_str(),&disk_write_counter_}};
     disk_warmed_ = false;
     disk_ok_ = OpenEnglishQuery(disk_query_, binds, 2);
     return disk_ok_;
@@ -3354,6 +3356,7 @@ void Metrics::Impl::UpdateSysDisk(unsigned long long now, Snapshot& s) {
             return;
         }
         sys_root_[0] = dir[0];
+        if(!selected_disk_.empty())sys_root_[0]=selected_disk_[0];
         sys_root_[1] = L':';
         sys_root_[2] = L'\\';
         sys_root_[3] = L'\0';
@@ -3811,6 +3814,28 @@ Metrics::~Metrics() { delete impl_; }
 void Metrics::Start(const Settings& s, EventCallback cb, void* user) { impl_->probe.Start(s, cb, user); }
 
 Snapshot Metrics::Sample(bool full) { return impl_->Take(full); }
+void Metrics::RefreshPeripherals() { impl_->peripherals_.Refresh(); }
+void Metrics::SetInputSources(const std::wstring& network,const std::wstring& disk) {
+    impl_->SetInputSources(network,disk);
+}
+void Metrics::Impl::SetInputSources(const std::wstring& network,const std::wstring& disk) {
+    if(selected_network_!=network){selected_network_=network;nics_ready_=false;have_net_=false;}
+    const auto valid=disk.empty()||(disk.size()==2&&disk[0]>=L'A'&&disk[0]<=L'Z'&&disk[1]==L':');
+    if(valid&&selected_disk_!=disk){selected_disk_=disk;ReleaseDisk();ReleaseSysDisk();sys_root_ready_=false;}
+}
+std::vector<InputDevice> Metrics::NetworkAdapters() {
+    std::vector<InputDevice> devices;PMIB_IF_TABLE2 table=nullptr;
+    if(GetIfTable2(&table)!=NO_ERROR||!table)return devices;
+    for(ULONG i=0;i<table->NumEntries&&devices.size()<64;++i){const auto& row=table->Table[i];if(row.Type==IF_TYPE_SOFTWARE_LOOPBACK)continue;
+        wchar_t id[40]{};StringFromGUID2(row.InterfaceGuid,id,40);devices.push_back({id,row.Alias[0]?row.Alias:row.Description});}
+    FreeMibTable(table);return devices;
+}
+std::vector<InputDevice> Metrics::Disks() {
+    std::vector<InputDevice> devices;const DWORD drives=GetLogicalDrives();
+    for(int i=0;i<26;++i)if(drives&(1u<<i)){wchar_t root[]{static_cast<wchar_t>(L'A'+i),L':',L'\\',0};const UINT type=GetDriveTypeW(root);
+        if(type==DRIVE_FIXED||type==DRIVE_REMOVABLE){std::wstring id(root,2);devices.push_back({id,id});}}
+    return devices;
+}
 
 void Metrics::SetWants(const Wants& w) { impl_->ApplyWants(w); }
 #ifdef PULSE_DEVELOPMENT

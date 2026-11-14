@@ -64,7 +64,7 @@ struct Snapshot {
     double gpu_percent = NAN;         // GPU 3D 引擎占用
 
     // —— 网络 ——
-    double down_bps = 0, up_bps = 0;  // 字节/秒，只统计物理网卡
+    double down_bps = NAN, up_bps = NAN;  // 字节/秒；未取得有效区间时未知
     uint64_t rx_total = 0, tx_total = 0;  // 本次启动以来
     NetState net_state = NetState::Checking;
     double latency_ms = NAN;          // 最近一次探测延迟（失败为 NaN）
@@ -186,6 +186,7 @@ struct Wants {
     bool peripherals = false;
 };
 
+struct InputDevice {std::wstring id,name;};
 class Metrics {
 public:
     // event_cb 在后台线程调用，界面需自行 PostMessage 回 UI 线程。
@@ -216,6 +217,10 @@ public:
     // UI/sample-thread operations. Empty id selects the busiest physical adapter.
     std::vector<GpuAdapter> GpuAdapters();
     void SetGpuAdapter(const std::wstring& id);
+    void RefreshPeripherals();
+    std::vector<InputDevice> NetworkAdapters();
+    std::vector<InputDevice> Disks();
+    void SetInputSources(const std::wstring& network,const std::wstring& disk);
 
 private:
 #ifdef PULSE_DEVELOPMENT

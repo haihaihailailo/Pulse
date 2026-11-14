@@ -12,6 +12,7 @@ enum class PeripheralState { Reading, Ready, Unavailable };
 struct PeripheralSnapshot {
     PeripheralState state = PeripheralState::Reading;
     std::vector<PeripheralBattery> devices;
+    unsigned long long sampledAt = 0;
 };
 namespace peripheral {
 inline int Percentage(unsigned value) { return value <= 100 ? static_cast<int>(value) : -1; }

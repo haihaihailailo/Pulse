@@ -67,7 +67,7 @@ const Entry strings[] = {
     {L"功耗走势图", L"Power chart"}, // PowerChartItems
     {L"进程前三", L"Top processes"}, // ProcessesItems
     {L"磁盘读写速度", L"Disk speed"}, // DiskIOItems
-    {L"系统盘占用", L"System drive usage"}, // SystemDiskItems
+    {L"磁盘空间占用", L"Disk space usage"}, // SystemDiskItems
     {L"电量 %", L"Battery %"}, // BatteryPercent
     {L"续航/充满", L"Time left / Full in"}, // EtaItems
     {L"总功耗", L"Power"}, // TotalPower
@@ -87,7 +87,7 @@ const Entry strings[] = {
     {L"网络", L"Network"}, // Network
     {L"延迟", L"Latency"}, // Latency
     {L"占用最高的进程", L"Top processes"}, // TopProcesses
-    {L"系统盘", L"System drive"}, // SystemDrive
+    {L"磁盘空间", L"Disk space"}, // SystemDrive
     {L"系统信息", L"System info"}, // SystemInfo
     {L"显卡", L"GPU"}, // GpuMemory (settings key remains gpu_memory)
     {L"Wi-Fi", L"Wi-Fi"}, // Wifi
@@ -234,7 +234,7 @@ const Entry strings[] = {
     {L"独显 ", L"dGPU "}, // DgpuPrefix
     {L"独显休眠", L"dGPU idle"}, // DgpuSleeping
     {L"靠边吸附", L"Snap to screen edges"},
-    {L"鼠标穿透（点击托盘图标恢复）", L"Click through (click tray icon to restore)"},
+    {L"鼠标穿透", L"Click through"},
     {L"未提供", L"N/A"},
     {L"需位置权限", L"Location access needed"},
     {L"未连接", L"Disconnected"},

@@ -21,19 +21,36 @@ void LightControl(HWND window) {
     if (allow) allow(window, FALSE);
 }
 }
-SettingsWindow::~SettingsWindow() { Close(); }
+SettingsWindow::~SettingsWindow() { Close();if(background_)DeleteObject(background_); }
+void SettingsWindow::SetDark(bool dark) {
+    if(dark_==dark&&background_)return;
+    CommitText();
+    dark_=dark;
+    if(background_)DeleteObject(background_);background_=CreateSolidBrush(Background());
+    if(window_) {
+        BOOL enabled=dark_;DwmSetWindowAttribute(window_,20,&enabled,sizeof(enabled));
+        Rebuild(true);RedrawWindow(window_,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
+    }
+}
 int SettingsWindow::Px(int value) const { return MulDiv(value, dpi_, 96); }
 HWND SettingsWindow::Add(const wchar_t* type, const std::wstring& text, DWORD style, int id, HWND parent) {
+    if(std::wstring(type)==L"STATIC")style|=SS_NOPREFIX;
     HWND result = CreateWindowExW(0, type, text.c_str(), WS_CHILD | WS_VISIBLE | style,
         0, 0, 1, 1, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     if (!result) throw std::runtime_error("Cannot create settings control");
     LightControl(result);
+    // Classic checkbox text honors WM_CTLCOLORBTN; retain standard interaction.
+    if(dark_ && std::wstring(type)==L"BUTTON" && (style&BS_AUTOCHECKBOX)==BS_AUTOCHECKBOX) {
+        static HMODULE theme=LoadLibraryExW(L"uxtheme.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        using SetTheme=HRESULT(WINAPI*)(HWND,LPCWSTR,LPCWSTR);
+        auto fn=theme?reinterpret_cast<SetTheme>(GetProcAddress(theme,"SetWindowTheme")):nullptr;if(fn)fn(result,L"",L"");
+    }
     SendMessageW(result, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     return result;
 }
 bool SettingsWindow::Open(HWND owner, Read read, Apply apply) {
     if (window_) { Refresh(); ShowWindow(window_, SW_RESTORE); SetForegroundWindow(window_); return true; }
-    read_ = std::move(read); apply_ = std::move(apply); page_ = 0; scroll_ = 0; saveOk_ = true;
+    read_ = std::move(read); apply_ = std::move(apply); saveOk_ = true;
     dpi_ = GetDpiForWindow(owner);
     if (!dpi_) dpi_ = 96;
     WNDCLASSW cls{}; cls.lpfnWndProc = Procedure; cls.hInstance = GetModuleHandleW(nullptr);
@@ -52,7 +69,13 @@ bool SettingsWindow::Open(HWND owner, Read read, Apply apply) {
     ShowWindow(result, SW_SHOWNORMAL); UpdateWindow(result); SetForegroundWindow(result);
     return true;
 }
-void SettingsWindow::Close() { if (window_) DestroyWindow(window_); }
+void SettingsWindow::CommitText() {
+    if(rebuilding_||applying_||pages_.empty())return;
+    for(const auto& control:controls_)if(!control.label&&control.window==GetFocus()&&pages_[page_].rows[control.row].kind==SettingRow::Kind::Text) {
+        Invoke(GetDlgCtrlID(control.window),EN_KILLFOCUS);break;
+    }
+}
+void SettingsWindow::Close() { if (window_) {CommitText();DestroyWindow(window_);} }
 bool SettingsWindow::Translate(MSG& message) {
     if (!window_ || !IsDialogMessageW(window_, &message)) return false;
     HWND focus=GetFocus();
@@ -65,6 +88,42 @@ bool SettingsWindow::Translate(MSG& message) {
     return true;
 }
 void SettingsWindow::Refresh() { if (window_) PostMessageW(window_, RefreshMessage, 0, 0); }
+void SettingsWindow::UpdateValues() {
+    auto next = read_();
+    bool same = next.size() == pages_.size() && page_ < next.size();
+    if(same) {
+        const auto p=page_;
+        same = next[p].title == pages_[p].title && next[p].rows.size() == pages_[p].rows.size();
+        for (size_t r=0; same && r<next[p].rows.size(); ++r) {
+            const auto& a=next[p].rows[r]; const auto& b=pages_[p].rows[r];
+            same = a.label==b.label && a.kind==b.kind && a.options.size()==b.options.size();
+            for (size_t o=0; same && o<a.options.size(); ++o)
+                same = a.options[o].command==b.options[o].command && a.options[o].label==b.options[o].label;
+        }
+    }
+    if (!same) {
+        // A device arrival must not destroy a name being edited.
+        for(const auto& c:controls_)if(c.window==GetFocus()&&pages_[page_].rows[c.row].kind==SettingRow::Kind::Text)return;
+        Rebuild(true);return;
+    }
+    pages_=std::move(next); rebuilding_=true;
+    for (const auto& c:controls_) {
+        if(c.label)continue;
+        const auto& row=pages_[page_].rows[c.row];
+        if(row.kind==SettingRow::Kind::Note)continue;
+        bool enabled=false;
+        for(size_t i=0;i<row.options.size();++i) {
+            const auto& option=row.options[i]; enabled=enabled||option.enabled;
+            if(row.kind==SettingRow::Kind::Choice && option.checked)SendMessageW(c.window,CB_SETCURSEL,i,0);
+        }
+        if(row.kind==SettingRow::Kind::Toggle && !row.options.empty())
+            SendMessageW(c.window,BM_SETCHECK,row.options.front().checked?BST_CHECKED:BST_UNCHECKED,0);
+        EnableWindow(c.window,enabled);
+    }
+    rebuilding_=false;
+    SetWindowTextW(status_,saveOk_?Words(L"更改立即生效并自动保存",L"Changes apply immediately and save automatically"):
+        Words(L"设置未能保存，原配置已保留。请检查目录权限后重试。",L"Settings could not be saved. The previous file is preserved. Check folder access and retry."));
+}
 void SettingsWindow::Rebuild(bool navigation) {
     rebuilding_ = true;
     int focusId = GetDlgCtrlID(GetFocus());
@@ -92,6 +151,12 @@ void SettingsWindow::Rebuild(bool navigation) {
         if (row.kind == SettingRow::Kind::Note) {
             control = Add(L"STATIC", row.label, SS_LEFT, id, body_);
             controls_.push_back({control,index,y,48,false}); y += 58; continue;
+        }
+        if(row.kind==SettingRow::Kind::Text) {
+            HWND label=Add(L"STATIC",row.label,SS_LEFT,0,body_);controls_.push_back({label,index,y,24,true});
+            control=Add(L"EDIT",row.options.front().label,WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL,id,body_);
+            SendMessageW(control,EM_SETLIMITTEXT,96,0);EnableWindow(control,enabled);
+            controls_.push_back({control,index,y+26,32,false});y+=68;continue;
         }
         if (row.kind == SettingRow::Kind::Toggle) {
             control = Add(L"BUTTON", row.label, WS_TABSTOP | BS_AUTOCHECKBOX | BS_MULTILINE, id, body_);
@@ -141,6 +206,7 @@ void SettingsWindow::Scroll(int position) {
     scroll_ = std::clamp(position, 0, std::max(0,contentHeight_-view));
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS,0,std::max(0,contentHeight_-1),static_cast<UINT>(view),scroll_,0};
     SetScrollInfo(body_, SB_VERT, &info, TRUE);
+    GetClientRect(body_,&rect);
     int width = MulDiv(rect.right,96,dpi_);
     for (const auto& c : controls_) {
         const auto kind = pages_[page_].rows[c.row].kind;
@@ -157,6 +223,12 @@ void SettingsWindow::Invoke(int id, int notification) {
     if (rowIndex >= pages_[page_].rows.size()) return;
     const auto row = pages_[page_].rows[rowIndex];
     size_t option=0;
+    std::wstring text;
+    if(row.kind==SettingRow::Kind::Text) {
+        if(notification!=EN_KILLFOCUS)return;
+        wchar_t value[97]{};GetDlgItemTextW(body_,id,value,97);text=value;
+        if(text==row.options.front().label){Refresh();return;}
+    } else
     if (row.kind == SettingRow::Kind::Choice) {
         if (notification != CBN_SELCHANGE) return;
         auto selected=SendDlgItemMessageW(body_,id,CB_GETCURSEL,0,0);
@@ -165,7 +237,7 @@ void SettingsWindow::Invoke(int id, int notification) {
     } else if (notification != BN_CLICKED) return;
     if (option >= row.options.size() || !row.options[option].enabled) { Refresh(); return; }
     applying_=true;
-    saveOk_=apply_(row.options[option].command);
+    saveOk_=apply_(row.options[option].command,text);
     applying_=false;
     // Rebuild after native control notification unwinds, preserving focus.
     Refresh();
@@ -189,6 +261,12 @@ LRESULT CALLBACK SettingsWindow::Procedure(HWND window,UINT message,WPARAM w,LPA
     return DefWindowProcW(window,message,w,l);
 }
 LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
+    if(message==WM_ERASEBKGND) {RECT r{};GetClientRect(window,&r);FillRect(reinterpret_cast<HDC>(w),&r,background_?background_:GetSysColorBrush(COLOR_WINDOW));return 1;}
+    if(message==WM_CTLCOLORSTATIC||message==WM_CTLCOLORBTN||message==WM_CTLCOLORLISTBOX||message==WM_CTLCOLOREDIT) {
+        SetTextColor(reinterpret_cast<HDC>(w),!saveOk_&&reinterpret_cast<HWND>(l)==status_?RGB(215,65,75):Foreground());
+        SetBkColor(reinterpret_cast<HDC>(w),Background());
+        return reinterpret_cast<LRESULT>(background_?background_:GetSysColorBrush(COLOR_WINDOW));
+    }
     if (window==body_) {
         if (message==WM_COMMAND) { Invoke(LOWORD(w),HIWORD(w)); return 0; }
         if (message==WM_VSCROLL) {
@@ -209,7 +287,7 @@ LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
     }
     switch (message) {
     case WM_CREATE: {
-        LightControl(window); BOOL dark=FALSE; DwmSetWindowAttribute(window,20,&dark,sizeof(dark));
+        LightControl(window); BOOL dark=dark_; DwmSetWindowAttribute(window,20,&dark,sizeof(dark));
         font_=CreateFontW(-Px(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
         headingFont_=CreateFontW(-Px(22),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
         navigation_=Add(L"LISTBOX",L"",WS_TABSTOP | LBS_NOTIFY | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,NavId,window);
@@ -236,7 +314,7 @@ LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
         auto* rect=reinterpret_cast<RECT*>(l);SetWindowPos(window,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOZORDER|SWP_NOACTIVATE);
         Rebuild(true);DeleteObject(old);DeleteObject(oldHeading);return 0;
     }
-    case RefreshMessage: Rebuild(true);return 0;
+    case RefreshMessage: UpdateValues();return 0;
     case WM_COMMAND:
         if (LOWORD(w)==NavId && HIWORD(w)==LBN_SELCHANGE) {
             auto selected=SendMessageW(navigation_,LB_GETCURSEL,0,0);

@@ -1,4 +1,4 @@
-"""Publish an already-tested CI artifact, never rebuild or overwrite a release."""
+"""Package an already-tested artifact, never rebuild or overwrite a release."""
 import hashlib
 import io
 import json
@@ -44,6 +44,8 @@ def package(out, exe, artifact, run, commit):
     archive = out / ('Pulse-' + tag + '-win-x64.zip')
     readme = ('Pulse '+tag+'\nUnzip into a separate folder and run Pulse.exe.\n'
               'Right-click > Settings: appearance, components, sampling, notifications and update tools.\n'
+              'A single tray click keeps click-through enabled; double-click hides or restores the panel.\n'
+              'Use temporary positioning from Settings to move a click-through panel.\n'
               'Create an empty pulse-portable.ini beside the EXE BEFORE launch to use portable data.\n'
               'Right-click > Check for updates: download, verify, replace and restart; settings are preserved.\n'
               'Windows PowerShell 5.1 and write access to the executable directory are required.\n'
@@ -90,6 +92,19 @@ def package(out, exe, artifact, run, commit):
                  '已有带更新功能的定制版可右键「检查更新」下载替换，也可下载 ZIP 解压使用。真实在线升级替换未在本轮执行。\n'
                  '外设支持范围沿用上一版本，未新增接收器协议；用户具体设备仍未实测。\n'
                  '包内不含个人设置、日志和调试文件；附来源清单及 SHA256。旧版本保留供回退，回退前正常退出并备份个人设置。\n\n'
+                 f'源码：https://github.com/{REPO}/commit/{commit}\n')
+    if tag == 'custom-2026.11.14.2':
+        notes = ('全面优化桌面交互、后台采样、设置和外设电量管理，保留现有个性化配置。\n\n'
+                 '- 托盘单击不再关闭鼠标穿透；双击显隐仍保留穿透偏好。新增临时调整位置，拖动结束、Esc 或 30 秒到期恢复。\n'
+                 '- 核心采样移至后台，界面读取缓存；锁屏暂停、解锁恢复，异常时退避。折叠卡片停止其专用采集，低频模式保留合理的数据时效余量。\n'
+                 '- 新增跟随系统、浅色和深色主题，完整卡片排序、折叠与宽度调整，以及网卡和磁盘来源选择。\n'
+                 '- 外设管理支持别名、隐藏、优先排序、手动刷新、更新时间及可关闭的低电提醒。沿用现有设备协议，未新增接收器型号。\n'
+                 '- 配置原子保存并保留一份备份，支持 Unicode 名称、导入导出及保存重试；关闭设置时保存正在编辑的别名。\n'
+                 '- 更新窗口显示版本说明、下载进度和取消；开始替换后禁止取消，继续保留校验与回滚。\n\n'
+                 '功能、配置恢复和代表性界面已通过本地验收；正式下载包通过独立配置启动及重开验证，发布同一份验收 EXE。\n'
+                 '尚未量化长期 CPU/内存改善；用户真实 VGN/ATK/酷雨/OPPO 设备和在线替换安装仍需实机验证。\n'
+                 '已有带更新功能的定制版可右键「检查更新」下载替换，也可下载 ZIP 解压使用。包内不含个人配置、日志或调试文件。\n'
+                 '附来源清单与 SHA256；旧版本保留供回退，回退前正常退出并备份个人设置。\n\n'
                  f'源码：https://github.com/{REPO}/commit/{commit}\n')
     (out/'release-notes.md').write_bytes(notes.encode())
     return tag, files

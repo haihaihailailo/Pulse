@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -49,6 +49,7 @@ struct Layout {
     D2D1_RECT_F Card(FullComponent c) const { return cards[static_cast<size_t>(c)]; }
 };
 Layout FullLayout(const Components& components, float width = 320);
+void SetLightPalette(bool light);
 
 class Renderer {
 public:
@@ -69,6 +70,7 @@ public:
     bool CanRender() const;
     float CompactWidth() const { return compactWidth_; }
     float FullWidth() const { return fullWidth_; }
+    void SetFullWidth(int width) {preferredFullWidth_=static_cast<float>(width);LanguageChanged();}
     float ToastHeight(const std::wstring& message, float width = 300);
     Button HitTest(float x, float y, bool compact, float width) const;
     D2D1_RECT_F ButtonRect(Button button, bool compact, float width) const;
@@ -78,6 +80,7 @@ public:
     HRESULT CaptureForDevelopment(const wchar_t* name);
 #endif
 private:
+    float preferredFullWidth_=320;
     using FormatKey = std::tuple<int, int, bool>;
     HRESULT CreateTarget();
     HRESULT Finish();

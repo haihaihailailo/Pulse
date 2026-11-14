@@ -43,7 +43,8 @@ function AllowedUrl([string]$url) {
 }
 function PulseUi {
     if($script:Form) {
-        [Windows.Forms.Application]::DoEvents()
+        if($script:Cancelled){throw 'Cancelled; the existing application was not replaced.'}
+        if(-not $script:Form.IsDisposed){[Windows.Forms.Application]::DoEvents()}
         if($script:Cancelled){throw 'Cancelled; the existing application was not replaced.'}
     }
 }
@@ -88,6 +89,11 @@ function Download([string]$url,[long]$limit,[string]$destination='', $handler=$n
             $count=WaitTask ($inputStream.ReadAsync($buffer,0,$buffer.Length)) $watch
             if(-not $count){break}
             $total+=$count; Require ($total -le $limit) 'Download exceeds size limit.'
+            if($destination -and $script:Progress) {
+                $length=$response.Content.Headers.ContentLength
+                if($length -gt 0){$script:Progress.Style='Continuous';$script:Progress.Value=[Math]::Min(100,[int](100.0*$total/$length))}
+                $label.Text=(Text '正在下载更新：' 'Downloading update: ')+[Math]::Round($total/1KB)+' KB'+$(if($length -gt 0){' / '+[Math]::Round($length/1KB)+' KB'})
+            }
             $output.Write($buffer,0,$count); PulseUi
         }
         if(-not $destination){return ,[byte[]]$output.ToArray()}
@@ -155,11 +161,18 @@ try {
     $owner=[Diagnostics.Process]::GetProcessById($OwnerPid)
     Require ($owner.StartTime.ToUniversalTime().ToFileTimeUtc() -eq $OwnerCreated -and $owner.MainModule.FileName -ieq $Target) 'Running application identity changed.'
     $script:Form=[Windows.Forms.Form]::new(); $script:Form.Text='Pulse '+(Text '更新' 'Update')
-    $script:Form.Size=[Drawing.Size]::new(480,155); $script:Form.StartPosition='CenterScreen'
+    $script:Form.Size=[Drawing.Size]::new(520,220); $script:Form.StartPosition='CenterScreen'
     $script:Form.FormBorderStyle='FixedDialog'; $script:Form.MaximizeBox=$false
     $label=[Windows.Forms.Label]::new(); $label.AutoSize=$false; $label.Dock='Fill'; $label.Padding=[Windows.Forms.Padding]::new(20)
     $label.Text=(Text '正在检查更新…' 'Checking for updates…')+"`r`n"+$CurrentVersion
-    $script:Form.Controls.Add($label); $script:Form.Add_FormClosing({$script:Cancelled=$true}); $script:Form.Show(); PulseUi
+    $script:Progress=[Windows.Forms.ProgressBar]::new();$script:Progress.Dock='Bottom';$script:Progress.Height=18;$script:Progress.Style='Marquee'
+    $cancelButton=[Windows.Forms.Button]::new();$cancelButton.Dock='Bottom';$cancelButton.Height=34;$cancelButton.Text=Text '取消' 'Cancel'
+    $cancelButton.Add_Click({$script:Cancelled=$true;$script:Form.Close()})
+    $script:Form.Controls.Add($label);$script:Form.Controls.Add($script:Progress);$script:Form.Controls.Add($cancelButton)
+    $script:Replacing=$false
+    $script:Form.Add_FormClosing({param($sender,$eventArgs)
+        if($script:Replacing){$eventArgs.Cancel=$true}else{$script:Cancelled=$true}
+    }); $script:Form.Show(); PulseUi
     [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
     $release=JsonDownload ('https://api.github.com/repos/'+$Repository+'/releases/latest')
     Require (-not $release.draft -and -not $release.prerelease) 'Only stable releases are accepted.'
@@ -171,6 +184,7 @@ try {
     }
     $script:Form.Hide()
     $prompt=(Text '发现新版：' 'New version: ')+$release.tag_name+"`r`n"+(Text '下载并替换当前程序，然后自动重启？现有设置将保留。' 'Download, replace this application and restart? Your settings will be preserved.')
+    if($release.body){$summary=[string]$release.body;if($summary.Length -gt 1200){$summary=$summary.Substring(0,1200)+'…'};$prompt+="`r`n`r`n"+$summary}
     if([Windows.Forms.MessageBox]::Show($prompt,'Pulse','YesNo','Question') -ne 'Yes'){return}
     $script:Form.Show(); $label.Text=Text '正在下载并校验更新… 可关闭此窗口取消。' 'Downloading and verifying… Close this window to cancel.'; PulseUi
     $manifest=JsonDownload (AssetUrl $release 'release-manifest.json')
@@ -211,6 +225,7 @@ public static class PulseUpdateWindow {
     $null=[PulseUpdateWindow]::GetWindowThreadProcessId($window,[ref]$windowPid)
     Require ($windowPid -eq $OwnerPid) 'Original window identity changed.'
     $label.Text=Text '正在正常退出旧版本并替换…' 'Closing the old version and replacing it…'
+    $script:Replacing=$true;$cancelButton.Enabled=$false;$script:Progress.Style='Marquee'
     $script:Form.ControlBox=$false; $script:Form.Refresh()
     Require ([PulseUpdateWindow]::PostMessage($window,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)) 'Could not request a normal exit.'
     Require ($owner.WaitForExit(30000)) 'Pulse did not exit; no executable was replaced.'
@@ -227,8 +242,8 @@ public static class PulseUpdateWindow {
     $script:Form.Hide()
     $null=[Windows.Forms.MessageBox]::Show((Text '更新完成，已重启。旧程序备份：' 'Updated and restarted. Previous executable: ')+"`r`n"+$backup,'Pulse')
 } catch {
-    if($script:Form){$script:Form.Hide()}
-    $message=(Text '更新未完成：' 'Update did not complete: ')+$_.Exception.Message
+    if($script:Form -and -not $script:Form.IsDisposed){$script:Form.Hide()}
+    $message=if($script:Cancelled -and -not $closed){Text '已取消更新，原程序未替换。' 'Update cancelled. The existing application was not replaced.'}else{(Text '更新未完成：' 'Update did not complete: ')+$_.Exception.Message}
     if('Windows.Forms.MessageBox' -as [type]){$null=[Windows.Forms.MessageBox]::Show($message,'Pulse','OK','Warning')}
 } finally {
     if($script:Form){$script:Form.Dispose()}

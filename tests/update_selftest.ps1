@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$FixtureRoot)
 $ErrorActionPreference='Stop'
 [Console]::InputEncoding=[Console]::OutputEncoding=$OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -50,7 +50,14 @@ public class PulseFakeHttp : HttpMessageHandler {
 $raw=Download 'https://api.github.com/test' 3 '' ([PulseFakeHttp]::new())
 Require ($raw.Length -eq 3 -and $raw[0] -eq 0 -and $raw[1] -eq 128 -and $raw[2] -eq 255) 'Binary stream preserved.'
 $binary=Join-Path $FixtureRoot 'download.bin'
+$script:Progress=[pscustomobject]@{Style='Marquee';Value=0}
+$label=[pscustomobject]@{Text=''}
 Download 'https://api.github.com/test' 3 $binary ([PulseFakeHttp]::new())
+Require ($script:Progress.Style -eq 'Continuous' -and $script:Progress.Value -eq 100 -and $label.Text -match 'KB') 'Download progress reaches 100 percent with received bytes.'
+$script:Progress=$null
+$script:Form=[pscustomobject]@{IsDisposed=$true};$script:Cancelled=$true
+Reject {PulseUi} 'Cancellation after closing the progress window'
+$script:Form=$null;$script:Cancelled=$false
 Require ([BitConverter]::ToString([IO.File]::ReadAllBytes($binary)) -eq '00-80-FF') 'Binary file download.'
 Reject {Download 'https://api.github.com/test' 2 '' ([PulseFakeHttp]::new())} 'Oversized HTTP body'
 Reject {Download 'https://api.github.com/test' 3 $binary ([PulseFakeHttp]::new())} 'Never overwrite download'

@@ -1,5 +1,9 @@
 #include "ui_model.h"
 #include <algorithm>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <cmath>
 #include <ctime>
 #include <cwchar>
@@ -107,6 +111,7 @@ std::wstring NetworkEventText(const NetEvent& event) {
 }
 
 void Components::Reset() {
+    fullOrder=FullOrder;collapsed.fill(false);
     compactOrder = DefaultCompactOrder;
     taskbarOrder = DefaultTaskbarOrder;
     for (size_t i = 0; i < full.size(); ++i) full[i] = FullComponents[i].enabled;
@@ -115,6 +120,7 @@ void Components::Reset() {
 }
 Wants CollectionWants(const Components& components, DisplayMode display, bool details, PowerTrace trace) {
     Components c = components;
+    for(size_t i=0;i<c.full.size();++i)if(c.collapsed[i])c.full[i]=false;
     const bool compact = display != DisplayMode::Full && !details;
     if (display == DisplayMode::Taskbar) c.compact = c.taskbar;
     const bool package = NeedsPackagePower(trace);
@@ -533,6 +539,11 @@ bool Model::Update(const Snapshot& s, bool compact, const Components& c, bool ta
             if (v.peripherals.size() > 4) {
                 v.peripheralHint = i18n::Format(Key::MorePeripherals,{std::to_wstring(v.peripherals.size()-4)});
                 v.peripherals.resize(4);
+            }
+            if(s.peripherals.sampledAt) {
+                const auto age=(GetTickCount64()-s.peripherals.sampledAt)/1000;
+                v.peripheralHint += L" · " + std::to_wstring(age) + (i18n::CurrentLanguage()==i18n::Language::English?L"s ago":L"秒前");
+                if(age>180)for(auto& device:v.peripherals)device.percent=-1;
             }
         }
         if (c.Enabled(FullComponent::BatteryHealth)) {

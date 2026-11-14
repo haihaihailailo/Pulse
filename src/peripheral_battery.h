@@ -98,22 +98,29 @@ public:
         wake_.notify_all();
     }
     PeripheralSnapshot Snapshot() { std::lock_guard<std::mutex> lock(mutex_); return sample_; }
+    void Refresh() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(enabled_ && GetTickCount64()-requestedAt_>=5000) {requestedAt_=GetTickCount64();refresh_=true;wake_.notify_all();}
+    }
 private:
     void Run() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stop_) {
             wake_.wait(lock,[&]{return stop_ || enabled_;}); if (stop_) break;
-            const auto generation = generation_; lock.unlock();
+            const auto generation = generation_; refresh_=false;lock.unlock();
             PeripheralSnapshot next;
             try { next = peripheral::Read(cancel_); } catch (...) { next.state = PeripheralState::Unavailable; }
+            next.sampledAt=GetTickCount64();
             lock.lock();
             if (enabled_ && generation == generation_) sample_ = std::move(next);
-            wake_.wait_for(lock,std::chrono::seconds(60),[&]{return stop_ || generation != generation_;});
+            const auto delay=sample_.state==PeripheralState::Unavailable?120:sample_.devices.empty()?180:60;
+            wake_.wait_for(lock,std::chrono::seconds(delay),[&]{return stop_ || refresh_ || generation != generation_;});
         }
     }
     std::mutex mutex_; std::condition_variable wake_; std::thread worker_;
     std::atomic<bool> cancel_{false};
     bool enabled_ = false, stop_ = false; unsigned generation_ = 0;
+    bool refresh_=false;unsigned long long requestedAt_=0;
     PeripheralSnapshot sample_;
 };
 }

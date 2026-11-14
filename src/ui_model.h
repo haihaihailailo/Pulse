@@ -82,6 +82,8 @@ inline constexpr ComponentOrder DefaultTaskbarOrder{{
     CompactComponent::Fps, CompactComponent::GpuTemp, CompactComponent::DiskIO
 }};
 struct Components {
+    std::array<FullComponent, FullComponents.size()> fullOrder=FullOrder;
+    std::array<bool, FullComponents.size()> collapsed{};
     std::array<bool, FullComponents.size()> full{};
     std::array<bool, CompactComponents.size()> compact{};
     std::array<bool, CompactComponents.size()> taskbar{};

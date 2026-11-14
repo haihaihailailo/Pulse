@@ -13,10 +13,11 @@ namespace {
 D2D1_COLOR_F Color(unsigned rgb, float alpha = 1) {
     return D2D1::ColorF(rgb, alpha);
 }
-const auto TextColor = Color(0xe9edf6), Muted = Color(0x8b94aa), Faint = Color(0x586079);
-const auto Down = Color(0x38bdf8), Up = Color(0xa78bfa), Drain = Color(0xfbbf24);
-const auto Charge = Color(0x34d399), Ac = Color(0x60a5fa), Danger = Color(0xf87171);
-const auto Track = Color(0xffffff, .07f), Border = Color(0xffffff, .07f);
+auto TextColor = Color(0xe9edf6), Muted = Color(0x9ca8bd), Faint = Color(0x8895ac);
+auto Down = Color(0x38bdf8), Up = Color(0xa78bfa), Drain = Color(0xfbbf24);
+auto Charge = Color(0x34d399), Ac = Color(0x60a5fa), Danger = Color(0xf87171);
+auto Track = Color(0xffffff, .07f), Border = Color(0xffffff, .07f);
+bool lightPalette=false;
 D2D1_COLOR_F Alpha(D2D1_COLOR_F color, float alpha) { color.a = alpha; return color; }
 D2D1_COLOR_F Accent(const View& v) {
     if (v.low) return Danger;
@@ -46,17 +47,24 @@ Layout FullLayout(const Components& components, float width) {
     Layout layout;
     float y = 44;
     bool any = false;
-    for (auto component : FullOrder) {
+    for (auto component : components.fullOrder) {
         if (!components.Enabled(component)) continue;
         const auto index = static_cast<size_t>(component);
         if (any) y += 8;
-        const float height = FullComponents[index].extent;
+        const float height = components.collapsed[index]?34:FullComponents[index].extent;
         layout.cards[index] = Rect(12, y, width - 24, height);
         y += height;
         any = true;
     }
     layout.height = y + 12;
     return layout;
+}
+void SetLightPalette(bool light) {
+    lightPalette=light;
+    TextColor=Color(light?0x172235:0xe9edf6);Muted=Color(light?0x49586f:0x9ca8bd);Faint=Color(light?0x59667a:0x8895ac);
+    Down=Color(light?0x036b9b:0x38bdf8);Up=Color(light?0x6d3cbc:0xa78bfa);Drain=Color(light?0x936000:0xfbbf24);
+    Charge=Color(light?0x087653:0x34d399);Ac=Color(light?0x245eaf:0x60a5fa);Danger=Color(light?0xb42332:0xf87171);
+    Track=Color(light?0x223344:0xffffff,.09f);Border=Color(light?0x223344:0xffffff,.12f);
 }
 
 void StyleWindow(HWND window) {
@@ -69,7 +77,7 @@ void StyleWindow(HWND window) {
         GetProcAddress(dwm, "DwmSetWindowAttribute"));
     static const auto extendFrame = reinterpret_cast<ExtendFrameFn>(
         GetProcAddress(dwm, "DwmExtendFrameIntoClientArea"));
-    const BOOL dark = TRUE;
+    const BOOL dark = !lightPalette;
     const BOOL noTransitions = TRUE;
     const int round = 2; // DWMWCP_ROUND; numeric values also support older MinGW headers.
     const COLORREF border = RGB(0x28, 0x34, 0x45);
@@ -389,8 +397,8 @@ void Renderer::Gradient(D2D1_RECT_F r, D2D1_COLOR_F from, D2D1_COLOR_F to, bool 
     target_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), gradient);
 }
 void Renderer::Background(float width, float height) {
-    target_->Clear(Color(0x0c111d));
-    if (auto* gradient = LinearGradient(Color(0x151c2f), Color(0x0c111d))) {
+    target_->Clear(Color(lightPalette?0xf1f4f8:0x0c111d));
+    if (auto* gradient = LinearGradient(Color(lightPalette?0xf5f7fa:0x151c2f), Color(lightPalette?0xe8edf4:0x0c111d))) {
         gradient->SetStartPoint(D2D1::Point2F(0, 0));
         gradient->SetEndPoint(D2D1::Point2F(width * .36f, height));
         target_->FillRectangle(Rect(0, 0, width, height), gradient);
@@ -411,7 +419,7 @@ void Renderer::Background(float width, float height) {
     glow(upGlow_, D2D1::Point2F(width, height), width * .9f, height * .4f, Alpha(Up, .09f));
 }
 void Renderer::Panel(D2D1_RECT_F r) {
-    Rounded(r, 14, Color(0xffffff, .035f));
+    Rounded(r, 14, Color(0xffffff, lightPalette?.90f:.035f));
     brush_->SetColor(Border);
     target_->DrawRoundedRectangle(D2D1::RoundedRect(r, 14, 14), brush_.Get(), 1);
 }
@@ -581,10 +589,13 @@ void Renderer::Full(const View& v, bool pinned, Button hover, Button pressed) {
     const float viewport = target_->GetSize().height;
     target_->PushAxisAlignedClip(Rect(0, 44, fullWidth_, std::max(0.0f, viewport - 44)), D2D1_ANTIALIAS_MODE_ALIASED);
     target_->SetTransform(D2D1::Matrix3x2F::Translation(0, -scroll_));
-    for (auto component : FullOrder) {
+    for (auto component : components_.fullOrder) {
         if (!components_.Enabled(component)) continue;
         const auto card = layout.Card(component);
         if (card.bottom - scroll_ < 44 || card.top - scroll_ > viewport) continue;
+        if(components_.collapsed[static_cast<size_t>(component)]) {
+            Panel(card);Text(T(FullComponents[static_cast<size_t>(component)].label),Rect(25,card.top+8,content,20),12,Muted);continue;
+        }
         switch (component) {
         case FullComponent::Hardware: {
             Panel(card);
@@ -856,7 +867,7 @@ void Renderer::UpdateFullLayout() {
     for (Key key : {Key::SinceLaunch, Key::SinceUnplugged})
         fullWidth_ = std::max(fullWidth_, 50 + Measure(T(key) + L"99+ " + T(Key::Hours) +
             T(Key::AveragePrefix) + L"999.9" + T(Key::WattSuffix), 11));
-    fullWidth_ = std::ceil(fullWidth_);
+    fullWidth_ = std::ceil(std::max(fullWidth_,preferredFullWidth_));
 }
 
 void Renderer::UpdateCompactLayout() {

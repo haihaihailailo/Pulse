@@ -3,6 +3,7 @@
 #include "ui_taskbar.h"
 #include "ui_settings.h"
 #include "metrics.h"
+#include "metrics_sampler.h"
 #include "netprobe.h"
 #include "development.h"
 #include "window_interaction.h"
@@ -70,6 +71,16 @@ constexpr UINT CmdWifiPermissions = 116, CmdGpu = 1200;
 constexpr UINT CmdPowerDiagnostics = 117;
 constexpr UINT CmdUpdate = 118;
 constexpr UINT CmdSettings = 119;
+constexpr UINT CmdPositionEdit = 120;
+constexpr UINT CmdPeripheralRefresh = 121;
+constexpr UINT CmdFullWidth=130,CmdFullCollapse=134,CmdFullReset=135,CmdFullMove=136;
+constexpr UINT CmdSettingsFull=3400;
+constexpr UINT CmdTheme=140;
+constexpr UINT CmdConfigExport=143,CmdConfigImport=144,CmdSaveRetry=145;
+constexpr UINT CmdNetworkSource=3700,CmdDiskSource=3800;
+constexpr UINT CmdDeviceSelect=3900,CmdDeviceAlias=148,CmdDeviceHidden=149,CmdDeviceFirst=150,CmdBatteryNotify=151,CmdBatteryThreshold=160;
+struct DevicePreference {std::wstring id,alias;bool hidden=false;};
+constexpr UINT EditTimer = 2;
 constexpr UINT CmdSettingsCompact = 3200, CmdSettingsTaskbar = 3300;
 constexpr UINT CmdTaskbarComponent = 700;
 constexpr UINT CmdTaskbarPosition = 750;
@@ -327,12 +338,17 @@ struct Config {
     DisplayMode mode = DisplayMode::Full;
     TaskbarPosition taskbarPosition = TaskbarPosition::Auto;
     int widgetsWidth = 120;
+    int fullWidth=320;
+    int theme=0;
     bool pinned = true;
     bool snap = true;
     bool clickThrough = false;
     bool notify = true, notify_sound = true;
     std::wstring file;
     std::wstring gpu;
+    std::wstring networkSource,diskSource;
+    std::vector<DevicePreference> devices;
+    bool batteryNotify=false;int batteryThreshold=20;
     Components components;
     MiniAppearance appearance;
     void LoadMiniPreferences(const wchar_t* section, ComponentOrder& order, const ComponentOrder& defaults,
@@ -367,7 +383,7 @@ struct Config {
         if (std::wcscmp(value, L"1") == 0) return true;
         return info.enabled;
     }
-    bool Load() {
+    bool Load(const std::wstring& source=L"") {
 #ifdef PULSE_DEVELOPMENT
         const std::wstring folder = development::DataDirectory();
 #else
@@ -376,10 +392,20 @@ struct Config {
         std::wstring folder = portable::Enabled() ? portable::directory : std::wstring(directory) + L"\\Pulse";
         if (!CreateDirectoryW(folder.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
 #endif
-        file = folder + L"\\settings.ini";
+        file = source.empty()?folder + L"\\settings.ini":source;
         wchar_t gpuValue[160]{};
         GetPrivateProfileStringW(L"Hardware", L"gpu", L"", gpuValue, 160, file.c_str());
         gpu = gpuValue;
+        batteryNotify=GetPrivateProfileIntW(L"Peripherals",L"notify",0,file.c_str())!=0;
+        batteryThreshold=std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Peripherals",L"threshold",20,file.c_str())),5,50);
+        devices.clear();const int count=std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Peripherals",L"count",0,file.c_str())),0,32);
+        for(int i=0;i<count;++i){const auto section=L"Peripheral"+std::to_wstring(i);wchar_t id[512]{},alias[97]{};
+            GetPrivateProfileStringW(section.c_str(),L"id",L"",id,512,file.c_str());GetPrivateProfileStringW(section.c_str(),L"alias",L"",alias,97,file.c_str());
+            if(id[0]&&std::none_of(devices.begin(),devices.end(),[&](const auto& d){return d.id==id;}))devices.push_back({id,peripheral::CleanName(alias),GetPrivateProfileIntW(section.c_str(),L"hidden",0,file.c_str())!=0});}
+        wchar_t sourceValue[160]{};
+        GetPrivateProfileStringW(L"Hardware",L"network",L"",sourceValue,160,file.c_str());networkSource=sourceValue;
+        GetPrivateProfileStringW(L"Hardware",L"disk",L"",sourceValue,160,file.c_str());diskSource=sourceValue;
+        if(!diskSource.empty()&&(diskSource.size()!=2||diskSource[0]<L'A'||diskSource[0]>L'Z'||diskSource[1]!=L':'))diskSource.clear();
         x = static_cast<int>(GetPrivateProfileIntW(L"Window", L"X", INT_MIN, file.c_str()));
         y = static_cast<int>(GetPrivateProfileIntW(L"Window", L"Y", INT_MIN, file.c_str()));
         wchar_t languageValue[32]{};
@@ -404,6 +430,18 @@ struct Config {
         pinned = GetPrivateProfileIntW(L"Window", L"OnTop", 1, file.c_str()) != 0;
         snap = GetPrivateProfileIntW(L"Window", L"snap", 1, file.c_str()) != 0;
         clickThrough = GetPrivateProfileIntW(L"Window", L"click_through", 0, file.c_str()) != 0;
+        fullWidth=std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Window",L"full_width",320,file.c_str())),320,600);
+        theme=std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Window",L"theme",0,file.c_str())),0,2);
+        wchar_t orderValue[512]{};
+        GetPrivateProfileStringW(L"Full",L"order",L"",orderValue,512,file.c_str());
+        std::wstring orderText=orderValue;size_t used=0;std::array<bool,FullComponents.size()> seen{};
+        for(size_t start=0;start<orderText.size();) {
+            auto end=orderText.find(L',',start);const auto key=orderText.substr(start,end==std::wstring::npos?end:end-start);
+            for(size_t i=0;i<FullComponents.size();++i)if(key==FullComponents[i].key&&!seen[i]){seen[i]=true;components.fullOrder[used++]=static_cast<FullComponent>(i);break;}
+            if(end==std::wstring::npos)break;start=end+1;
+        }
+        for(auto component:FullOrder)if(!seen[static_cast<size_t>(component)])components.fullOrder[used++]=component;
+        for(size_t i=0;i<FullComponents.size();++i)components.collapsed[i]=GetPrivateProfileIntW(L"Collapsed",FullComponents[i].key,0,file.c_str())!=0;
         wchar_t zoomValue[32]{};
         GetPrivateProfileStringW(L"Window", L"zoom", L"100", zoomValue, 32, file.c_str());
         wchar_t* zoomEnd = nullptr;
@@ -444,11 +482,82 @@ struct Config {
     }
     bool Save() const {
         if (file.empty()) return false;
+        const DWORD attributes = GetFileAttributesW(file.c_str());
+        const bool exists = attributes != INVALID_FILE_ATTRIBUTES;
+        if (!exists && GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+        if (exists && (attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY))) return false;
+        // Preserve comments and unknown keys, while making future Unicode names
+        // independent of the machine's ANSI code page.
+        std::wstring original;
+        if(exists) {
+            HANDLE input=CreateFileW(file.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+            if(input==INVALID_HANDLE_VALUE)return false;
+            LARGE_INTEGER size{};DWORD read=0;
+            if(!GetFileSizeEx(input,&size)||size.QuadPart<0||size.QuadPart>1024*1024){CloseHandle(input);return false;}
+            std::vector<unsigned char> bytes(static_cast<size_t>(size.QuadPart));
+            const bool loaded=bytes.empty()||(ReadFile(input,bytes.data(),static_cast<DWORD>(bytes.size()),&read,nullptr)&&read==bytes.size());
+            CloseHandle(input);if(!loaded)return false;
+            if(bytes.size()>=2&&((bytes[0]==0xff&&bytes[1]==0xfe)||(bytes[0]==0xfe&&bytes[1]==0xff))) {
+                if(bytes.size()%2)return false;
+                const bool little=bytes[0]==0xff;
+                for(size_t i=2;i<bytes.size();i+=2)original.push_back(static_cast<wchar_t>(little?bytes[i]|(bytes[i+1]<<8):(bytes[i]<<8)|bytes[i+1]));
+            } else if(!bytes.empty()) {
+                const bool utf8=bytes.size()>=3&&bytes[0]==0xef&&bytes[1]==0xbb&&bytes[2]==0xbf;
+                const auto offset=utf8?3u:0u;const char* text=reinterpret_cast<const char*>(bytes.data()+offset);
+                const int length=static_cast<int>(bytes.size()-offset);
+                const UINT page=utf8?CP_UTF8:CP_ACP;
+                const int count=length?MultiByteToWideChar(page,0,text,length,nullptr,0):0;
+                if(length&&!count)return false;
+                original.resize(count);if(count)MultiByteToWideChar(page,0,text,length,original.data(),count);
+            }
+        }
+        const auto temporary = file + L".saving-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+        HANDLE out = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (out == INVALID_HANDLE_VALUE) return false;
+        const WORD bom = 0xfeff; DWORD written = 0;
+        bool initialized = WriteFile(out, &bom, sizeof(bom), &written, nullptr) && written == sizeof(bom);
+        const DWORD originalBytes=static_cast<DWORD>(original.size()*sizeof(wchar_t));
+        if(initialized&&originalBytes)initialized=WriteFile(out,original.data(),originalBytes,&written,nullptr)&&written==originalBytes;
+        CloseHandle(out);
+        struct Cleanup { const std::wstring& path; ~Cleanup() { DeleteFileW(path.c_str()); } } cleanup{temporary};
+        if (!initialized) return false;
+        Config candidate = *this; candidate.file = temporary;
+        if (!candidate.SaveValues()) return false;
+        // The documented flush operation returns zero even on success.
+        ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary.c_str());
+        out = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (out == INVALID_HANDLE_VALUE) return false;
+        const bool flushed = FlushFileBuffers(out) != FALSE; CloseHandle(out);
+        if (!flushed) return false;
+        const bool replaced = exists ? ReplaceFileW(file.c_str(), temporary.c_str(), (file + L".previous").c_str(), 0, nullptr, nullptr) != FALSE :
+            MoveFileExW(temporary.c_str(), file.c_str(), MOVEFILE_WRITE_THROUGH) != FALSE;
+        if (replaced) ::WritePrivateProfileStringW(nullptr, nullptr, nullptr, file.c_str());
+        else if(exists&&GetFileAttributesW(file.c_str())==INVALID_FILE_ATTRIBUTES&&GetLastError()==ERROR_FILE_NOT_FOUND) {
+            // ReplaceFile can move the original to its backup before failing.
+            // Keep that backup and restore the primary name if it is absent.
+            CopyFileW((file+L".previous").c_str(),file.c_str(),TRUE);
+        }
+        return replaced;
+    }
+    bool SaveValues() const {
         bool ok = true;
         const auto WritePrivateProfileStringW = [&](LPCWSTR a,LPCWSTR b,LPCWSTR c,LPCWSTR d) {
             const BOOL result = ::WritePrivateProfileStringW(a,b,c,d); ok = result && ok; return result;
         };
         WritePrivateProfileStringW(L"Hardware", L"gpu", gpu.c_str(), file.c_str());
+        WritePrivateProfileStringW(L"Peripherals",L"notify",batteryNotify?L"1":L"0",file.c_str());
+        WritePrivateProfileStringW(L"Peripherals",L"threshold",std::to_wstring(batteryThreshold).c_str(),file.c_str());
+        WritePrivateProfileStringW(L"Peripherals",L"count",std::to_wstring(devices.size()).c_str(),file.c_str());
+        for(size_t i=0;i<devices.size();++i){const auto section=L"Peripheral"+std::to_wstring(i);const auto& device=devices[i];
+            WritePrivateProfileStringW(section.c_str(),L"id",device.id.c_str(),file.c_str());WritePrivateProfileStringW(section.c_str(),L"alias",device.alias.c_str(),file.c_str());WritePrivateProfileStringW(section.c_str(),L"hidden",device.hidden?L"1":L"0",file.c_str());}
+        WritePrivateProfileStringW(L"Hardware",L"network",networkSource.c_str(),file.c_str());
+        WritePrivateProfileStringW(L"Hardware",L"disk",diskSource.c_str(),file.c_str());
+        WritePrivateProfileStringW(L"Window",L"full_width",std::to_wstring(fullWidth).c_str(),file.c_str());
+        WritePrivateProfileStringW(L"Window",L"theme",std::to_wstring(theme).c_str(),file.c_str());
+        std::wstring fullOrderText;
+        for(auto component:components.fullOrder){if(!fullOrderText.empty())fullOrderText+=L",";fullOrderText+=FullComponents[static_cast<size_t>(component)].key;}
+        WritePrivateProfileStringW(L"Full",L"order",fullOrderText.c_str(),file.c_str());
+        for(size_t i=0;i<FullComponents.size();++i)WritePrivateProfileStringW(L"Collapsed",FullComponents[i].key,components.collapsed[i]?L"1":L"0",file.c_str());
         const auto sx = std::to_wstring(x), sy = std::to_wstring(y);
         WritePrivateProfileStringW(L"Window", L"X", sx.c_str(), file.c_str());
         WritePrivateProfileStringW(L"Window", L"Y", sy.c_str(), file.c_str());
@@ -698,6 +807,7 @@ public:
         development::UiPeer peer(smoke);
 #endif
         config_.Load();
+        ApplyTheme();
         taskbarFallback_ = config_.mode == DisplayMode::Taskbar;
         i18n::SetLanguage(config_.language);
         notificationState_.store(config_.notify ? 1u : 0u, std::memory_order_release);
@@ -732,6 +842,7 @@ public:
         renderer_.SetSoftware(config_.mode != DisplayMode::Full);
         effectiveZoom_ = config_.zoom;
         renderer_.SetZoom(effectiveZoom_);
+        renderer_.SetFullWidth(config_.fullWidth);
         renderer_.SetComponents(config_.components, Compact());
         renderer_.SetTextColors(config_.appearance.compact);
         taskbar_.SetTextColors(config_.appearance.taskbar);
@@ -759,10 +870,12 @@ public:
         SetWindowPos(window_, config_.pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
                      0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         AddTray();
+        SessionNotifications(true);
         ConfigureTaskbar();
         if (config_.mode == DisplayMode::Taskbar) TrackTaskbar(true);
-        metrics_ = std::make_unique<Metrics>();
+        metrics_ = std::make_unique<MetricsSampler>();
         metrics_->SetGpuAdapter(config_.gpu);
+        metrics_->SetInputSources(config_.networkSource,config_.diskSource);
         const Wants initialWants = CollectionWants(config_.components, CollectionMode(), details_, powerTrace_);
         metrics_->SetWants(initialWants); // Always before Start and the first Sample, including --restarted.
         if (initialWants.fps) {
@@ -882,6 +995,7 @@ private:
         taskbar_.Configure(config_.components, config_.zoom, config_.taskbarPosition, config_.widgetsWidth);
     }
     bool ProbeNeeded() const {
+        if(sessionLocked_)return false;
 #ifdef PULSE_DEVELOPMENT
         return false;
 #endif
@@ -892,7 +1006,7 @@ private:
         }
         if (!window_ || !IsWindowVisible(window_) || IsIconic(window_)) return false;
         return Compact() ? config_.components.Enabled(CompactComponent::Latency) :
-                           config_.components.Enabled(FullComponent::Network);
+                           (config_.components.Enabled(FullComponent::Network)&&!config_.components.collapsed[static_cast<size_t>(FullComponent::Network)]);
     }
     void UpdateCollection() {
         if (!metrics_) return;
@@ -1016,7 +1130,7 @@ private:
         RECT r{};
         if (GetWindowRect(window_, &r)) { config_.x = r.left; config_.y = r.top; }
     }
-    void Save() { CapturePosition(); settingsSaved_ = config_.Save(); }
+    void Save() { if(applyingConfig_)return;CapturePosition(); settingsSaved_ = config_.Save(); }
 #ifdef PULSE_DEVELOPMENT
     void InteractionSmoke(development::UiPeer& peer, bool capture) {
         auto require = [](bool condition, const char* message) {
@@ -1111,6 +1225,7 @@ private:
         metrics_->SetGpuAdapter(previousGpu);
         Save();
 
+        const int themeBeforeCaptures=config_.theme;Command(CmdTheme+1);
         Snapshot sample{};
         sample.percent = 68; sample.cpu_percent = 24; sample.mem_percent = 48;
         for (auto mode : {DisplayMode::Full, DisplayMode::Compact}) {
@@ -1188,8 +1303,8 @@ private:
         if (capture) require(SUCCEEDED(renderer_.CaptureForDevelopment(L"full-fps-70-fit.bmp")),
                              "Fitted FPS panel capture failed");
         SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
-        require(!clickThrough_ && config_.clickThrough, "Fitted panel tray recovery lost the preference");
-        Command(CmdClickThrough); Command(CmdClickThrough); // Restore saved OFF for the remaining smoke checks.
+        require(clickThrough_ && config_.clickThrough, "Single tray click changed click-through");
+        Command(CmdClickThrough); // Restore saved OFF for the remaining smoke checks.
         const auto close = renderer_.ButtonRect(Button::Close, false, CurrentWidth());
         require(Hit(MAKELPARAM(static_cast<int>((close.left+close.right) * .5f * Scale()),
                              static_cast<int>((close.top+close.bottom) * .5f * Scale()))) == Button::Close,
@@ -1212,6 +1327,7 @@ private:
                 "Peripheral card selection did not restore");
         SetMode(DisplayMode::Compact);
         require(effectiveZoom_ == 70, "Full-panel fit leaked into compact mode");
+        Command(CmdTheme+themeBeforeCaptures);
         if (config_.pinned != previousPinned) TogglePin();
 
         Command(CmdSnap); // Persist OFF and verify it on the next process launch.
@@ -1231,21 +1347,40 @@ private:
                 "Layered click-through render failed");
         if (capture) require(SUCCEEDED(renderer_.CaptureForDevelopment(L"compact-click-through.bmp")), "Click-through capture failed");
         SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
-        require(!clickThrough_ && IsWindowVisible(window_) && WindowFromPoint(point) == window_, "Tray click did not restore interaction");
-        require(config_.clickThrough, "Temporary tray recovery erased the startup preference");
+        require(clickThrough_ && IsWindowVisible(window_) && WindowFromPoint(point) == peer.target, "Tray click interrupted click-through");
+        Command(CmdPositionEdit);
+        require(!clickThrough_ && config_.clickThrough && positionEditing_, "Temporary positioning changed saved preference");
+        SendMessageW(window_,WM_KEYDOWN,VK_ESCAPE,0);
+        require(clickThrough_ && !positionEditing_, "Escape did not restore click-through");
+        Command(CmdPositionEdit);SendMessageW(window_,WM_TIMER,EditTimer,0);
+        require(clickThrough_ && !positionEditing_, "Positioning timeout did not restore click-through");
         ActivateButton(Button::Minimize);
         require(!IsWindowVisible(window_), "Minimize did not hide to tray");
-        SendMessageW(window_, TrayMessage, 0, MAKELPARAM(NIN_SELECT, TrayId));
-        require(IsWindowVisible(window_), "Tray did not restore hidden window");
-        Command(CmdClickThrough);
+        SendMessageW(window_, TrayMessage, 0, MAKELPARAM(WM_LBUTTONDBLCLK, TrayId));
+        require(IsWindowVisible(window_) && clickThrough_, "Tray restore lost click-through");
+        SetMode(DisplayMode::Full);SetMode(DisplayMode::Compact);
+        require(clickThrough_ && config_.clickThrough, "Mode switch changed click-through");
         SendMessageW(window_, taskbarCreated_, 0, 0);
-        require(!clickThrough_ && tray_, "Shell restart did not recover direct control");
+        require(clickThrough_ && tray_, "Shell restart did not restore preference");
+        Command(CmdClickThrough);
         RemoveTray(); Command(CmdClickThrough);
         require(!clickThrough_, "Click-through enabled without tray recovery");
         AddTray(); require(tray_, "Tray re-registration failed");
         Command(CmdClickThrough); Command(CmdClickThrough);
         require(!config_.clickThrough && GetPrivateProfileIntW(L"Window", L"click_through", 1, config_.file.c_str()) == 0,
                 "Disabling click-through was not saved");
+        require(::WritePrivateProfileStringW(L"Future",L"preserved",L"73",config_.file.c_str())!=FALSE,"Cannot seed unknown config key");
+        require(config_.Save() && GetPrivateProfileIntW(L"Future",L"preserved",0,config_.file.c_str())==73,
+                "Atomic save lost unknown keys");
+        require(GetPrivateProfileIntW(L"Future",L"preserved",0,(config_.file+L".previous").c_str())==73,
+                "Previous configuration backup missing");
+        const auto configAttributes=GetFileAttributesW(config_.file.c_str());
+        require(SetFileAttributesW(config_.file.c_str(),configAttributes|FILE_ATTRIBUTE_READONLY)!=FALSE,"Cannot exercise config save failure");
+        Config rejected=config_;rejected.zoom=150;
+        const bool incorrectlySaved=rejected.Save();
+        const bool restoredAttributes=SetFileAttributesW(config_.file.c_str(),configAttributes)!=FALSE;
+        require(restoredAttributes && !incorrectlySaved && GetPrivateProfileIntW(L"Window",L"zoom",-1,config_.file.c_str())==config_.zoom,
+                "Failed save changed the original configuration");
         // Exercise real modeless controls through the shared command/save path.
         auto drainSettings=[&] {
             MSG message{};int count=0;
@@ -1267,6 +1402,7 @@ private:
         HWND peripheralControl=settingsWindow_.ControlForTest(peripheralCommand);
         require(peripheralControl&&IsWindowEnabled(peripheralControl),"Settings peripheral control missing");
         SendMessageW(peripheralControl,BM_CLICK,0,0);drainSettings();
+        require(settingsWindow_.ControlForTest(peripheralCommand)==peripheralControl,"Toggle unnecessarily rebuilt settings controls");
         require(config_.components.Enabled(FullComponent::Peripherals)!=oldPeripheral&&settingsSaved_,"Settings toggle did not apply/save");
         require(GetPrivateProfileIntW(L"Full",L"peripherals",-1,config_.file.c_str())==!oldPeripheral,"Settings toggle INI mismatch");
         if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-components.bmp").c_str());
@@ -1285,6 +1421,90 @@ private:
         drainSettings();
         if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-english-narrow.bmp").c_str());
         settingsWindow_.Close();require(!settingsWindow_.Handle(),"Settings close left window alive");
+        const auto optimizationState=config_;
+        const auto previousRaw=rawPeripherals_;
+        const auto previousAlerts=lowBatteryNotified_;
+        // UI requests must remain bounded while real provider work runs elsewhere.
+        const auto requestBegin=std::chrono::steady_clock::now();
+        for(int i=0;i<1000;++i)metrics_->Sample(i%2==0);
+        const double requestMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-requestBegin).count();
+        require(requestMs<1000,"Cached sampling requests blocked the UI");
+        std::printf("PULSE_ASYNC_REQUESTS count=1000 elapsed_ms=%.3f provider_ms=%.2f\n",requestMs,metrics_->LastSampleMilliseconds());
+        SendMessageW(window_,0x02B1,7,0);
+        require(sessionLocked_&&!active_,"Lock screen did not pause UI collection");
+        SendMessageW(window_,0x02B1,8,0);
+        require(!sessionLocked_&&active_,"Unlock did not resume collection");
+
+        SetLanguage(i18n::Preference::Chinese);
+        SetMode(DisplayMode::Full);
+        config_.components.full.fill(true);
+        Command(CmdSettingsFull+static_cast<UINT>(FullComponent::Peripherals));
+        Command(CmdFullMove+2);
+        Command(CmdSettingsFull+static_cast<UINT>(FullComponent::Hardware));
+        Command(CmdFullCollapse);
+        Command(CmdFullWidth+2);
+        require(config_.components.fullOrder.front()==FullComponent::Peripherals&&ContentWidth()>=480,
+                "Full card order or width was not applied");
+        auto collapsed=config_.components;collapsed.full.fill(false);
+        collapsed.full[static_cast<size_t>(FullComponent::Hardware)]=true;
+        const auto pausedWants=CollectionWants(collapsed,DisplayMode::Full);
+        require(!pausedWants.cpu_usage&&!pausedWants.gpu_usage&&!pausedWants.chip_power,
+                "Collapsed hardware card retained dedicated providers");
+        Config restoredLayout;
+        require(restoredLayout.Load()&&restoredLayout.fullWidth==480&&restoredLayout.components.fullOrder.front()==FullComponent::Peripherals&&
+                restoredLayout.components.collapsed[static_cast<size_t>(FullComponent::Hardware)],"Full layout did not persist");
+        Command(CmdTheme+2);
+        sample.peripherals.sampledAt=GetTickCount64();
+        model_.Update(sample,false,config_.components);
+        if(capture)require(renderer_.Paint(model_.Data(),false,false,Button::None,Button::None)==S_OK&&
+            SUCCEEDED(renderer_.CaptureForDevelopment(L"full-custom-dark.bmp")),"Custom dark layout capture failed");
+        Command(CmdSettings);settingsWindow_.SelectPageForTest(0);drainSettings();
+        if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-dark.bmp").c_str());
+        Command(CmdTheme+1);
+        require(GetPrivateProfileIntW(L"Window",L"theme",-1,config_.file.c_str())==1,"Theme was not saved");
+
+        rawPeripherals_=sample.peripherals.devices;
+        config_.devices.clear();lowBatteryNotified_.clear();
+        config_.batteryNotify=true;config_.batteryThreshold=20;selectedDevice_=L"test-mouse";
+        settingsWindow_.SelectPageForTest(7);drainSettings();
+        const auto edit=settingsWindow_.ControlForTest(CmdDeviceAlias);
+        require(edit!=nullptr,"Peripheral alias edit missing");
+        SetWindowTextW(edit,L"办公鼠标 🖱");
+        SendMessageW(GetParent(edit),WM_COMMAND,MAKEWPARAM(GetDlgCtrlID(edit),EN_KILLFOCUS),reinterpret_cast<LPARAM>(edit));
+        drainSettings();
+        Config savedDevice;
+        require(savedDevice.Load()&&!savedDevice.devices.empty()&&savedDevice.devices.front().alias==L"办公鼠标 🖱",
+                "Unicode peripheral alias did not round-trip");
+        auto adjusted=sample;CustomizePeripherals(adjusted);CustomizePeripherals(adjusted);
+        require(adjusted.peripherals.devices.front().name==L"办公鼠标 🖱"&&lowBatteryNotified_.size()==2,
+                "Alias or once-per-cycle low battery notification failed");
+        adjusted.peripherals.devices.front().percent=50;CustomizePeripherals(adjusted);
+        require(lowBatteryNotified_.size()==1,"Battery recovery did not reset notification cycle");
+        Command(CmdDeviceHidden);adjusted=sample;CustomizePeripherals(adjusted);
+        require(adjusted.peripherals.devices.size()==3,"Hidden peripheral remained visible");
+        Command(CmdDeviceHidden);selectedDevice_=L"test-keyboard";Command(CmdDeviceFirst);
+        adjusted=sample;CustomizePeripherals(adjusted);
+        require(adjusted.peripherals.devices.front().id==L"test-keyboard","Peripheral priority was not applied");
+        savedDevice.Load();
+        require(savedDevice.devices.front().id==L"test-keyboard"&&!savedDevice.devices.back().hidden,"Device preferences did not persist");
+        Config imported;require(imported.Load(config_.file+L".previous")&&imported.fullWidth==480,"Configuration import parsing failed");
+        imported.theme=2;imported.fullWidth=400;imported.language=i18n::Preference::English;
+        require(ApplyConfiguration(imported)&&config_.theme==2&&ContentWidth()>=400&&i18n::CurrentLanguage()==i18n::Language::English,
+                "Imported configuration did not apply to the live interface");
+        Config importBackup;require(importBackup.Load(config_.file+L".previous")&&importBackup.theme==1&&importBackup.fullWidth==480,
+                "Import replaced the original backup with an intermediate configuration");
+        Command(CmdTheme+1);SetLanguage(i18n::Preference::Chinese);
+        selectedDevice_=L"test-mouse";settingsWindow_.SelectPageForTest(7);drainSettings();
+        if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-peripherals.bmp").c_str());
+        const auto closingEdit=settingsWindow_.ControlForTest(CmdDeviceAlias);
+        SetFocus(closingEdit);SetWindowTextW(closingEdit,L"关闭前编辑");
+        settingsWindow_.Close();
+        savedDevice.Load();
+        require(std::any_of(savedDevice.devices.begin(),savedDevice.devices.end(),[](const auto& d){return d.id==L"test-mouse"&&d.alias==L"关闭前编辑";}),
+                "Closing settings lost the focused text edit");
+        const auto currentMode=config_.mode;config_=optimizationState;config_.mode=currentMode;
+        rawPeripherals_=previousRaw;lowBatteryNotified_=previousAlerts;
+        ApplyTheme();renderer_.SetFullWidth(config_.fullWidth);SetMode(optimizationState.mode);Reconfigure(true);
         SetLanguage(previousLanguage);
     }
 #endif
@@ -1368,7 +1588,8 @@ private:
         renderer_.SetScroll(scroll_);
     }
     Snapshot ReadMetrics() {
-        auto sample = metrics_->Sample(!Cheap());
+        const bool cheap=Cheap();
+        auto sample = metrics_->Sample(!cheap,cheap?config_.mini_refresh_ms:config_.refresh_ms);
         fpsStatus_ = sample.fps_status;
         // sample.power_trace stays the observed value, including Unknown.
         const PowerTrace next = NextCollectionTrace(powerTrace_, sample.power_trace);
@@ -1381,7 +1602,12 @@ private:
     void Refresh() {
         if (!running_ || !active_ || !metrics_) return;
         if (config_.mode == DisplayMode::Taskbar) UpdateCollection();
-        const auto sample = ReadMetrics();
+        auto sample = ReadMetrics();
+        rawPeripherals_=sample.peripherals.devices;
+        if(sample.peripherals.sampledAt!=settingsPeripheralStamp_) {
+            settingsPeripheralStamp_=sample.peripherals.sampledAt;settingsWindow_.Refresh();
+        }
+        CustomizePeripherals(sample);
         latest_ = sample;
         TrackTaskbar();
         if (TaskbarMode() && !details_) return;
@@ -1395,7 +1621,7 @@ private:
     }
     void Sampling(bool sampleNow, bool resetTimer = false) {
         if (!running_ || !metrics_) return;
-        const bool active = !systemSuspended_ && (config_.mode == DisplayMode::Taskbar ||
+        const bool active = !systemSuspended_ && !sessionLocked_ && (config_.mode == DisplayMode::Taskbar ||
             (IsWindowVisible(window_) && !IsIconic(window_)));
         const bool changed = active_ != active;
         if (changed || resetTimer || !active) KillTimer(window_, SampleTimer);
@@ -1412,6 +1638,37 @@ private:
         if (changed || resetTimer) SetSampleTimer(window_, Cheap(), config_.refresh_ms, config_.mini_refresh_ms);
         if (sampleNow || changed) Refresh();
     }
+    DevicePreference* SelectedDevicePreference() {
+        if(selectedDevice_.empty())return nullptr;
+        for(auto& device:config_.devices)if(device.id==selectedDevice_)return &device;
+        if(config_.devices.size()>=32){settingsSaved_=false;return nullptr;}
+        config_.devices.push_back({selectedDevice_,L"",false});return &config_.devices.back();
+    }
+    void CustomizePeripherals(Snapshot& sample) {
+        auto& devices=sample.peripherals.devices;
+        auto rank=[&](const std::wstring& id){for(size_t i=0;i<config_.devices.size();++i)if(config_.devices[i].id==id)return i;return config_.devices.size();};
+        devices.erase(std::remove_if(devices.begin(),devices.end(),[&](auto& device){
+            const auto i=rank(device.id);if(i==config_.devices.size())return false;
+            if(config_.devices[i].hidden)return true;
+            if(!config_.devices[i].alias.empty())device.name=config_.devices[i].alias;
+            return false;
+        }),devices.end());
+        std::stable_sort(devices.begin(),devices.end(),[&](const auto& a,const auto& b){return rank(a.id)<rank(b.id);});
+        for(const auto& device:devices) {
+            auto it=std::find(lowBatteryNotified_.begin(),lowBatteryNotified_.end(),device.id);
+            if(device.percent>config_.batteryThreshold+5){if(it!=lowBatteryNotified_.end())lowBatteryNotified_.erase(it);continue;}
+            if(!config_.batteryNotify||device.percent<0||device.percent>config_.batteryThreshold||it!=lowBatteryNotified_.end()||
+                !sample.peripherals.sampledAt||GetTickCount64()-sample.peripherals.sampledAt>180000||lowBatteryNotified_.size()>=32)continue;
+            lowBatteryNotified_.push_back(device.id);
+#ifndef PULSE_DEVELOPMENT
+            if(tray_) {
+                NOTIFYICONDATAW info{};info.cbSize=sizeof(info);info.hWnd=window_;info.uID=TrayId;info.uFlags=NIF_INFO;info.dwInfoFlags=NIIF_INFO;
+                swprintf(info.szInfoTitle,64,L"%ls",SettingsText(L"外设电量偏低",L"Peripheral battery low"));
+                swprintf(info.szInfo,256,L"%ls · %d%%",device.name.c_str(),device.percent);Shell_NotifyIconW(NIM_MODIFY,&info);
+            }
+#endif
+        }
+    }
     void Reconfigure(bool resetHistory, bool visibleChanged = true) {
         ApplyCompactOpacity();
         UpdateCollection();
@@ -1422,7 +1679,8 @@ private:
         renderer_.SetScroll(0);
         renderer_.SetComponents(config_.components, Compact());
         if (resetHistory) model_.BreakHistory();
-        const Snapshot sample = metrics_ ? ReadMetrics() : Snapshot{};
+        Snapshot sample = metrics_ ? ReadMetrics() : Snapshot{};
+        CustomizePeripherals(sample);
         latest_ = sample;
         TrackTaskbar();
         model_.Update(sample, Compact(), config_.components);
@@ -1463,6 +1721,8 @@ private:
             if (mode == DisplayMode::Taskbar && taskbarFallback_) TrackTaskbar(true);
             return;
         }
+        EndPositionEdit();
+        if (mode == DisplayMode::Taskbar) SetClickThrough(false);
         CapturePosition();
         const bool fromTaskbar = config_.mode == DisplayMode::Taskbar;
         const POINT floating{config_.x, config_.y};
@@ -1512,15 +1772,23 @@ private:
         Save();
         if (active_) InvalidateRect(window_, nullptr, FALSE);
     }
+    void ApplyTheme() {
+        DWORD value=1,bytes=sizeof(value);
+        RegGetValueW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",L"AppsUseLightTheme",RRF_RT_REG_DWORD,nullptr,&value,&bytes);
+        const bool light=config_.theme==1||(config_.theme==0&&value!=0);
+        SetLightPalette(light);settingsWindow_.SetDark(!light);
+        if(window_) {StyleWindow(window_);renderer_.DiscardTarget();InvalidateRect(window_,nullptr,FALSE);}
+    }
     void Show() {
-        SetClickThrough(false);
+        SetClickThrough(config_.clickThrough && !positionEditing_);
         if (TaskbarMode()) { if (!details_) ToggleDetails(); return; }
         ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOW);
         Fit(false);
-        SetForegroundWindow(window_);
+        if (!clickThrough_) SetForegroundWindow(window_);
         Sampling(true);
     }
     void ToggleVisibility() {
+        EndPositionEdit();
         if (TaskbarMode()) { ToggleDetails(); return; }
         if (IsWindowVisible(window_) && !IsIconic(window_)) {
             Save();
@@ -1569,6 +1837,13 @@ private:
         Shell_NotifyIconW(NIM_DELETE, &data);
         tray_ = false;
     }
+    void SessionNotifications(bool enabled) {
+        static HMODULE library=LoadLibraryExW(L"wtsapi32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!library)return;
+        using Register=BOOL(WINAPI*)(HWND,DWORD);using Unregister=BOOL(WINAPI*)(HWND);
+        if(enabled) {auto fn=reinterpret_cast<Register>(GetProcAddress(library,"WTSRegisterSessionNotification"));if(fn)fn(window_,0);}
+        else {auto fn=reinterpret_cast<Unregister>(GetProcAddress(library,"WTSUnRegisterSessionNotification"));if(fn)fn(window_);}
+    }
     bool SetClickThrough(bool enabled) {
         if (enabled == clickThrough_) return true;
         if (enabled && (!tray_ || TaskbarMode())) return false;
@@ -1591,6 +1866,13 @@ private:
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         InvalidateRect(window_, nullptr, FALSE);
         return true;
+    }
+    void EndPositionEdit() {
+        if (!positionEditing_) return;
+        positionEditing_ = false;
+        KillTimer(window_, EditTimer);
+        SetClickThrough(config_.clickThrough);
+        settingsWindow_.Refresh();
     }
     bool StartupEnabled() const {
         if (portable::Enabled()) return false;
@@ -1854,12 +2136,21 @@ private:
         pages.back().rows.push_back(std::move(mode));
         choice(T(Key::LanguageMenu),CmdLanguage,Languages.size());
         for(UINT id:{CmdPin,CmdSnap,CmdClickThrough,CmdStartup})single(id,Kind::Toggle);
+        single(CmdPositionEdit,Kind::Action);
         note(L"鼠标穿透开启后，可从系统托盘打开设置。",L"With click-through enabled, open settings from the system tray.");
         if(portable::Enabled())note(L"便携模式不修改自启和快捷方式。",L"Portable mode leaves startup and shortcuts unchanged.");
 #ifdef PULSE_DEVELOPMENT
         note(L"开发试用：自启、任务栏嵌入、网络提醒和外部操作已禁用。",L"Development trial: startup, taskbar integration, network alerts and external actions are disabled.");
 #endif
         page(L"外观与位置",L"Appearance");
+        pages.back().rows.push_back({SettingsText(L"主题",L"Theme"),Kind::Choice,{
+            {SettingsText(L"跟随系统",L"System"),CmdTheme,config_.theme==0,true},
+            {SettingsText(L"浅色",L"Light"),CmdTheme+1,config_.theme==1,true},
+            {SettingsText(L"深色",L"Dark"),CmdTheme+2,config_.theme==2,true}}});
+        SettingRow widthRow{SettingsText(L"完整面板宽度",L"Full panel width"),Kind::Choice,{}};
+        for(UINT i=0;i<4;++i)widthRow.options.push_back({std::to_wstring(320+i*80),CmdFullWidth+i,config_.fullWidth==320+static_cast<int>(i)*80,true});
+        if(std::none_of(widthRow.options.begin(),widthRow.options.end(),[](const auto& option){return option.checked;}))widthRow.options.push_back({std::to_wstring(config_.fullWidth),0,true,false});
+        pages.back().rows.push_back(std::move(widthRow));
         choice(T(Key::Size),CmdZoom,ZoomLevels.size());
         if(std::find(ZoomLevels.begin(),ZoomLevels.end(),config_.zoom)==ZoomLevels.end())
             pages.back().rows.back().options.push_back({std::to_wstring(config_.zoom)+L"%",0,true,false});
@@ -1867,9 +2158,14 @@ private:
         choice(T(Key::TaskbarPositionMenu),CmdTaskbarPosition,3);
         note(L"大小影响监控面板；设置窗口使用系统显示缩放。",L"Size affects the monitor panel. Settings use Windows display scaling.");
         page(L"完整模式组件",L"Full panel");
-        for(size_t i=0;i<FullComponents.size();++i)single(CmdFullComponent+static_cast<UINT>(i),Kind::Toggle);
+        for(auto component:config_.components.fullOrder)single(CmdFullComponent+static_cast<UINT>(component),Kind::Toggle);
+        SettingRow fullTarget{SettingsText(L"调整卡片",L"Arrange card"),Kind::Choice,{}};
+        for(auto component:config_.components.fullOrder)fullTarget.options.push_back({T(FullComponents[static_cast<size_t>(component)].label),CmdSettingsFull+static_cast<UINT>(component),component==settingsFull_,true});
+        pages.back().rows.push_back(std::move(fullTarget));
+        pages.back().rows.push_back({SettingsText(L"折叠所选卡片（暂停其专用采集）",L"Collapse selected card (pause its dedicated collection)"),Kind::Toggle,{{L"",CmdFullCollapse,config_.components.collapsed[static_cast<size_t>(settingsFull_)],true}}});
+        for(UINT i=0;i<4;++i)pages.back().rows.push_back({T(i==0?Key::MoveUp:i==1?Key::MoveDown:i==2?Key::MoveFirst:Key::MoveLast),Kind::Action,{{L"",CmdFullMove+i,false,true}}});
+        pages.back().rows.push_back({SettingsText(L"恢复完整面板默认组件",L"Restore full panel defaults"),Kind::Action,{{L"",CmdFullReset,false,true}}});
         single(CmdSelect,Kind::Action);single(CmdSelect+1,Kind::Action);
-        single(CmdDefaults,Kind::Action,SettingsText(L"恢复三种模式的默认组件",L"Restore components in all modes"));
         for(bool taskbar:{false,true}) {
             page(taskbar?L"任务栏组件":L"迷你模式组件",taskbar?L"Taskbar items":L"Mini items");
             const auto& order=taskbar?config_.components.taskbarOrder:config_.components.compactOrder;
@@ -1892,6 +2188,17 @@ private:
             if(!enabled[static_cast<size_t>(selected)])note(L"先勾选该组件，再调整颜色或顺序。",L"Enable this item before changing its color or order.");
         }
         page(L"采样与通知",L"Sampling & alerts");
+        networkChoices_=metrics_?metrics_->NetworkAdapters():std::vector<InputDevice>{};
+        diskChoices_=metrics_?metrics_->Disks():std::vector<InputDevice>{};
+        auto sourceChoice=[&](const wchar_t* label,const wchar_t* automatic,const std::vector<InputDevice>& devices,const std::wstring& selected,UINT base) {
+            SettingRow row{label,Kind::Choice,{{automatic,base,selected.empty(),true}}};bool found=selected.empty();
+            for(size_t i=0;i<devices.size();++i){const bool match=devices[i].id==selected;found=found||match;row.options.push_back({devices[i].name,base+1+static_cast<UINT>(i),match,true});}
+            if(!found)row.options.push_back({SettingsText(L"已保存设备当前不可用",L"Saved device is unavailable"),0,true,false});
+            pages.back().rows.push_back(std::move(row));
+        };
+        sourceChoice(SettingsText(L"网速来源",L"Network source"),SettingsText(L"自动汇总物理网卡",L"Automatic physical adapters"),networkChoices_,config_.networkSource,CmdNetworkSource);
+        sourceChoice(SettingsText(L"磁盘读写与空间来源",L"Disk I/O and space source"),SettingsText(L"全部读写 / 系统盘空间",L"All I/O / system volume space"),diskChoices_,config_.diskSource,CmdDiskSource);
+        single(CmdPeripheralRefresh,Kind::Action);
         choice(SettingsText(L"完整模式刷新间隔",L"Full panel refresh"),CmdRefresh,RefreshIntervals.size());
         choice(T(Key::MiniTaskbar)+L" · "+T(Key::RefreshInterval),CmdMiniRefresh,MiniRefreshIntervals.size());
         choice(T(Key::GpuSelection),CmdGpu,gpuChoices_.size()+1);
@@ -1899,15 +2206,40 @@ private:
             pages.back().rows.back().options.push_back({T(Key::GpuUnavailable),0,true,false});
         choice(T(Key::SlowThreshold),CmdSlowThreshold,SlowThresholds.size());
         single(CmdNetworkNotify,Kind::Toggle);single(CmdNotifySound,Kind::Toggle);
-        note(L"外设电量每 60 秒刷新；不显示电量卡片时停止查询。",L"Peripheral batteries refresh every 60 seconds, only while their card is needed.");
+        if(metrics_&&metrics_->Failed())note(L"采样暂时失败，数据以未知显示。可稍后重试或查看诊断日志。",L"Sampling failed; readings are unknown. Retry later or inspect the diagnostic log.");
+        note(L"外设通常每 60 秒刷新；无设备或读取失败时降低频率，设备变化或手动刷新时重新读取。隐藏或折叠卡片时暂停专用采集。",L"Batteries refresh every 60 seconds, less often when absent or unavailable. Device changes and manual refresh request a new reading. Hidden or collapsed cards pause dedicated collection.");
         page(L"工具与更新",L"Tools & updates");
         note((std::wstring(L"Pulse · ")+update::Version).c_str(),(std::wstring(L"Pulse · ")+update::Version).c_str());
-        for(UINT id:{CmdUpdate,CmdWifiPermissions,CmdShortcutDesktop,CmdShortcutStartMenu,CmdPowerDiagnostics,CmdLog,CmdRestartAdmin})
+        for(UINT id:{CmdUpdate,CmdConfigExport,CmdConfigImport,CmdSaveRetry,CmdWifiPermissions,CmdShortcutDesktop,CmdShortcutStartMenu,CmdPowerDiagnostics,CmdLog,CmdRestartAdmin})
             single(id,Kind::Action);
+        page(L"外设管理",L"Peripherals");
+        single(CmdPeripheralRefresh,Kind::Action);
+        pages.back().rows.push_back({SettingsText(L"低电量提醒（每个低电周期一次）",L"Low battery alerts (once per low-battery cycle)"),Kind::Toggle,{{L"",CmdBatteryNotify,config_.batteryNotify,true}}});
+        SettingRow threshold{SettingsText(L"低电量阈值",L"Low battery threshold"),Kind::Choice,{}};
+        for(UINT i=0;i<4;++i){const int value=10+static_cast<int>(i)*10;threshold.options.push_back({std::to_wstring(value)+L"%",CmdBatteryThreshold+i,config_.batteryThreshold==value,true});}
+        if(std::none_of(threshold.options.begin(),threshold.options.end(),[](const auto& option){return option.checked;}))threshold.options.push_back({std::to_wstring(config_.batteryThreshold)+L"%",0,true,false});
+        pages.back().rows.push_back(std::move(threshold));
+        deviceChoices_=rawPeripherals_;
+        for(const auto& saved:config_.devices)if(std::none_of(deviceChoices_.begin(),deviceChoices_.end(),[&](const auto& d){return d.id==saved.id;}))
+            deviceChoices_.push_back({saved.id,saved.alias.empty()?saved.id:saved.alias,-1});
+        if(!deviceChoices_.empty()) {
+            if(std::none_of(deviceChoices_.begin(),deviceChoices_.end(),[&](const auto& d){return d.id==selectedDevice_;}))selectedDevice_=deviceChoices_.front().id;
+            SettingRow choice{SettingsText(L"设备",L"Device"),Kind::Choice,{}};
+            for(size_t i=0;i<deviceChoices_.size();++i)choice.options.push_back({deviceChoices_[i].name,CmdDeviceSelect+static_cast<UINT>(i),deviceChoices_[i].id==selectedDevice_,true});
+            pages.back().rows.push_back(std::move(choice));
+            const auto saved=std::find_if(config_.devices.begin(),config_.devices.end(),[&](const auto& d){return d.id==selectedDevice_;});
+            pages.back().rows.push_back({SettingsText(L"设备别名（留空使用原名称）",L"Device alias (empty uses original name)"),Kind::Text,{{saved==config_.devices.end()?L"":saved->alias,CmdDeviceAlias,false,true}}});
+            pages.back().rows.push_back({SettingsText(L"隐藏此设备",L"Hide this device"),Kind::Toggle,{{L"",CmdDeviceHidden,saved!=config_.devices.end()&&saved->hidden,true}}});
+            pages.back().rows.push_back({SettingsText(L"将此设备置于最前",L"Move this device first"),Kind::Action,{{L"",CmdDeviceFirst,false,true}}});
+            const auto device=std::find_if(deviceChoices_.begin(),deviceChoices_.end(),[&](const auto& d){return d.id==selectedDevice_;});
+            const auto status=device->percent<0?SettingsText(L"未上报电量或设备已离线",L"Battery not reported or device offline"):(std::to_wstring(device->percent)+L"%");
+            note(status.c_str(),status.c_str());
+        } else note(L"尚未读取到设备。请开启外设电量卡片并连接设备，再刷新。",L"No devices reported. Enable the peripheral battery card, connect a device and refresh.");
         return pages;
     }
     void OpenSettings() {
-        if(!settingsWindow_.Open(window_,[this]{return SettingsPages();},[this](UINT command) {
+        if(!settingsWindow_.Open(window_,[this]{return SettingsPages();},[this](UINT command,const std::wstring& text) {
+            if(command==CmdDeviceAlias){if(auto* device=SelectedDevicePreference()){device->alias=peripheral::CleanName(text);Save();}return settingsSaved_;}
             if(command>=CmdSettingsCompact&&command<CmdSettingsCompact+CompactComponents.size()) {
                 settingsCompact_=static_cast<CompactComponent>(command-CmdSettingsCompact);return settingsSaved_;
             }
@@ -1917,10 +2249,65 @@ private:
             Command(command);return settingsSaved_;
         }))MessageBoxW(window_,SettingsText(L"无法打开设置，请重试。",L"Could not open settings. Please try again."),L"Pulse",MB_OK|MB_ICONWARNING);
     }
+    bool ApplyConfiguration(Config candidate) {
+        candidate.file=config_.file;
+        settingsSaved_=candidate.Save();if(!settingsSaved_)return false;
+        struct Applying {bool& flag;Applying(bool& v):flag(v){flag=true;}~Applying(){flag=false;}} applying(applyingConfig_);
+        const auto previousMode=config_.mode,targetMode=candidate.mode;
+        const int targetX=candidate.x,targetY=candidate.y;
+        config_=std::move(candidate);config_.mode=previousMode;
+        ApplyTheme();SetLanguage(config_.language);renderer_.SetFullWidth(config_.fullWidth);
+        renderer_.SetTextColors(config_.appearance.compact);taskbar_.SetTextColors(config_.appearance.taskbar);
+        metrics_->SetGpuAdapter(config_.gpu);metrics_->SetSlowThreshold(config_.slow_ms);
+        metrics_->SetInputSources(config_.networkSource,config_.diskSource);
+        dockedEdges_=0;SetMode(targetMode);SetClickThrough(config_.clickThrough);Reconfigure(true);
+        if(!TaskbarMode()) {
+            SetWindowPos(window_,config_.pinned?HWND_TOPMOST:HWND_NOTOPMOST,
+                targetX==INT_MIN?config_.x:targetX,targetY==INT_MIN?config_.y:targetY,0,0,SWP_NOSIZE|SWP_NOACTIVATE);
+            Fit(false);if(config_.snap)SnapCurrent();
+        }
+        Sampling(true,true);return true;
+    }
+    void TransferConfiguration(bool importing) {
+#ifndef PULSE_DEVELOPMENT
+        wchar_t selected[32768]{};
+        OPENFILENAMEW dialog{sizeof(dialog)};dialog.hwndOwner=settingsWindow_.Handle()?settingsWindow_.Handle():window_;
+        dialog.lpstrFilter=L"Pulse settings (*.ini)\0*.ini\0\0";dialog.lpstrFile=selected;dialog.nMaxFile=32768;dialog.lpstrDefExt=L"ini";
+        dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|(importing?OFN_FILEMUSTEXIST:OFN_OVERWRITEPROMPT);
+        const HMODULE dialogs=LoadLibraryExW(L"comdlg32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!dialogs)return;
+        using FileDialog=BOOL(WINAPI*)(LPOPENFILENAMEW);
+        const auto choose=reinterpret_cast<FileDialog>(GetProcAddress(dialogs,importing?"GetOpenFileNameW":"GetSaveFileNameW"));
+        const bool chosen=choose&&choose(&dialog);FreeLibrary(dialogs);if(!chosen)return;
+        const auto attributes=GetFileAttributesW(selected);
+        if(attributes!=INVALID_FILE_ATTRIBUTES&&(attributes&(FILE_ATTRIBUTE_REPARSE_POINT|FILE_ATTRIBUTE_DIRECTORY)))return;
+        bool ok=false;
+        if(importing) {
+            WIN32_FILE_ATTRIBUTE_DATA stat{};
+            wchar_t sections[4096]{};bool windowSection=false;
+            GetPrivateProfileSectionNamesW(sections,4096,selected);
+            for(const wchar_t* p=sections;*p;p+=wcslen(p)+1)if(_wcsicmp(p,L"Window")==0)windowSection=true;
+            Config candidate;
+            if(windowSection&&GetFileAttributesExW(selected,GetFileExInfoStandard,&stat)&&stat.nFileSizeHigh==0&&stat.nFileSizeLow<=1048576&&candidate.Load(selected)) {
+                if(MessageBoxW(dialog.hwndOwner,SettingsText(L"应用此文件中的显示和采样设置？当前配置会保留一份备份。",L"Apply display and sampling settings from this file? A backup of the current configuration will be kept."),L"Pulse",MB_YESNO|MB_ICONQUESTION)!=IDYES)return;
+                ok=ApplyConfiguration(std::move(candidate));
+            }
+        } else {Save();ok=settingsSaved_&&CopyFileW(config_.file.c_str(),selected,FALSE)!=FALSE;}
+        if(!ok)MessageBoxW(dialog.hwndOwner,SettingsText(L"操作未完成。请检查文件格式及目录权限，当前配置文件仍保留。",L"Could not complete the operation. Check the file format and folder access. The current configuration file is preserved."),L"Pulse",MB_OK|MB_ICONWARNING);
+#else
+        (void)importing;
+#endif
+    }
     HMENU BuildMenu() {
         HMENU menu = CreatePopupMenu();
         if (!menu) return nullptr;
         AppendMenuW(menu,MF_STRING,CmdSettings,SettingsText(L"设置…",L"Settings…"));
+        AppendMenuW(menu,MF_STRING,CmdPeripheralRefresh,SettingsText(L"刷新外设电量",L"Refresh peripheral batteries"));
+        AppendMenuW(menu,MF_STRING,CmdSaveRetry,SettingsText(L"重新保存设置",L"Retry saving settings"));
+#ifndef PULSE_DEVELOPMENT
+        AppendMenuW(menu,MF_STRING,CmdConfigExport,SettingsText(L"导出设置…",L"Export settings…"));
+        AppendMenuW(menu,MF_STRING,CmdConfigImport,SettingsText(L"导入设置…",L"Import settings…"));
+#endif
         AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
         AppendMenuW(menu, MF_STRING | (config_.mode == DisplayMode::Full ? MF_CHECKED : 0), CmdFull, T(Key::FullMode).c_str());
         AppendMenuW(menu, MF_STRING | (Compact() ? MF_CHECKED : 0), CmdCompact, T(Key::MiniMode).c_str());
@@ -2069,8 +2456,11 @@ private:
         AppendMenuW(menu, MF_STRING | (config_.pinned ? MF_CHECKED : 0), CmdPin, T(Key::AlwaysOnTop).c_str());
         AppendMenuW(menu, MF_STRING | (config_.snap ? MF_CHECKED : 0) | (TaskbarMode() ? MF_GRAYED : 0),
                     CmdSnap, T(Key::SnapToEdge).c_str());
-        AppendMenuW(menu, MF_STRING | (clickThrough_ ? MF_CHECKED : 0) | (!tray_ || TaskbarMode() ? MF_GRAYED : 0),
+        AppendMenuW(menu, MF_STRING | (config_.clickThrough ? MF_CHECKED : 0) | (!tray_ || TaskbarMode() ? MF_GRAYED : 0),
                     CmdClickThrough, T(Key::ClickThrough).c_str());
+        AppendMenuW(menu, MF_STRING | (TaskbarMode() ? MF_GRAYED : 0), CmdPositionEdit,
+            positionEditing_ ? SettingsText(L"完成位置调整（恢复穿透）",L"Finish positioning (restore click-through)") :
+            SettingsText(L"临时调整位置（拖动后恢复，最长30秒）",L"Position temporarily (restore after drag, up to 30 seconds)"));
         AppendMenuW(menu, MF_STRING | (StartupEnabled() ? MF_CHECKED : 0), CmdStartup, T(Key::StartWithWindows).c_str());
         HMENU shortcuts = CreatePopupMenu();
         if (shortcuts) {
@@ -2113,6 +2503,36 @@ private:
     void Command(UINT command) {
         if(command==CmdSettings){OpenSettings();return;}
         struct RefreshSettings {SettingsWindow& window;~RefreshSettings(){window.Refresh();}} refreshSettings{settingsWindow_};
+        if(command==CmdSaveRetry){Save();return;}
+        if(command==CmdConfigImport||command==CmdConfigExport){TransferConfiguration(command==CmdConfigImport);return;}
+        if(command>=CmdDeviceSelect&&command<CmdDeviceSelect+deviceChoices_.size()){selectedDevice_=deviceChoices_[command-CmdDeviceSelect].id;return;}
+        if(command==CmdDeviceHidden||command==CmdDeviceFirst){if(auto* device=SelectedDevicePreference()){
+            if(command==CmdDeviceHidden)device->hidden=!device->hidden;
+            else {const auto i=static_cast<size_t>(device-config_.devices.data());std::rotate(config_.devices.begin(),config_.devices.begin()+i,config_.devices.begin()+i+1);}
+            Save();}return;
+        }
+        if(command==CmdBatteryNotify){config_.batteryNotify=!config_.batteryNotify;lowBatteryNotified_.clear();Save();return;}
+        if(command>=CmdBatteryThreshold&&command<CmdBatteryThreshold+4){config_.batteryThreshold=10+static_cast<int>(command-CmdBatteryThreshold)*10;lowBatteryNotified_.clear();Save();return;}
+        if(command>=CmdNetworkSource&&command<=CmdNetworkSource+networkChoices_.size()){
+            config_.networkSource=command==CmdNetworkSource?L"":networkChoices_[command-CmdNetworkSource-1].id;
+            metrics_->SetInputSources(config_.networkSource,config_.diskSource);Save();return;
+        }
+        if(command>=CmdDiskSource&&command<=CmdDiskSource+diskChoices_.size()){
+            config_.diskSource=command==CmdDiskSource?L"":diskChoices_[command-CmdDiskSource-1].id;
+            metrics_->SetInputSources(config_.networkSource,config_.diskSource);Save();return;
+        }
+        if(command>=CmdTheme&&command<CmdTheme+3){config_.theme=static_cast<int>(command-CmdTheme);ApplyTheme();Save();return;}
+        if(command>=CmdSettingsFull&&command<CmdSettingsFull+FullComponents.size()){settingsFull_=static_cast<FullComponent>(command-CmdSettingsFull);return;}
+        if(command>=CmdFullWidth&&command<CmdFullWidth+4){config_.fullWidth=320+static_cast<int>(command-CmdFullWidth)*80;renderer_.SetFullWidth(config_.fullWidth);Reconfigure(true);return;}
+        if(command==CmdFullCollapse){auto& value=config_.components.collapsed[static_cast<size_t>(settingsFull_)];value=!value;Reconfigure(true);return;}
+        if(command==CmdFullReset){Components defaults;config_.components.full=defaults.full;config_.components.fullOrder=defaults.fullOrder;config_.components.collapsed.fill(false);Reconfigure(true);return;}
+        if(command>=CmdFullMove&&command<CmdFullMove+4){
+            auto& order=config_.components.fullOrder;auto it=std::find(order.begin(),order.end(),settingsFull_);size_t from=static_cast<size_t>(it-order.begin());
+            if(from<order.size()){size_t to=command==CmdFullMove?(from?from-1:0):command==CmdFullMove+1?std::min(from+1,order.size()-1):command==CmdFullMove+2?0:order.size()-1;
+                if(from<to)std::rotate(order.begin()+from,order.begin()+from+1,order.begin()+to+1);
+                else if(to<from)std::rotate(order.begin()+to,order.begin()+from,order.begin()+from+1);
+                Reconfigure(true);}return;
+        }
         if (command == CmdUpdate) {
 #ifndef PULSE_DEVELOPMENT
             if (!update::Start(window_, i18n::CurrentLanguage() == i18n::Language::English))
@@ -2268,10 +2688,22 @@ private:
             Save();
             break;
         case CmdClickThrough:
-            if (SetClickThrough(!clickThrough_)) {
+            EndPositionEdit();
+            if (SetClickThrough(!config_.clickThrough)) {
                 config_.clickThrough = clickThrough_;
                 Save();
             }
+            break;
+        case CmdPositionEdit:
+            if (positionEditing_) EndPositionEdit();
+            else if (!TaskbarMode()) {
+                positionEditing_=true;
+                if (!SetTimer(window_,EditTimer,30000,nullptr)) {positionEditing_=false;break;}
+                SetClickThrough(false); Show();
+            }
+            break;
+        case CmdPeripheralRefresh:
+            if(metrics_)metrics_->RefreshPeripherals();
             break;
         case CmdStartup: ToggleStartup(); break;
         case CmdShortcutDesktop: CreateShortcut(window_, FOLDERID_Desktop); break;
@@ -2332,6 +2764,7 @@ private:
     void Shutdown() {
         if (stopping_) return;
         stopping_ = true;
+        SessionNotifications(false);
         Save();
         running_ = active_ = false;
         KillTimer(window_, SampleTimer);
@@ -2347,6 +2780,7 @@ private:
         if (taskbarCreated_ && message == taskbarCreated_) {
             SetClickThrough(false); // Restore direct control before rebuilding a lost tray icon.
             tray_ = false; AddTray();
+            if (tray_) SetClickThrough(config_.clickThrough);
             if (config_.mode == DisplayMode::Taskbar) TrackTaskbar(true);
             return 0;
         }
@@ -2393,6 +2827,12 @@ private:
             limits->ptMaxTrackSize = limits->ptMinTrackSize;
             return 0;
         }
+        case 0x02B1: // WM_WTSSESSION_CHANGE, registered for this session only.
+            if(w==7||w==8) {sessionLocked_=w==7;ClearNetworkNotifications();Sampling(!sessionLocked_,true);}
+            return 0;
+        case WM_DEVICECHANGE:
+            if(metrics_)metrics_->RefreshPeripherals();
+            return 0;
         case WM_POWERBROADCAST:
             if (w == PBT_APMSUSPEND) {
                 systemSuspended_ = true;
@@ -2413,7 +2853,13 @@ private:
             }
             break;
         case WM_SHOWWINDOW: Sampling(w != 0); break;
-        case WM_TIMER: if (w == SampleTimer) Refresh(); return 0;
+        case WM_KEYDOWN:
+            if(w==VK_ESCAPE && positionEditing_) {EndPositionEdit();return 0;}
+            break;
+        case WM_TIMER:
+            if (w == SampleTimer) Refresh();
+            else if (w == EditTimer) EndPositionEdit();
+            return 0;
         case WM_DPICHANGED: {
             if (config_.mode == DisplayMode::Taskbar)
                 PostMessageW(window_, TaskbarMessage, static_cast<WPARAM>(TaskbarAction::Changed), 0);
@@ -2440,6 +2886,7 @@ private:
             if (active_) InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_SETTINGCHANGE:
+            if(config_.theme==0)ApplyTheme();
             taskbar_.ThemeChanged();
             TrackTaskbar();
             PositionDetails();
@@ -2511,7 +2958,7 @@ private:
             pressed_ = Button::None;
             dragging_ = dragCandidate_ = false;
             if (GetCapture() == window_) ReleaseCapture();
-            if (moved) { Fit(false); Save(); }
+            if (moved) { Fit(false); Save(); EndPositionEdit(); }
             if (pressed != Button::None) InvalidateRect(window_, nullptr, FALSE);
             if (click) ActivateButton(pressed);
             return 0;
@@ -2552,10 +2999,8 @@ private:
         }
         case WM_COMMAND: Command(LOWORD(w)); return 0;
         case TrayMessage:
-            if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT ||
-                (!trayVersion4_ && LOWORD(l) == WM_LBUTTONUP)) {
-                if (clickThrough_) { SetClickThrough(false); Show(); }
-                else ToggleVisibility();
+            if (LOWORD(l) == WM_LBUTTONDBLCLK || LOWORD(l) == NIN_KEYSELECT) {
+                ToggleVisibility();
             }
             else if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) {
                 POINT p{};
@@ -2612,6 +3057,8 @@ private:
     // Class icons must outlive every main/notification window and both classes.
     HICON classIcon_ = nullptr, classSmallIcon_ = nullptr;
     std::atomic<HWND> callbackWindow_{nullptr};
+    unsigned long long settingsPeripheralStamp_=0;
+    bool applyingConfig_=false;
     // Low bit enables reminders; every toggle advances the value so an old
     // callback cannot replay its card after reminders have been re-enabled.
     std::atomic<UINT_PTR> notificationState_{1};
@@ -2626,7 +3073,7 @@ private:
     SettingsWindow settingsWindow_;
     bool settingsSaved_ = true;
     CompactComponent settingsCompact_ = CompactComponent::Battery, settingsTaskbar_ = CompactComponent::Network;
-    std::unique_ptr<Metrics> metrics_;
+    std::unique_ptr<MetricsSampler> metrics_;
     std::vector<GpuAdapter> gpuChoices_;
     std::vector<std::unique_ptr<Toast>> toasts_;
     UINT dpi_ = 96, taskbarCreated_ = 0;
@@ -2638,7 +3085,13 @@ private:
     bool zoomFitPending_ = false;
     bool systemSuspended_ = false;
     bool tray_ = false, trayVersion4_ = false;
-    bool clickThrough_ = false; // Effective state; temporary recovery keeps the saved preference.
+    bool clickThrough_ = false; // Effective state; editing keeps the saved preference.
+    bool positionEditing_ = false;
+    bool sessionLocked_ = false;
+    FullComponent settingsFull_=FullComponent::Hardware;
+    std::vector<InputDevice> networkChoices_,diskChoices_;
+    std::vector<PeripheralBattery> rawPeripherals_,deviceChoices_;
+    std::wstring selectedDevice_;std::vector<std::wstring> lowBatteryNotified_;
     unsigned dockedEdges_ = 0;
     bool registeredMain_ = false, registeredToast_ = false, renderLost_ = false;
     float scroll_ = 0;

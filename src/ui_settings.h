@@ -23,7 +23,7 @@ struct SettingOption {
     bool checked = false, enabled = true;
 };
 struct SettingRow {
-    enum class Kind { Toggle, Choice, Action, Note };
+    enum class Kind { Toggle, Choice, Action, Note, Text };
     std::wstring label;
     Kind kind = Kind::Action;
     std::vector<SettingOption> options;
@@ -34,11 +34,12 @@ struct SettingsPage { std::wstring title; std::vector<SettingRow> rows; };
 class SettingsWindow {
 public:
     using Read = std::function<std::vector<SettingsPage>()>;
-    using Apply = std::function<bool(UINT)>;
+    using Apply = std::function<bool(UINT,const std::wstring&)>;
     ~SettingsWindow();
     bool Open(HWND owner, Read read, Apply apply);
     void Close();
     void Refresh();
+    void SetDark(bool dark);
     bool Translate(MSG& message);
     HWND Handle() const { return window_; }
 #ifdef PULSE_DEVELOPMENT
@@ -52,9 +53,11 @@ private:
     LRESULT Message(HWND, UINT, WPARAM, LPARAM);
     HWND Add(const wchar_t* type, const std::wstring& text, DWORD style, int id, HWND parent);
     void Rebuild(bool navigation);
+    void UpdateValues();
     void Layout();
     void Scroll(int position);
     void Invoke(int id, int notification);
+    void CommitText();
     int Px(int value) const;
     HWND window_ = nullptr, navigation_ = nullptr, body_ = nullptr, title_ = nullptr;
     HWND status_ = nullptr, close_ = nullptr;
@@ -67,5 +70,9 @@ private:
     int scroll_ = 0, contentHeight_ = 0;
     UINT dpi_ = 96;
     bool rebuilding_ = false, applying_ = false, saveOk_ = true;
+    bool dark_=false;
+    HBRUSH background_=nullptr;
+    COLORREF Background() const {return dark_?RGB(25,32,45):GetSysColor(COLOR_WINDOW);}
+    COLORREF Foreground() const {return dark_?RGB(233,237,246):GetSysColor(COLOR_WINDOWTEXT);}
 };
 }
