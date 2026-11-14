@@ -112,6 +112,7 @@ exports.run=async({root,storage,config,action,preparedArgs,emit=true})=>{
   const sourcing=action==='release-source';
   const currentPackage=action==='release-package'&&args.tag!==undefined;
   if(sourcing&&args.paths!==undefined) {
+    if(args.message!==undefined)flow.check(typeof args.message==='string'&&args.message.length>=1&&args.message.length<=200&&!/[\x00-\x1f]/.test(args.message),'Invalid commit message');
     flow.check(/^[a-f0-9]{40}$/.test(args.base)&&/^codex\/[a-z0-9-]+$/.test(args.branch)&&
       /^custom-\d{4}\.\d{2}\.\d{2}\.\d+$/.test(args.tag)&&Array.isArray(args.paths)&&args.paths.length>0&&args.paths.length<=128,
       'Bounded exact source scope required');

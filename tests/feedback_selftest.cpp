@@ -1241,6 +1241,22 @@ int main() {
             !peripheral::DiscoverReceiver(0x1234,0x5678,L"USB Keyboard"),
             "unknown wireless receivers are discoverable without listing every ordinary wired HID");
         const auto zero=peripheral::Receiver(0x373b,0x1155);
+        for(unsigned pid:{0x1005u,0x1a05u}) {
+            const auto dragonfly=peripheral::Receiver(0x391d,pid);
+            Expect(dragonfly.name && dragonfly.family==peripheral::ReceiverFamily::VgnMouseEnc,
+                "Dragonfly 3 Master+ maps to MouseEnc, not Feature or Nordic 54");
+            Expect(peripheral::ReceiverInterface(dragonfly,0xff00,1,17,17) &&
+                !peripheral::ReceiverInterface(dragonfly,1,2,17,17) &&
+                !peripheral::ReceiverInterface(dragonfly,0xff00,1,17,0),"Master+ queries only vendor output collections");
+        }
+        auto online=peripheral::MouseOnlineRequest();
+        Expect(peripheral::MouseOnline(online.data(),online.size())==0,"offline MouseEnc response is not a battery");
+        online[6]=1;online[16]--;
+        Expect(peripheral::MouseOnline(online.data(),online.size())==1 &&
+            peripheral::ReceiverPercentage(online.data(),online.size())==-1,"online response cannot be mistaken for percentage");
+        online[16]++;
+        Expect(peripheral::MouseOnline(online.data(),online.size())==-1 &&
+            peripheral::MouseOnline(online.data(),16)==-1,"invalid and truncated MouseEnc replies rejected");
         Expect(peripheral::ReceiverInterface(zero,0xff05,1,64,64) &&
             !peripheral::ReceiverInterface(zero,0xff02,2,17,17) &&
             !peripheral::ReceiverInterface(peripheral::Receiver(0x373b,0xffff),0xff05,1,64,64),

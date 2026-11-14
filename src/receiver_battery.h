@@ -140,6 +140,22 @@ inline void ReadReceivers(std::vector<PeripheralBattery>& rows, const std::atomi
             } else {const auto command=BatteryRequest();std::copy(command.begin(),command.end(),request.begin());}
             DWORD count=0;const auto until=(std::min)(scanUntil,GetTickCount64()+350);
             int percent=-1;
+            if(candidate.spec.family==ReceiverFamily::VgnMouseEnc) {
+                std::array<BYTE,65> online{};const auto command=MouseOnlineRequest();
+                std::copy(command.begin(),command.end(),online.begin());
+                int connected=-1;
+                if(ReceiverTransfer(device.value,true,online.data(),caps.OutputReportByteLength,count,cancel,until) && count==caps.OutputReportByteLength)
+                    for(unsigned attempt=0;attempt<8 && connected<0;++attempt) {
+                        if(!ReceiverTransfer(device.value,false,response.data(),caps.InputReportByteLength,count,cancel,until))break;
+                        connected=MouseOnline(response.data(),count);
+                    }
+                if(connected!=1) {
+                    row->status=connected==0?BatteryStatus::Sleeping:BatteryStatus::Unknown;
+                    row->detail+=connected==0?L" | mouse offline":L" | no valid online reply";
+                    if(connected==0)break;
+                    continue;
+                }
+            }
             if(candidate.spec.family==ReceiverFamily::VgnFeature) {
                 if(ReceiverTransfer(device.value,true,request.data(),65,count,cancel,until,IOCTL_HID_SET_FEATURE) &&
                    ReceiverTransfer(device.value,false,response.data(),65,count,cancel,until,IOCTL_HID_GET_FEATURE))
@@ -153,8 +169,9 @@ inline void ReadReceivers(std::vector<PeripheralBattery>& rows, const std::atomi
             if(percent>=0) {
                 row->percent=percent;row->status=BatteryStatus::Unknown;
                 row->source=candidate.spec.family==ReceiverFamily::VgnFeature?L"HID / VGN Feature":
+                    candidate.spec.family==ReceiverFamily::VgnMouseEnc?L"HID / VGN MouseEnc":
                     candidate.spec.family==ReceiverFamily::Nordic54?L"HID / Nordic 54":L"HID / Nordic 52";
-                row->charging=candidate.spec.wired && percent<100;
+                row->charging=candidate.spec.family==ReceiverFamily::VgnMouseEnc?response[7]==1:candidate.spec.wired && percent<100;
                 successful[group.first]=candidate.path;break;
             }
             if(row->percent<0) row->status=percent==-2?BatteryStatus::Sleeping:BatteryStatus::Unknown;

@@ -7,10 +7,14 @@
 #include <string>
 
 namespace pulse::peripheral {
-enum class ReceiverFamily { Nordic52, Nordic54, VgnFeature };
+enum class ReceiverFamily { Nordic52, Nordic54, VgnFeature, VgnMouseEnc };
 struct ReceiverSpec { const wchar_t* name; ReceiverFamily family; bool wired; };
 inline ReceiverSpec Receiver(unsigned vid, unsigned pid) {
     if(vid==0x391d) switch(pid) {
+        // Dragonfly 3 Master / Master+: MouseEnc report 8, not VgnRy Feature.
+        // The PID does not reliably identify connection mode across firmware.
+        case 0x1005: case 0x1a05:
+            return {L"VGN 蜻蜓 3 大师版 / 大师版+",ReceiverFamily::VgnMouseEnc,false};
         case 0x1004: case 0x1a04: case 0x1008: case 0x1a08: case 0x1028: case 0x1a25: case 0x102f: case 0x1a2b:
             return {L"VGN 无线鼠标",ReceiverFamily::VgnFeature,false};
     }
@@ -50,6 +54,8 @@ inline bool DiscoverReceiver(unsigned vid, unsigned pid, std::wstring name) {
 }
 inline bool ReceiverInterface(ReceiverSpec spec, unsigned page, unsigned usage, unsigned input, unsigned output, unsigned feature=0) {
     if(spec.name && spec.family==ReceiverFamily::VgnFeature) return page>=0xff00 && feature==65;
+    if(spec.name && spec.family==ReceiverFamily::VgnMouseEnc)
+        return page>=0xff00 && input>=17 && input<=65 && output>=17 && output<=65;
     if (!spec.name || input>65 || output>65) return false;
     if (spec.family==ReceiverFamily::Nordic54) return page==0xff05 && usage==1 && input>=64 && output>=64;
     return (page==0xff02 || page==0xff04) && usage==2 && input>=17 && output>=17;
@@ -66,6 +72,17 @@ inline int VgnFeaturePercentage(const uint8_t* data, size_t size) {
 }
 inline constexpr std::array<uint8_t,17> BatteryRequest() {
     return {8,4,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x49};
+}
+inline constexpr std::array<uint8_t,17> MouseOnlineRequest() {
+    return {8,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x4a};
+}
+inline bool MouseEncReply(const uint8_t* data,size_t size,uint8_t command) {
+    if(size<17 || data[0]!=8 || data[1]!=command || data[2]!=0) return false;
+    unsigned sum=0;for(size_t i=0;i<17;++i)sum+=data[i];
+    return (sum&255)==0x55;
+}
+inline int MouseOnline(const uint8_t* data,size_t size) {
+    return MouseEncReply(data,size,3)?(data[6]>0?1:0):-1;
 }
 inline int ReceiverPercentage(const uint8_t* data, size_t length) {
     if (length < 17 || data[0] != 8 || data[1] != 4 || data[2] != 0 || data[6] > 100) return -1;

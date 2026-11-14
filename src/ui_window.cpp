@@ -1421,7 +1421,8 @@ private:
         SendMessageW(GetParent(languageControl),WM_COMMAND,MAKEWPARAM(GetDlgCtrlID(languageControl),CBN_SELCHANGE),reinterpret_cast<LPARAM>(languageControl));
         drainSettings();require(config_.language==i18n::Preference::English,"Settings combo did not apply language");
         settingsWindow_.SelectPageForTest(5);
-        SetWindowPos(settingsWindow_.Handle(),nullptr,0,0,700,460,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+        const UINT settingsDpi=GetDpiForWindow(settingsWindow_.Handle());
+        SetWindowPos(settingsWindow_.Handle(),nullptr,0,0,MulDiv(700,settingsDpi,96),MulDiv(460,settingsDpi,96),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
         drainSettings();
         if(capture)settingsWindow_.CaptureForTest((development::DataDirectory()+L"\\settings-english-narrow.bmp").c_str());
         settingsWindow_.Close();require(!settingsWindow_.Handle(),"Settings close left window alive");
@@ -1467,6 +1468,13 @@ private:
         Command(CmdTheme+1);
         require(GetPrivateProfileIntW(L"Window",L"theme",-1,config_.file.c_str())==1,"Theme was not saved");
 
+        // This block owns synthetic peripheral state. A dispatched sample timer
+        // must not replace it with the VM's unrelated live discovery snapshot.
+        struct SyntheticSamplingScope {
+            bool& running;bool previous;
+            explicit SyntheticSamplingScope(bool& value):running(value),previous(value){running=false;}
+            ~SyntheticSamplingScope(){running=previous;}
+        } syntheticSampling(running_);
         rawPeripherals_=sample.peripherals.devices;
         config_.devices.clear();lowBatteryNotified_.clear();
         config_.batteryNotify=true;config_.batteryThreshold=20;selectedDevice_=L"test-mouse";
@@ -2135,18 +2143,25 @@ private:
             pages.back().rows.push_back(std::move(row));
         };
         auto note=[&](const wchar_t* zh,const wchar_t* en) {pages.back().rows.push_back({SettingsText(zh,en),Kind::Note,{}});};
+        auto section=[&](const wchar_t* zh,const wchar_t* en) {pages.back().rows.push_back({SettingsText(zh,en),Kind::Heading,{}});};
         page(L"常规",L"General");
+        pages.back().description=SettingsText(L"显示方式、语言与桌面交互。",L"Display mode, language and desktop behavior.");
+        section(L"显示与语言",L"Display & language");
         SettingRow mode{SettingsText(L"显示模式",L"Display mode"),Kind::Choice,{option(CmdFull),option(CmdCompact),option(CmdTaskbar)}};
         pages.back().rows.push_back(std::move(mode));
         choice(T(Key::LanguageMenu),CmdLanguage,Languages.size());
-        for(UINT id:{CmdPin,CmdSnap,CmdClickThrough,CmdStartup})single(id,Kind::Toggle);
-        single(CmdPositionEdit,Kind::Action);
+        section(L"桌面交互",L"Desktop behavior");
+        for(UINT id:{CmdPin,CmdSnap,CmdClickThrough})single(id,Kind::Toggle);
+        single(CmdPositionEdit,Kind::Action,SettingsText(L"临时调整位置（30 秒后恢复穿透）",L"Adjust position (restore click-through after 30 seconds)"));
         note(L"鼠标穿透开启后，可从系统托盘打开设置。",L"With click-through enabled, open settings from the system tray.");
+        section(L"启动",L"Startup");single(CmdStartup,Kind::Toggle);
         if(portable::Enabled())note(L"便携模式不修改自启和快捷方式。",L"Portable mode leaves startup and shortcuts unchanged.");
 #ifdef PULSE_DEVELOPMENT
         note(L"开发试用：自启、任务栏嵌入、网络提醒和外部操作已禁用。",L"Development trial: startup, taskbar integration, network alerts and external actions are disabled.");
 #endif
         page(L"外观与位置",L"Appearance");
+        pages.back().description=SettingsText(L"让监控面板适合你的桌面。",L"Fit the monitor panel to your desktop.");
+        section(L"主题与尺寸",L"Theme & size");
         pages.back().rows.push_back({SettingsText(L"主题",L"Theme"),Kind::Choice,{
             {SettingsText(L"跟随系统",L"System"),CmdTheme,config_.theme==0,true},
             {SettingsText(L"浅色",L"Light"),CmdTheme+1,config_.theme==1,true},
@@ -2162,7 +2177,10 @@ private:
         choice(T(Key::TaskbarPositionMenu),CmdTaskbarPosition,3);
         note(L"大小影响监控面板；设置窗口使用系统显示缩放。",L"Size affects the monitor panel. Settings use Windows display scaling.");
         page(L"完整模式组件",L"Full panel");
+        pages.back().description=SettingsText(L"选择显示的卡片，并调整排列与折叠状态。",L"Choose visible cards, their order and collapsed state.");
+        section(L"显示的卡片",L"Visible cards");
         for(auto component:config_.components.fullOrder)single(CmdFullComponent+static_cast<UINT>(component),Kind::Toggle);
+        section(L"排列与折叠",L"Order & collapse");
         SettingRow fullTarget{SettingsText(L"调整卡片",L"Arrange card"),Kind::Choice,{}};
         for(auto component:config_.components.fullOrder)fullTarget.options.push_back({T(FullComponents[static_cast<size_t>(component)].label),CmdSettingsFull+static_cast<UINT>(component),component==settingsFull_,true});
         pages.back().rows.push_back(std::move(fullTarget));
@@ -2172,12 +2190,15 @@ private:
         single(CmdSelect,Kind::Action);single(CmdSelect+1,Kind::Action);
         for(bool taskbar:{false,true}) {
             page(taskbar?L"任务栏组件":L"迷你模式组件",taskbar?L"Taskbar items":L"Mini items");
+            pages.back().description=SettingsText(L"选择指标，自定义颜色与显示顺序。",L"Choose metrics and customize their colors and order.");
+            section(L"显示的指标",L"Visible metrics");
             const auto& order=taskbar?config_.components.taskbarOrder:config_.components.compactOrder;
             const auto& enabled=taskbar?config_.components.taskbar:config_.components.compact;
             const auto selected=taskbar?settingsTaskbar_:settingsCompact_;
             const UINT base=taskbar?CmdTaskbarComponent:CmdCompactComponent;
             for(auto c:order)single(base+static_cast<UINT>(c),Kind::Toggle);
             single(CmdSelect+(taskbar?4:2),Kind::Action);single(CmdSelect+(taskbar?5:3),Kind::Action);
+            section(L"颜色与顺序",L"Colors & order");
             SettingRow target{SettingsText(L"调整颜色与顺序",L"Color and order for"),Kind::Choice,{}};
             for(auto c:order)target.options.push_back({T(CompactComponents[static_cast<size_t>(c)].label),
                 (taskbar?CmdSettingsTaskbar:CmdSettingsCompact)+static_cast<UINT>(c),c==selected,true});
@@ -2192,6 +2213,8 @@ private:
             if(!enabled[static_cast<size_t>(selected)])note(L"先勾选该组件，再调整颜色或顺序。",L"Enable this item before changing its color or order.");
         }
         page(L"采样与通知",L"Sampling & alerts");
+        pages.back().description=SettingsText(L"选择数据来源，平衡刷新速度与资源占用。",L"Choose data sources and balance refresh speed with resource usage.");
+        section(L"数据来源",L"Data sources");
         networkChoices_=metrics_?metrics_->NetworkAdapters():std::vector<InputDevice>{};
         diskChoices_=metrics_?metrics_->Disks():std::vector<InputDevice>{};
         auto sourceChoice=[&](const wchar_t* label,const wchar_t* automatic,const std::vector<InputDevice>& devices,const std::wstring& selected,UINT base) {
@@ -2203,6 +2226,7 @@ private:
         sourceChoice(SettingsText(L"网速来源",L"Network source"),SettingsText(L"自动汇总物理网卡",L"Automatic physical adapters"),networkChoices_,config_.networkSource,CmdNetworkSource);
         sourceChoice(SettingsText(L"磁盘读写与空间来源",L"Disk I/O and space source"),SettingsText(L"全部读写 / 系统盘空间",L"All I/O / system volume space"),diskChoices_,config_.diskSource,CmdDiskSource);
         single(CmdPeripheralRefresh,Kind::Action);
+        section(L"刷新与提醒",L"Refresh & alerts");
         choice(SettingsText(L"完整模式刷新间隔",L"Full panel refresh"),CmdRefresh,RefreshIntervals.size());
         choice(T(Key::MiniTaskbar)+L" · "+T(Key::RefreshInterval),CmdMiniRefresh,MiniRefreshIntervals.size());
         choice(T(Key::GpuSelection),CmdGpu,gpuChoices_.size()+1);
@@ -2213,10 +2237,13 @@ private:
         if(metrics_&&metrics_->Failed())note(L"采样暂时失败，数据以未知显示。可稍后重试或查看诊断日志。",L"Sampling failed; readings are unknown. Retry later or inspect the diagnostic log.");
         note(L"外设通常每 60 秒刷新；无设备或读取失败时降低频率，设备变化或手动刷新时重新读取。隐藏或折叠卡片时暂停专用采集。",L"Batteries refresh every 60 seconds, less often when absent or unavailable. Device changes and manual refresh request a new reading. Hidden or collapsed cards pause dedicated collection.");
         page(L"工具与更新",L"Tools & updates");
+        pages.back().description=SettingsText(L"管理更新、配置备份与诊断工具。",L"Manage updates, configuration backups and diagnostic tools.");
         note((std::wstring(L"Pulse · ")+update::Version).c_str(),(std::wstring(L"Pulse · ")+update::Version).c_str());
         for(UINT id:{CmdUpdate,CmdConfigExport,CmdConfigImport,CmdSaveRetry,CmdWifiPermissions,CmdShortcutDesktop,CmdShortcutStartMenu,CmdPowerDiagnostics,CmdLog,CmdRestartAdmin})
             single(id,Kind::Action);
         page(L"外设管理",L"Peripherals");
+        pages.back().description=SettingsText(L"管理无线设备与电量提醒。",L"Manage wireless devices and battery alerts.");
+        section(L"电量与提醒",L"Battery & alerts");
         single(CmdPeripheralRefresh,Kind::Action);
         pages.back().rows.push_back({SettingsText(L"低电量提醒（每个低电周期一次）",L"Low battery alerts (once per low-battery cycle)"),Kind::Toggle,{{L"",CmdBatteryNotify,config_.batteryNotify,true}}});
         SettingRow threshold{SettingsText(L"低电量阈值",L"Low battery threshold"),Kind::Choice,{}};

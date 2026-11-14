@@ -64,7 +64,10 @@ if stage=='release-source':
     base=args['base'] if scoped else '2a118b31fbabbe99c45e55fc1810e02aefe3d45f'
     branch=args['branch'] if scoped else 'codex/pulse-optimization-20261114'
     tag=args['tag'] if scoped else 'custom-2026.11.14.2'
-    check(set(args)==({'base','branch','tag','paths'} if scoped else {'base','branch','tag'}),'Exact source scope required')
+    fields={'base','branch','tag','paths'} if scoped else {'base','branch','tag'}
+    check(set(args)-{'message'}==fields and ('message' not in args or scoped),'Exact source scope required')
+    message=args.get('message','Fix peripheral discovery and battery protocols; automate safe artifact retirement' if scoped else 'Optimize desktop interaction, background sampling and peripheral settings')
+    check(isinstance(message,str) and 1<=len(message)<=200 and not any(ord(c)<32 for c in message),'Invalid commit message')
     gh=Path(r'C:\Program Files\GitHub CLI\gh.exe');check(gh.is_file(),'Verified gh is missing')
     audit=ROOT/'dev-work/evidence'/('release-source-'+tag)
     progress=(audit/'source-progress.jsonl').open('x',encoding='utf-8')
@@ -112,7 +115,7 @@ if stage=='release-source':
     check(rows,'No source changes to publish')
     tree=github('git/trees',dict(base_tree=base_tree,tree=rows))
     for p,text in content.items():check((ROOT/p).read_text(encoding='utf-8-sig').replace('\r\n','\n')==text,'Source changed during upload')
-    commit=github('git/commits',dict(message=('Fix peripheral discovery and battery protocols; automate safe artifact retirement' if scoped else 'Optimize desktop interaction, background sampling and peripheral settings')+'\n\nRelease '+tag,tree=tree['sha'],parents=[base]))
+    commit=github('git/commits',dict(message=message+'\n\nRelease '+tag,tree=tree['sha'],parents=[base]))
     record('commit-prepared',dict(commit=commit['sha'],tree=tree['sha']))
     github('git/refs',dict(ref='refs/heads/'+branch,sha=commit['sha']))
     check(github('git/ref/heads/'+branch)['object']['sha']==commit['sha'],'Published branch differs')

@@ -21,12 +21,13 @@ void LightControl(HWND window) {
     if (allow) allow(window, FALSE);
 }
 }
-SettingsWindow::~SettingsWindow() { Close();if(background_)DeleteObject(background_); }
+SettingsWindow::~SettingsWindow() { Close();if(background_)DeleteObject(background_);if(surface_)DeleteObject(surface_); }
 void SettingsWindow::SetDark(bool dark) {
     if(dark_==dark&&background_)return;
     CommitText();
     dark_=dark;
     if(background_)DeleteObject(background_);background_=CreateSolidBrush(Background());
+    if(surface_)DeleteObject(surface_);surface_=CreateSolidBrush(Surface());
     if(window_) {
         BOOL enabled=dark_;DwmSetWindowAttribute(window_,20,&enabled,sizeof(enabled));
         Rebuild(true);RedrawWindow(window_,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
@@ -59,8 +60,8 @@ bool SettingsWindow::Open(HWND owner, Read read, Apply apply) {
     if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return false;
     MONITORINFO monitor{sizeof(monitor)};
     GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
-    int width = std::min(Px(820), static_cast<int>(monitor.rcWork.right - monitor.rcWork.left));
-    int height = std::min(Px(690), static_cast<int>(monitor.rcWork.bottom - monitor.rcWork.top));
+    int width = std::min(Px(920), static_cast<int>(monitor.rcWork.right - monitor.rcWork.left));
+    int height = std::min(Px(740), static_cast<int>(monitor.rcWork.bottom - monitor.rcWork.top));
     HWND result = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_CONTROLPARENT, ClassName, L"Pulse",
         WS_OVERLAPPEDWINDOW, monitor.rcWork.left + (monitor.rcWork.right-monitor.rcWork.left-width)/2,
         monitor.rcWork.top + (monitor.rcWork.bottom-monitor.rcWork.top-height)/2,
@@ -110,7 +111,7 @@ void SettingsWindow::UpdateValues() {
     for (const auto& c:controls_) {
         if(c.label)continue;
         const auto& row=pages_[page_].rows[c.row];
-        if(row.kind==SettingRow::Kind::Note)continue;
+        if(row.kind==SettingRow::Kind::Note || row.kind==SettingRow::Kind::Heading)continue;
         bool enabled=false;
         for(size_t i=0;i<row.options.size();++i) {
             const auto& option=row.options[i]; enabled=enabled||option.enabled;
@@ -140,6 +141,7 @@ void SettingsWindow::Rebuild(bool navigation) {
         SendMessageW(navigation_, LB_SETCURSEL, page_, 0);
     }
     SetWindowTextW(title_, pages_[page_].title.c_str());
+    SetWindowTextW(subtitle_,pages_[page_].description.c_str());
     SetWindowTextW(status_, saveOk_ ? Words(L"更改立即生效并自动保存", L"Changes apply immediately and save automatically") :
         Words(L"设置未能保存。请检查配置目录权限，再重试更改。", L"Settings could not be saved. Check folder access and retry."));
     int y = 8;
@@ -148,8 +150,9 @@ void SettingsWindow::Rebuild(bool navigation) {
         const int id = RowBase + static_cast<int>(index);
         HWND control = nullptr;
         bool enabled = !row.options.empty() && row.options.front().enabled;
-        if (row.kind == SettingRow::Kind::Note) {
+        if (row.kind == SettingRow::Kind::Note || row.kind == SettingRow::Kind::Heading) {
             control = Add(L"STATIC", row.label, SS_LEFT, id, body_);
+            if(row.kind==SettingRow::Kind::Heading)SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font_),TRUE);
             controls_.push_back({control,index,y,48,false}); y += 58; continue;
         }
         if(row.kind==SettingRow::Kind::Text) {
@@ -193,29 +196,71 @@ void SettingsWindow::Layout() {
     if (!window_ || !body_) return;
     RECT rect{}; GetClientRect(window_, &rect);
     int width = rect.right, height = rect.bottom;
-    MoveWindow(navigation_, Px(16), Px(22), Px(160), std::max(1,height-Px(92)), TRUE);
-    MoveWindow(title_, Px(200), Px(22), std::max(1,width-Px(220)), Px(36), TRUE);
-    MoveWindow(body_, Px(196), Px(68), std::max(1,width-Px(212)), std::max(1,height-Px(138)), TRUE);
+    MoveWindow(brand_,Px(24),Px(28),Px(164),Px(36),TRUE);
+    MoveWindow(navigation_, Px(12), Px(86), Px(188), std::max(1,height-Px(156)), TRUE);
+    MoveWindow(title_, Px(240), Px(28), std::max(1,width-Px(264)), Px(40), TRUE);
+    MoveWindow(subtitle_,Px(240),Px(72),std::max(1,width-Px(264)),Px(42),TRUE);
+    MoveWindow(body_, Px(228), Px(118), std::max(1,width-Px(244)), std::max(1,height-Px(188)), TRUE);
     MoveWindow(status_, Px(20), height-Px(47), std::max(1,width-Px(150)), Px(36), TRUE);
     MoveWindow(close_, width-Px(112), height-Px(49), Px(92), Px(32), TRUE);
     Scroll(scroll_);
 }
 void SettingsWindow::Scroll(int position) {
     RECT rect{}; GetClientRect(body_, &rect);
+    const int width=MulDiv(rect.right,96,dpi_);
+    const bool stacked=width<530;
+    HDC dc=GetDC(body_);auto old=SelectObject(dc,font_);
+    auto textHeight=[&](const std::wstring& text,int available) {
+        RECT r{0,0,Px(std::max(40,available)),0};
+        DrawTextW(dc,text.c_str(),-1,&r,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);
+        return std::max(20,MulDiv(r.bottom,96,dpi_));
+    };
+    cards_.clear();int y=0;
+    for(size_t row=0;row<pages_[page_].rows.size();++row) {
+        const auto& item=pages_[page_].rows[row];const auto kind=item.kind;
+        int h=0,labelHeight=textHeight(item.label,width-64);
+        if(kind==SettingRow::Kind::Heading)h=36;
+        else if(kind==SettingRow::Kind::Note)h=labelHeight+24;
+        else if(kind==SettingRow::Kind::Choice)h=stacked?labelHeight+60:std::max(60,textHeight(item.label,width-300)+24);
+        else if(kind==SettingRow::Kind::Text)h=labelHeight+62;
+        else h=std::max(54,labelHeight+28);
+        if(kind!=SettingRow::Kind::Note && kind!=SettingRow::Kind::Heading)cards_.push_back({y,h});
+        for(auto& c:controls_)if(c.row==row) {
+            c.y=y+12;c.height=h-24;
+            if(kind==SettingRow::Kind::Choice) {
+                if(stacked){c.y=y+(c.label?12:labelHeight+20);c.height=c.label?labelHeight:30;}
+                else {c.y=y+(c.label?12:(h-30)/2);c.height=c.label?h-24:30;}
+            } else if(kind==SettingRow::Kind::Text){c.y=y+(c.label?12:labelHeight+20);c.height=c.label?labelHeight:30;}
+            else if(kind==SettingRow::Kind::Heading){c.y=y+12;c.height=24;}
+        }
+        y+=h+(kind==SettingRow::Kind::Heading?4:8);
+    }
+    SelectObject(dc,old);ReleaseDC(body_,dc);contentHeight_=y;
     int view = MulDiv(rect.bottom,96,dpi_);
     scroll_ = std::clamp(position, 0, std::max(0,contentHeight_-view));
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS,0,std::max(0,contentHeight_-1),static_cast<UINT>(view),scroll_,0};
     SetScrollInfo(body_, SB_VERT, &info, TRUE);
     GetClientRect(body_,&rect);
-    int width = MulDiv(rect.right,96,dpi_);
     for (const auto& c : controls_) {
         const auto kind = pages_[page_].rows[c.row].kind;
-        int x=10, w=width-24;
-        if (kind == SettingRow::Kind::Choice) { x=c.label?10:255; w=c.label?235:width-269; }
+        int x=24, w=width-56;
+        if (kind == SettingRow::Kind::Choice && !stacked) { x=c.label?24:width-256; w=c.label?width-300:224; }
         int h = kind == SettingRow::Kind::Choice && !c.label ? 280 : c.height;
         MoveWindow(c.window,Px(x),Px(c.y-scroll_),Px(std::max(1,w)),Px(h),TRUE);
     }
     InvalidateRect(body_,nullptr,TRUE);
+}
+void SettingsWindow::PaintSurface(HWND window,HDC dc) {
+    RECT r{};GetClientRect(window,&r);FillRect(dc,&r,background_?background_:GetSysColorBrush(COLOR_WINDOW));
+    HPEN pen=CreatePen(PS_SOLID,1,dark_?RGB(55,55,55):RGB(226,226,226));
+    auto oldPen=SelectObject(dc,pen);auto oldBrush=SelectObject(dc,surface_?surface_:GetSysColorBrush(COLOR_WINDOW));
+    if(window==body_) {
+        for(const auto& card:cards_)RoundRect(dc,Px(8),Px(card.y-scroll_),r.right-Px(8),Px(card.y+card.height-scroll_),Px(8),Px(8));
+    } else {
+        MoveToEx(dc,Px(212),Px(16),nullptr);LineTo(dc,Px(212),r.bottom-Px(66));
+        MoveToEx(dc,Px(20),r.bottom-Px(64),nullptr);LineTo(dc,r.right-Px(20),r.bottom-Px(64));
+    }
+    SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(pen);
 }
 void SettingsWindow::Invoke(int id, int notification) {
     if (rebuilding_ || applying_ || id < RowBase || pages_.empty()) return;
@@ -261,11 +306,21 @@ LRESULT CALLBACK SettingsWindow::Procedure(HWND window,UINT message,WPARAM w,LPA
     return DefWindowProcW(window,message,w,l);
 }
 LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
-    if(message==WM_ERASEBKGND) {RECT r{};GetClientRect(window,&r);FillRect(reinterpret_cast<HDC>(w),&r,background_?background_:GetSysColorBrush(COLOR_WINDOW));return 1;}
+    if(message==WM_ERASEBKGND) {PaintSurface(window,reinterpret_cast<HDC>(w));return 1;}
+    if(message==WM_PAINT){PAINTSTRUCT ps{};HDC dc=BeginPaint(window,&ps);PaintSurface(window,dc);EndPaint(window,&ps);return 0;}
     if(message==WM_CTLCOLORSTATIC||message==WM_CTLCOLORBTN||message==WM_CTLCOLORLISTBOX||message==WM_CTLCOLOREDIT) {
-        SetTextColor(reinterpret_cast<HDC>(w),!saveOk_&&reinterpret_cast<HWND>(l)==status_?RGB(215,65,75):Foreground());
-        SetBkColor(reinterpret_cast<HDC>(w),Background());
-        return reinterpret_cast<LRESULT>(background_?background_:GetSysColorBrush(COLOR_WINDOW));
+        HWND child=reinterpret_cast<HWND>(l);bool card=window==body_;bool muted=child==subtitle_||child==status_;
+        for(const auto& c:controls_)if(c.window==child) {
+            const auto kind=pages_[page_].rows[c.row].kind;
+            if(kind==SettingRow::Kind::Note||kind==SettingRow::Kind::Heading){card=false;muted=kind==SettingRow::Kind::Note;}
+            if(kind==SettingRow::Kind::Choice&&!c.label) {
+                SetTextColor(reinterpret_cast<HDC>(w),GetSysColor(COLOR_WINDOWTEXT));SetBkColor(reinterpret_cast<HDC>(w),GetSysColor(COLOR_WINDOW));return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
+            }
+        }
+        if(message==WM_CTLCOLORLISTBOX && child!=navigation_){SetTextColor(reinterpret_cast<HDC>(w),GetSysColor(COLOR_WINDOWTEXT));SetBkColor(reinterpret_cast<HDC>(w),GetSysColor(COLOR_WINDOW));return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));}
+        SetTextColor(reinterpret_cast<HDC>(w),!IsWindowEnabled(child)?Muted():!saveOk_&&child==status_?RGB(215,65,75):muted?Muted():Foreground());
+        SetBkColor(reinterpret_cast<HDC>(w),card?Surface():Background());
+        return reinterpret_cast<LRESULT>(card?surface_:background_);
     }
     if (window==body_) {
         if (message==WM_COMMAND) { Invoke(LOWORD(w),HIWORD(w)); return 0; }
@@ -287,13 +342,16 @@ LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
     }
     switch (message) {
     case WM_CREATE: {
+        if(!background_)background_=CreateSolidBrush(Background());if(!surface_)surface_=CreateSolidBrush(Surface());
         LightControl(window); BOOL dark=dark_; DwmSetWindowAttribute(window,20,&dark,sizeof(dark));
         font_=CreateFontW(-Px(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
         headingFont_=CreateFontW(-Px(22),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        navigation_=Add(L"LISTBOX",L"",WS_TABSTOP | LBS_NOTIFY | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,NavId,window);
-        SendMessageW(navigation_,LB_SETITEMHEIGHT,0,Px(36));
+        brand_=Add(L"STATIC",L"Pulse",SS_LEFT,0,window);SendMessageW(brand_,WM_SETFONT,reinterpret_cast<WPARAM>(headingFont_),TRUE);
+        navigation_=Add(L"LISTBOX",L"",WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED,NavId,window);
+        SendMessageW(navigation_,LB_SETITEMHEIGHT,0,Px(46));
         title_=Add(L"STATIC",L"",SS_LEFT,0,window);
         SendMessageW(title_,WM_SETFONT,reinterpret_cast<WPARAM>(headingFont_),TRUE);
+        subtitle_=Add(L"STATIC",L"",SS_LEFT,0,window);
         body_=CreateWindowExW(WS_EX_CONTROLPARENT,ClassName,L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_CLIPCHILDREN,
             0,0,1,1,window,nullptr,GetModuleHandleW(nullptr),this);
         status_=Add(L"STATIC",L"",SS_LEFT,0,window);
@@ -302,19 +360,30 @@ LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
     }
     case WM_SIZE: Layout();return 0;
     case WM_GETMINMAXINFO: {
-        auto* info=reinterpret_cast<MINMAXINFO*>(l);info->ptMinTrackSize={Px(700),Px(420)};return 0;
+        auto* info=reinterpret_cast<MINMAXINFO*>(l);info->ptMinTrackSize={Px(700),Px(460)};return 0;
     }
     case WM_DPICHANGED: {
         dpi_=HIWORD(w);
         HFONT old=font_,oldHeading=headingFont_;
         font_=CreateFontW(-Px(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
         headingFont_=CreateFontW(-Px(22),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        for (auto control:{navigation_,status_,close_}) SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font_),TRUE);
+        for (auto control:{navigation_,status_,close_,subtitle_}) SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font_),TRUE);
+        SendMessageW(navigation_,LB_SETITEMHEIGHT,0,Px(46));SendMessageW(brand_,WM_SETFONT,reinterpret_cast<WPARAM>(headingFont_),TRUE);
         SendMessageW(title_,WM_SETFONT,reinterpret_cast<WPARAM>(headingFont_),TRUE);
         auto* rect=reinterpret_cast<RECT*>(l);SetWindowPos(window,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOZORDER|SWP_NOACTIVATE);
         Rebuild(true);DeleteObject(old);DeleteObject(oldHeading);return 0;
     }
     case RefreshMessage: UpdateValues();return 0;
+    case WM_MEASUREITEM: reinterpret_cast<MEASUREITEMSTRUCT*>(l)->itemHeight=Px(46);return TRUE;
+    case WM_DRAWITEM: {
+        auto* draw=reinterpret_cast<DRAWITEMSTRUCT*>(l);if(draw->CtlID!=NavId||draw->itemID>=pages_.size())break;
+        RECT r=draw->rcItem;FillRect(draw->hDC,&r,background_);InflateRect(&r,-Px(4),-Px(3));
+        if(draw->itemState&ODS_SELECTED){HBRUSH selected=CreateSolidBrush(dark_?RGB(52,52,52):RGB(228,234,240));FillRect(draw->hDC,&r,selected);DeleteObject(selected);
+            RECT bar{r.left,r.top+Px(10),r.left+Px(3),r.bottom-Px(10)};HBRUSH accent=CreateSolidBrush(dark_?RGB(109,185,255):RGB(0,103,192));FillRect(draw->hDC,&bar,accent);DeleteObject(accent);}
+        r.left+=Px(16);SetBkMode(draw->hDC,TRANSPARENT);SetTextColor(draw->hDC,Foreground());SelectObject(draw->hDC,font_);
+        DrawTextW(draw->hDC,pages_[draw->itemID].title.c_str(),-1,&r,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        if((draw->itemState&ODS_FOCUS)&&!(draw->itemState&ODS_NOFOCUSRECT))DrawFocusRect(draw->hDC,&r);return TRUE;
+    }
     case WM_COMMAND:
         if (LOWORD(w)==NavId && HIWORD(w)==LBN_SELCHANGE) {
             auto selected=SendMessageW(navigation_,LB_GETCURSEL,0,0);
@@ -328,7 +397,7 @@ LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
         SetTextColor(reinterpret_cast<HDC>(w),!saveOk_ && reinterpret_cast<HWND>(l)==status_ ? RGB(180,30,30):GetSysColor(COLOR_WINDOWTEXT));
         return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_WINDOW));
     case WM_NCDESTROY:
-        controls_.clear();pages_.clear();window_=navigation_=body_=title_=status_=close_=nullptr;
+        controls_.clear();cards_.clear();pages_.clear();window_=navigation_=body_=title_=status_=close_=brand_=subtitle_=nullptr;
         if(font_)DeleteObject(font_);if(headingFont_)DeleteObject(headingFont_);font_=headingFont_=nullptr;
         SetWindowLongPtrW(window,GWLP_USERDATA,0);break;
     }
@@ -337,6 +406,7 @@ LRESULT SettingsWindow::Message(HWND window,UINT message,WPARAM w,LPARAM l) {
 #ifdef PULSE_DEVELOPMENT
 void SettingsWindow::SelectPageForTest(size_t page) {
     if(page>=pages_.size())throw std::runtime_error("Settings page missing");
+    SetFocus(navigation_); // Match real navigation; do not restore a different page's row ID.
     page_=page;scroll_=0;Rebuild(true);
 }
 HWND SettingsWindow::ControlForTest(UINT command) const {

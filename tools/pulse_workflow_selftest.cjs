@@ -343,6 +343,9 @@ test('versioned storage preserves default and byte guards; only explicit entry b
   assert.equal(result.status,'PREPARED');assert.equal(result.reused,true);assert.equal(leases,1);
   checks.push('actual preparation entry reuses the same registered plan under a lease');
   const config={identities:[]};
+  for(const message of ['', 'x'.repeat(201), 'title\nsecond line', 123])
+    await assert.rejects(release.run({root,storage,config,action:'release-source',preparedArgs:{
+      base:'a'.repeat(40),branch:'codex/synthetic',tag,paths:['app.rc'],message},emit:false}),/Invalid commit message/);
   await assert.rejects(release.run({root,storage,config,action:'release-source',preparedArgs:{
     base:'a'.repeat(40),branch:'codex/synthetic',tag,paths:['tools/dev-environment.local.json']},emit:false}),/Private or unsupported/);
   await assert.rejects(release.run({root,storage,config,action:'release-package',preparedArgs:{

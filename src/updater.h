@@ -1,7 +1,7 @@
 #pragma once
 #include <windows.h>
 namespace pulse::update {
-inline constexpr wchar_t Version[] = L"custom-2026.11.14.3";
+inline constexpr wchar_t Version[] = L"custom-2026.11.14.4";
 // Starts only on an explicit menu action. Development builds never launch it.
 bool Start(HWND owner, bool english);
 #ifdef PULSE_DEVELOPMENT
