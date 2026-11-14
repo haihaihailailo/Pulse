@@ -130,7 +130,7 @@ def production(config):
                 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run'):
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_READ) as opened:
-                value, kind = winreg.QueryValueEx(opened, 'Pulse')
+                value, kind = winreg.QueryValueEx(opened, 'Pulse硬件监控')
                 registry[key] = [value.hex() if isinstance(value, bytes) else value, kind]
         except FileNotFoundError:
             registry[key] = None
@@ -195,7 +195,11 @@ def apply_interactive_defaults(pid, profile, defaults_hash, window_class='Pulse.
             sent_click_through = True
         U.GetWindowRect(window, C.byref(rect))
         style = U.GetWindowLongPtrW(window, -20)
-        saved = configparser.ConfigParser(); saved.read(profile/'settings.ini', encoding='utf-8-sig')
+        ini_bytes = (profile/'settings.ini').read_bytes()
+        if len(ini_bytes) > MIB:
+            raise RuntimeError('Development settings size bound exceeded')
+        encoding = 'utf-16' if ini_bytes[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8-sig'
+        saved = configparser.ConfigParser(); saved.read_string(ini_bytes.decode(encoding))
         keys = ['hardware','battery','power_chart','network','processes','disk_io','sys_disk',
                 'system_info','gpu_memory','wifi','battery_health']
         if (saved.get('Window','Mode') != 'full' or saved.getint('Window','zoom') != 70 or
@@ -279,7 +283,7 @@ def main(plan_file, expected):
             raise RuntimeError('Whole action deadline reached')
         if P['read_policy']() != policy or H['N']['available']() < policy['hostReserveMiB'] * MIB:
             raise RuntimeError('Memory policy/reserve drift')
-        if shutil.disk_usage(root).free < 40 * 1024**3:
+        if shutil.disk_usage(root).free < 20 * 1024**3:
             raise RuntimeError('Physical disk headroom exhausted')
         used = 0; count = 0
         for file in root.rglob('*'):
@@ -288,9 +292,9 @@ def main(plan_file, expected):
                 used += file.stat().st_size; count += 1
         if used > 1024 * MIB or count > 10000:
             raise RuntimeError('Project capacity bound exceeded')
-        if plan['action'] == 'build':
+        if plan['action'] in ('build','release'):
             build_bytes = sum(file.stat().st_size for file in (root/'dev-work'/'builds').rglob('*') if file.is_file())
-            if build_bytes > 256 * MIB:
+            if build_bytes > 320 * MIB:
                 raise RuntimeError('Registered build capacity bound exceeded')
         if startup_state and startup_state.get('pid') and not startup_state.get('applied'):
             applied = apply_interactive_defaults(startup_state['pid'], startup_state['profile'], startup_state['sha256'],
@@ -352,7 +356,17 @@ def main(plan_file, expected):
         os.environ['PATH'] = str(bin_dir) + os.pathsep + os.environ['PATH']
         compiler = bin_dir/'clang++.exe'
         libs = ['winhttp','powrprof','pdh','iphlpapi','ntdll','winmm','shell32','gdi32','user32','ole32','advapi32','uuid','ws2_32','setupapi']
-        if plan['action'] == 'build':
+        if plan['action'] == 'test':
+            run([Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe',
+                 '-NoProfile','-NonInteractive','-File',root/'tests/update_selftest.ps1',
+                 '-FixtureRoot',target/'update-fixtures'], 'updater transaction regression',maximum_seconds=30)
+            feedback = target/'feedback-selftest.exe'
+            run([compiler,'-std=c++17','-O0','-static','-I'+str(root/'src'),
+                 root/'tests/feedback_selftest.cpp',root/'src/ui_model.cpp',root/'src/i18n.cpp',
+                 '-luser32','-o',feedback], 'compile upstream synthetic regression',maximum_seconds=30)
+            run([feedback], 'upstream synthetic regression',maximum_seconds=15)
+        if plan['action'] in ('build','release'):
+            release = plan['action'] == 'release'
             resource = target/'app.res.o'
             run([bin_dir/'x86_64-w64-mingw32-windres.exe','-F','pe-x86-64','-i',root/'app.rc','-O','coff','-o',resource], 'resources')
             cpp = sorted((root/'src').glob('*.cpp'))
@@ -368,44 +382,66 @@ def main(plan_file, expected):
                         raise RuntimeError('Current build intermediate identity changed; preserve it')
                     file.unlink()
                 intermediates.extend(identities)
-            for variant, objects in (('dev', dev_objects), ('normal', normal_objects)):
+            variants = [('normal', normal_objects)] if release else [('dev', dev_objects), ('normal', normal_objects)]
+            for variant, objects in variants:
                 for source in cpp:
                     if variant == 'normal' and source.stem == 'metrics_selftest':
                         continue
                     output = target/(variant+'-'+source.stem+'.o')
-                    args = [compiler,'-std=c++17','-g' if variant == 'dev' else '-g0','-O0','-fno-omit-frame-pointer','-pthread','-c',source,'-o',output]
+                    args = [compiler,'-std=c++17','-g' if variant == 'dev' else '-g0','-O2' if release else '-O0','-fno-omit-frame-pointer','-pthread','-c',source,'-o',output]
+                    if release:
+                        args += ['-ffile-prefix-map='+str(root)+'=.', '-ffile-prefix-map='+str(bin_dir.parent)+'=toolchain']
                     if variant == 'dev':
                         args.append('-DPULSE_DEVELOPMENT=1')
                     commands.append(dict(directory=str(root), file=str(source), arguments=[str(arg) for arg in args]))
                     run(args, variant+' '+source.name)
                     objects[source.stem] = output; all_outputs.append(output)
-                programs = [('Pulse-Dev.exe',False), ('metrics-selftest-dev.exe',True)] if variant == 'dev' else [('Pulse-ReleaseCheck.exe',False)]
+                programs = [('Pulse-Dev.exe',False), ('metrics-selftest-dev.exe',True)] if variant == 'dev' else [('Pulse.exe' if release else 'Pulse-ReleaseCheck.exe',False)]
                 for name, console in programs:
                     selected = [objects[key] for key in ('metrics_selftest','metrics','netprobe','fpsmon')] if console else [value for key,value in objects.items() if key != 'metrics_selftest']
                     exe = target/name
                     args = [compiler,'-g' if variant == 'dev' else '-g0','-static','-pthread','-municode', *selected]
+                    if release:
+                        args.append('-Wl,--strip-all')
                     if not console:
                         args += ['-mwindows',resource,'-ld2d1','-ldwrite','-ldwmapi','-lcomctl32']
                     args += ['-o',exe] + ['-l'+library for library in libs]
                     run(args, 'link '+name); all_outputs.append(exe)
                 release_objects(objects.values())
             database = target/'compile_commands.json'
-            write(database, [row for row in commands if '-DPULSE_DEVELOPMENT=1' in row['arguments']])
+            write(database, commands if release else [row for row in commands if '-DPULSE_DEVELOPMENT=1' in row['arguments']])
             all_outputs.append(database)
             # Each variant releases only its own objects after all its links succeed.
             release_objects([resource])
             receipt['removedBuildIntermediates'] = intermediates
             all_outputs = [file for file in all_outputs if file.suffix != '.o']
-            manifest = dict(status='PASS',buildKey=plan['buildKey'],
+            manifest = dict(status='PASS',buildKey=plan['buildKey'],kind='release' if release else 'development',inputs=plan['inputs'],
                 outputs=[dict(path=str(file),bytes=file.stat().st_size,sha256=sha(file)) for file in all_outputs])
             write(target/'build.json', manifest)
             receipt['build'] = manifest
+        elif plan['action'] == 'workflow-test':
+            result = run([config['node'], '--max-old-space-size=64', root/'tools/pulse_workflow_selftest.cjs', target],
+                         'release preparation, checkpoint recovery and refusal checks', maximum_seconds=25)
+            receipt['workflowChecks'] = json.loads(result)
+            if receipt['workflowChecks'].get('status') != 'PASS':
+                raise RuntimeError('Workflow self-check failed')
+        elif plan['action'] == 'script-test':
+            powershell = Path(os.environ['SystemRoot'])/'System32/WindowsPowerShell/v1.0/powershell.exe'
+            for script in ('install_params_selftest.ps1','uninstall_params_selftest.ps1'):
+                run([powershell,'-NoProfile','-NonInteractive','-File',root/'tests'/script],
+                    'mocked '+script,maximum_seconds=60)
+        elif plan['action'] == 'capacity':
+            result = run([config['node'],'--max-old-space-size=64',root/'tools/pulse_capacity_migration.cjs','--self-test'],
+                         'synthetic exact capacity migration and rejection checks',maximum_seconds=10)
+            receipt['capacityChecks'] = json.loads(result)
+            if receipt['capacityChecks'].get('pass') is not True:
+                raise RuntimeError('Capacity migration checks failed')
         elif plan['action'] in ('trial','trial-test'):
             profile = target/'data'; profile.mkdir()
             exe = target/'Pulse.exe'
             artifact = plan['artifact']
             if sha(safe(artifact['path'])) != artifact['sha256']:
-                raise RuntimeError('CI executable drift')
+                raise RuntimeError('Trial executable drift')
             with exe.open('xb') as destination:
                 destination.write(Path(artifact['path']).read_bytes())
             (target/'pulse-portable.ini').write_text('',encoding='utf-8')
@@ -430,7 +466,7 @@ def main(plan_file, expected):
                 if not normal_mutex:
                     raise C.WinError(C.get_last_error())
             try:
-                run([exe], 'downloaded CI portable trial', desktop_name,
+                run([exe], 'verified artifact portable trial', desktop_name,
                     maximum_seconds=1800 if plan['action'] == 'trial' else 20)
                 if plan['action'] == 'trial-test':
                     if not startup_state.get('applied'):
@@ -514,8 +550,8 @@ def main(plan_file, expected):
                         raise RuntimeError('Restart did not restore development settings')
                     run([exe,'--dev-smoke','unexpected'], 'refuse extra smoke arguments',desktop_name,expected_code=1)
                     run([exe], 'refuse missing smoke argument',desktop_name,expected_code=1)
-                    run([Path(plan['buildDir'])/'metrics-selftest-dev.exe','--samples','3','--compact','--no-probe'],
-                        'bounded backend sampling without network',desktop_name)
+                    run([Path(plan['buildDir'])/'metrics-selftest-dev.exe','--samples','6','--gpu-each','--no-probe'],
+                        'bounded hardware sampling and GPU selection without network',desktop_name)
                     run([exe,'--dev-smoke'], 'refuse smoke on current desktop',expected_code=2)
                     original = os.environ.pop('PULSE_DEV_DATA_DIR')
                     try:
@@ -536,8 +572,11 @@ def main(plan_file, expected):
                             with safe(png).open('xb') as destination:
                                 rgb.save(destination, format='PNG')
                             captures.append(dict(path=str(png),width=rgb.width,height=rgb.height,sha256=sha(png)))
-                    if len(captures) != 7:
-                        raise RuntimeError('Expected six zoom captures and one click-through capture')
+                    if len(captures) != 15 or any(not (profile/name).is_file() for name in (
+                            'full-fps-70-fit.png','sensor-unavailable.png','settings-general.png',
+                            'settings-components.png','settings-english-narrow.png','full-custom-dark.png',
+                            'settings-dark.png','settings-peripherals.png')):
+                        raise RuntimeError('Expected ten panel captures and five native settings captures')
                     receipt['renderCaptures'] = captures
                 if input_desktop() != visible:
                     raise RuntimeError('Input desktop changed during verification')
@@ -560,6 +599,8 @@ def main(plan_file, expected):
             remaining = [row for row in processes() if within(root/'dev-work',row['path'])]
             receipt['remainingDevelopmentProcesses'] = remaining
             if remaining:
+                if receipt.get('error'):
+                    receipt['executionError'] = receipt['error']
                 receipt['status'] = 'FAILED'; receipt['error'] = 'Development process exit is not confirmed'
             if desktop and not U.CloseDesktop(desktop):
                 receipt['status'] = 'FAILED'; receipt['error'] = 'Private desktop cleanup failed'
